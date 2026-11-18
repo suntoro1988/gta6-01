@@ -10,16 +10,60 @@ export const CITY_MAX = 162;
 export const BEACH_X = 190; // sand ends, ocean begins
 export const WORLD = { minX: -172, maxX: 198, minZ: -172, maxZ: 172 };
 
-const BUILDING_COLORS = [
-  [0.93, 0.82, 0.68], [0.95, 0.55, 0.45], [0.35, 0.65, 0.62],
-  [0.95, 0.62, 0.72], [0.65, 0.55, 0.85], [0.95, 0.75, 0.35],
-  [0.92, 0.9, 0.86], [0.6, 0.8, 0.65], [0.9, 0.6, 0.5],
-];
 const NEON = [
   [1.0, 0.25, 0.55], [0.2, 0.9, 1.0], [1.0, 0.85, 0.2], [0.65, 0.4, 1.0],
 ];
 const WINDOW_LIT = [1.0, 0.85, 0.55];
 const WINDOW_DARK = [0.25, 0.3, 0.42];
+
+// --- Districts: 8 named neighbourhoods, one per region of the 6x6 grid.
+// Each has its own building palette and height range, so the city reads
+// as different places instead of one repeating pattern. The map is indexed
+// [bx][bz] over the block grid; the park block (2,2) is Bay Park itself. ---
+export const DISTRICTS = [
+  { name: 'Old Town', colors: [[0.93, 0.82, 0.68], [0.9, 0.6, 0.5], [0.95, 0.75, 0.35]], h: [8, 18] },
+  { name: 'Downtown', colors: [[0.35, 0.65, 0.62], [0.65, 0.55, 0.85], [0.92, 0.9, 0.86]], h: [18, 34] },
+  { name: 'Marina', colors: [[0.95, 0.62, 0.72], [0.92, 0.9, 0.86], [0.95, 0.55, 0.45]], h: [22, 46] },
+  { name: 'West End', colors: [[0.6, 0.8, 0.65], [0.93, 0.82, 0.68], [0.9, 0.6, 0.5]], h: [8, 20] },
+  { name: 'The Strip', colors: [[0.65, 0.55, 0.85], [0.95, 0.62, 0.72], [0.95, 0.55, 0.45]], h: [16, 32] },
+  { name: 'Southside', colors: [[0.95, 0.55, 0.45], [0.9, 0.6, 0.5], [0.6, 0.8, 0.65]], h: [8, 22] },
+  { name: 'Midtown', colors: [[0.92, 0.9, 0.86], [0.35, 0.65, 0.62], [0.95, 0.75, 0.35]], h: [14, 28] },
+  { name: 'Harbor South', colors: [[0.35, 0.65, 0.62], [0.6, 0.8, 0.65], [0.93, 0.82, 0.68]], h: [8, 24] },
+];
+// [bx][bz] -> district index. Rows are bz (south to north), columns bx.
+const DISTRICT_MAP = [
+  [0, 0, 3, 5, 5, 5],
+  [0, 0, 3, 5, 5, 5],
+  [1, 1, -1, 6, 6, 6],
+  [1, 1, 6, 6, 6, 6],
+  [2, 2, 4, 7, 7, 7],
+  [2, 2, 4, 7, 7, 7],
+];
+
+/** The district a ground point sits in (Bay Park for the park block,
+ * Marina for the beach strip east of the city, Old Town off-grid). */
+export function districtAt(x, z) {
+  if (x > CITY_MAX) return DISTRICTS[2]; // the beach belongs to Marina
+  let bx = -1;
+  let bz = -1;
+  for (let i = 0; i < 6; i += 1) {
+    if (x >= LINES[i] && x < LINES[i + 1]) bx = i;
+    if (z >= LINES[i] && z < LINES[i + 1]) bz = i;
+  }
+  if (bx < 0 || bz < 0) return DISTRICTS[0];
+  const id = DISTRICT_MAP[bx][bz];
+  if (id < 0) return { name: 'Bay Park', colors: DISTRICTS[0].colors, h: [8, 18] };
+  return DISTRICTS[id];
+}
+
+// --- Fixed places: the garage (car upgrades), the shop (ammo) and the
+// safehouse (heal + save). All sit on a road line, never inside a building,
+// so they are always reachable on foot or by car. ---
+export const PLACES = {
+  garage: { name: 'Sunset Garage', x: -104, z: 46, color: [1.0, 0.6, 0.15] },
+  shop: { name: 'Ammo & More', x: 104, z: -46, color: [0.3, 0.9, 0.4] },
+  safehouse: { name: 'Safehouse', x: -52, z: 24, color: [0.35, 0.6, 1.0] },
+};
 
 function blockBounds(bx, bz) {
   return {
@@ -49,6 +93,10 @@ export function generateCity(rng) {
         continue;
       }
       const nearBeach = bx === 5;
+      const district = districtAt(
+        (blockBounds(bx, bz).x0 + blockBounds(bx, bz).x1) / 2,
+        (blockBounds(bx, bz).z0 + blockBounds(bx, bz).z1) / 2,
+      );
       const count = rng.chance(0.55) ? 1 : rng.int(2, 4);
       for (let i = 0; i < count; i += 1) {
         const cols = count === 1 ? 1 : 2;
@@ -63,8 +111,8 @@ export function generateCity(rng) {
         const z = b.z0 + ri * ch + ch / 2 + rng.range(-2, 2);
         const h = nearBeach
           ? rng.range(22, 46)
-          : rng.range(8, 26) + (Math.abs(bx - 2.5) + Math.abs(bz - 2.5) < 2 ? 8 : 0);
-        const color = rng.pick(BUILDING_COLORS);
+          : rng.range(district.h[0], district.h[1]) + (Math.abs(bx - 2.5) + Math.abs(bz - 2.5) < 2 ? 8 : 0);
+        const color = rng.pick(district.colors);
         const building = { x, z, w, d, h, color };
         buildings.push(building);
         // A neon sign on some buildings, facing a random street.
@@ -204,6 +252,19 @@ export function buildCityMesh(city) {
   }
   m.box(222, 2.6, 0, 5, 4, 6, [0.85, 0.5, 0.4], [0.7, 0.4, 0.32]);
   m.box(222, 5.2, 0, 6, 1, 7, [0.5, 0.3, 0.25]);
+
+  // Garage, shop and safehouse kiosks: a low canopy in the place colour
+  // with a glowing sign, so each one reads from down the street.
+  for (const key of Object.keys(PLACES)) {
+    const p = PLACES[key];
+    m.box(p.x, 0.5, p.z, 7, 1, 5, [0.3, 0.3, 0.34]);
+    m.box(p.x, 3.4, p.z, 7.6, 0.5, 5.6, p.color, p.color, 0.35);
+    m.box(p.x, 4.6, p.z, 4.5, 1.6, 0.3, p.color, p.color, 0.9);
+    m.cylinder(p.x - 3.2, 0, p.z - 2.2, 0.18, 3.2, [0.25, 0.25, 0.28], 6);
+    m.cylinder(p.x + 3.2, 0, p.z - 2.2, 0.18, 3.2, [0.25, 0.25, 0.28], 6);
+    m.cylinder(p.x - 3.2, 0, p.z + 2.2, 0.18, 3.2, [0.25, 0.25, 0.28], 6);
+    m.cylinder(p.x + 3.2, 0, p.z + 2.2, 0.18, 3.2, [0.25, 0.25, 0.28], 6);
+  }
 
   return m;
 }

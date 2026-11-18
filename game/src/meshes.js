@@ -68,6 +68,56 @@ export function buildCoinMesh() {
   return m;
 }
 
+/** A police helicopter: body, tail boom, skids and a rotor bar that spins
+ * (the rotor is a separate mesh, rotated each frame in main.js). */
+export function buildHeliMesh() {
+  const m = new MeshBuilder();
+  const white = [0.92, 0.92, 0.95];
+  const dark = [0.15, 0.18, 0.25];
+  m.box(0, 0, 0, 2.6, 1.6, 3.4, white, shade(white, 1.1));
+  m.box(0, 0.1, 1.9, 1.6, 1.0, 1.2, [0.14, 0.18, 0.26], [0.2, 0.26, 0.36]);
+  m.box(0, 0.1, -3.2, 0.7, 0.7, 3.6, white);
+  m.box(0, 0.9, -4.9, 0.5, 1.6, 0.3, dark);
+  m.box(-1.1, -0.9, 0.8, 0.18, 0.5, 2.6, dark);
+  m.box(1.1, -0.9, 0.8, 0.18, 0.5, 2.6, dark);
+  m.box(0, -0.7, -1.2, 0.5, 0.5, 0.5, [1.0, 0.85, 0.2], [1.0, 0.85, 0.2], 0.9);
+  return m;
+}
+
+/** The spinning rotor bar for the helicopter, drawn separately. */
+export function buildRotorMesh() {
+  const m = new MeshBuilder();
+  m.box(0, 0, 0, 9.5, 0.12, 0.5, [0.12, 0.12, 0.14]);
+  m.box(0, 0, 0, 0.5, 0.12, 9.5, [0.12, 0.12, 0.14]);
+  m.box(0, 0.08, 0, 0.7, 0.2, 0.7, [0.3, 0.3, 0.34]);
+  return m;
+}
+
+/** A bullet tracer: a unit-long thin box along +Z, stretched to the shot
+ * length with matModelScale and faded out over a few frames. */
+export function buildTracerMesh() {
+  const m = new MeshBuilder();
+  m.box(0, 0, 0.5, 0.12, 0.12, 1, [1.0, 0.85, 0.3], [1.0, 0.85, 0.3], 0.95);
+  return m;
+}
+
+/** A glowing marker pillar for a place (garage, shop, safehouse): a short
+ * column with a floating diamond, tinted in the place colour at draw time. */
+export function buildMarkerMesh() {
+  const m = new MeshBuilder();
+  m.cylinder(0, 0, 0, 0.7, 7, [1, 1, 1], 8, 0.85);
+  m.octa(0, 8.5, 0, 1.4, [1, 1, 1], 0.9);
+  return m;
+}
+
+/** An ammo pickup: a small green crate with a glowing top. */
+export function buildAmmoMesh() {
+  const m = new MeshBuilder();
+  m.box(0, 0.4, 0, 1.1, 0.8, 0.8, [0.25, 0.55, 0.25], [0.35, 0.65, 0.3]);
+  m.box(0, 0.9, 0, 0.9, 0.25, 0.6, [0.5, 1.0, 0.4], [0.5, 1.0, 0.4], 0.9);
+  return m;
+}
+
 /** A waypoint beacon: a tall, wide glowing pillar with floating diamonds,
  * built to read from 100+ units away, above the rooftops. */
 export function buildBeaconMesh() {

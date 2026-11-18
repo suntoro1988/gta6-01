@@ -11,7 +11,7 @@
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
@@ -23,6 +23,16 @@ mkdirSync(out, { recursive: true });
 cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
 mkdirSync(join(out, 'screenshots'), { recursive: true });
 if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
+
+// Warn (don't fail) when a staged screenshot is missing or stale, so a
+// half-restaged entry is obvious before the dossier is written.
+if (existsSync(join(here, 'shots.json'))) {
+  const wanted = JSON.parse(readFileSync(join(here, 'shots.json'), 'utf-8'));
+  const have = existsSync(join(here, 'screenshots')) ? readdirSync(join(here, 'screenshots')) : [];
+  for (const shot of wanted) {
+    if (!have.includes(shot.name)) console.warn(`warning: missing screenshot ${shot.name} (${shot.query})`);
+  }
+}
 
 // The scorer's own caps (reference/gate.json): only text_max_bytes shapes the
 // bytes; the others refuse an entry the scorer would refuse — more than 4

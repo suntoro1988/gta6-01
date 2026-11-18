@@ -15,6 +15,7 @@ function giveCar(game, x, z, heading, speed) {
     speed,
     steer: 0,
     color: PLAYER_CAR_COLOR,
+    model: 'Comet',
   };
   game.playerCar = car;
   game.player.onFoot = false;
@@ -34,13 +35,16 @@ function placePolice(game, car, offsets) {
   const fz = Math.cos(car.heading);
   const rx = Math.cos(car.heading);
   const rz = -Math.sin(car.heading);
-  game.police = offsets.map(([back, side]) => {
+  game.police = offsets.map(([back, side], i) => {
     const cop = createPoliceCar(
       car.x - fx * back + rx * side,
       car.z - fz * back + rz * side,
     );
     cop.heading = car.heading;
     cop.speed = 24;
+    cop.name = `UNIT ${12 + i * 7}`;
+    cop.dist = Math.hypot(cop.x - car.x, cop.z - car.z);
+    cop.tactic = back < 0 ? 'ROADBLOCK' : 'PURSUIT';
     return cop;
   });
 }
@@ -70,11 +74,17 @@ export function stageShot(name, game) {
     game.state = 'playing';
     game.money = 1250;
     game.heat = 210;
+    game.startMission(3); // Street Race: checkpoints + the race card on screen
+    game.radioStationName = 'BAY FM';
+    game.radioTrack = { title: 'Sunset Cruise', artist: 'The Palms' };
+    game.ammo.pistol = 12;
+    game.unlocked.pistol = true;
+    game.weaponIndex = 1;
     giveCar(game, 0, -40, Math.PI, 26);
-    game.jobTarget = { x: 0, z: -150, name: 'Hotel Bayview' };
-    game.jobTimeLeft = 64;
     driveFor(game, 1.6, DRIVE);
     const car = game.playerCar;
+    game.jobTarget = { x: 0, z: -150, name: 'Checkpoint 1' };
+    game.missionTimeLeft = 64;
     placePolice(game, car, [[12, 5], [18, -5]]);
     // Traffic and a pedestrian ahead, a coin on the road, beacon ahead:
     // the chase reads from behind, the mission reads in the middle.
@@ -85,8 +95,8 @@ export function stageShot(name, game) {
     return {
       target: [car.x, 2, car.z],
       yaw: car.heading + Math.PI,
-      pitch: 0.48,
-      dist: 31,
+      pitch: 0.38,
+      dist: 28,
     };
   }
 
@@ -95,12 +105,28 @@ export function stageShot(name, game) {
     game.money = 4800;
     game.heat = 460;
     game.jobsDone = 6;
+    game.startMission(6); // The Big Heist, at 4 stars: heli + roadblock in frame
+    game.radioStationName = 'SUNSET DRIVE';
+    game.radioTrack = { title: 'Full Throttle', artist: 'Neon Coast' };
+    game.ammo.pistol = 24;
+    game.ammo.smg = 30;
+    game.unlocked.pistol = true;
+    game.unlocked.smg = true;
+    game.weaponIndex = 3;
     giveCar(game, -40, 0, Math.PI / 2, 16);
-    game.jobTarget = { x: 120, z: 0, name: 'The Pier' };
-    game.jobTimeLeft = 41;
     driveFor(game, 1.2, DRIVE);
     const car = game.playerCar;
+    game.jobTarget = { x: 120, z: 0, name: 'Marina Vault' };
+    game.missionTimeLeft = 41;
     placePolice(game, car, [[8, 4], [13, -5], [18, 5], [-14, 6]]);
+    // Park the helicopter in frame: ahead-right of the car, low enough to
+    // read against the sky, its spotlight disc on the road below it.
+    if (game.heli) {
+      game.heli.x = car.x + 24;
+      game.heli.z = car.z - 10;
+      game.heli.y = 14;
+      game.heli.rotor = 0.6;
+    }
     stageTrafficAndPed(game, car, car.x + 45, 0, Math.PI / 2, car.x + 32, 7, -Math.PI / 2);
     game.pickups[0] = { x: car.x + 24, z: 2, amount: 25, taken: false, spin: -2.3, respawn: 0 };
     // Rear view, raised and pulled back so all four cops read — the two
@@ -109,8 +135,8 @@ export function stageShot(name, game) {
     return {
       target: [car.x, 2, car.z],
       yaw: car.heading + Math.PI,
-      pitch: 0.48,
-      dist: 32,
+      pitch: 0.38,
+      dist: 29,
     };
   }
 
@@ -118,6 +144,12 @@ export function stageShot(name, game) {
     game.state = 'playing';
     game.money = 350;
     game.heat = 120;
+    game.startMission(1); // Package Run, on foot with a pistol in hand
+    game.radioStationName = 'NEON NIGHTS';
+    game.radioTrack = { title: 'Ultraviolet', artist: 'DJ Sunset' };
+    game.ammo.pistol = 12;
+    game.unlocked.pistol = true;
+    game.weaponIndex = 1;
     // On a city sidewalk, not the beach: the player stands on the z = 52
     // road, facing the camera, with the street running west.
     game.player.x = -20;
@@ -125,7 +157,7 @@ export function stageShot(name, game) {
     game.player.heading = Math.PI / 2;
     game.player.onFoot = true;
     game.jobTarget = { x: -110, z: 52, name: 'Bay Park' };
-    game.jobTimeLeft = 72;
+    game.missionTimeLeft = 72;
     driveFor(game, 0.5, IDLE);
     // A parked car and a coin on the street ahead, a traffic car coming
     // down the road, pedestrians on the sidewalk — after driveFor, so the
@@ -167,18 +199,21 @@ export function stageShot(name, game) {
   game.state = 'playing';
   game.money = 1250;
   game.heat = 210;
+  game.startMission(1); // Package Run: the mission card reads on the cover
+  game.radioStationName = 'BAY FM';
+  game.radioTrack = { title: 'Golden Hour', artist: 'Marina Lights' };
   giveCar(game, 0, -60, 0, 26);
-  game.jobTarget = { x: 0, z: 40, name: 'Hotel Bayview' };
-  game.jobTimeLeft = 64;
   driveFor(game, 1.6, DRIVE);
   const car = game.playerCar;
+  game.jobTarget = { x: 0, z: 40, name: 'Hotel Bayview' };
+  game.missionTimeLeft = 64;
   placePolice(game, car, [[12, 5], [18, -5]]);
   stageTrafficAndPed(game, car, 0, car.z + 38, 0, 7, car.z + 24, -Math.PI / 2);
   game.pickups[0] = { x: -2, z: car.z + 28, amount: 25, taken: false, spin: -2.3, respawn: 0 };
   return {
     target: [car.x, 2, car.z],
     yaw: car.heading + Math.PI,
-    pitch: 0.45,
-    dist: 31,
+    pitch: 0.38,
+    dist: 28,
   };
 }

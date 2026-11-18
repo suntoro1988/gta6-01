@@ -23,5 +23,23 @@ export function createRng(seed) {
     chance(p) {
       return next() < p;
     },
+    /** Fisher-Yates shuffle, in place, from the same seeded stream. */
+    shuffle(list) {
+      for (let i = list.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(next() * (i + 1));
+        const t = list[i];
+        list[i] = list[j];
+        list[j] = t;
+      }
+      return list;
+    },
+    /** A random element that is not `avoid` (up to 4 tries, then any). */
+    pickNot(list, avoid) {
+      let v = list[Math.floor(next() * list.length)];
+      for (let i = 0; i < 4 && v === avoid; i += 1) {
+        v = list[Math.floor(next() * list.length)];
+      }
+      return v;
+    },
   };
 }

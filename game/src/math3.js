@@ -96,3 +96,29 @@ export function turnToward(from, to, maxStep) {
   if (Math.abs(d) <= maxStep) return to;
   return from + Math.sign(d) * maxStep;
 }
+
+/** Model matrix like matModel, but with a different scale per axis — for
+ * stretching a unit-length mesh (a bullet tracer) to a real length. */
+export function matModelScale(yaw, x, y, z, sx, sy, sz) {
+  const c = Math.cos(yaw);
+  const s = Math.sin(yaw);
+  const m = new Float32Array(16);
+  m[0] = c * sx; m[1] = 0; m[2] = -s * sx; m[3] = 0;
+  m[4] = 0; m[5] = sy; m[6] = 0; m[7] = 0;
+  m[8] = s * sz; m[9] = 0; m[10] = c * sz; m[11] = 0;
+  m[12] = x; m[13] = y; m[14] = z; m[15] = 1;
+  return m;
+}
+
+/** Linear interpolation, clamped to [0, 1] on t. */
+export function lerp(a, b, t) {
+  const k = t < 0 ? 0 : t > 1 ? 1 : t;
+  return a + (b - a) * k;
+}
+
+/** Squared distance on the ground plane, for cheap range checks. */
+export function dist2(ax, az, bx, bz) {
+  const dx = ax - bx;
+  const dz = az - bz;
+  return dx * dx + dz * dz;
+}

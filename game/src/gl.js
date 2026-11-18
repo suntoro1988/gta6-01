@@ -276,11 +276,14 @@ export function createRenderer(canvas) {
   return {
     gl,
     resize(w, h) {
+      // Render at device pixel ratio (capped at 2) so the dusk light stays
+      // crisp on hidpi screens; the canvas CSS size stays 100%.
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
       width = w;
       height = h;
-      canvas.width = w;
-      canvas.height = h;
-      gl.viewport(0, 0, w, h);
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+      gl.viewport(0, 0, canvas.width, canvas.height);
     },
     get aspect() {
       return width / Math.max(1, height);
@@ -293,7 +296,7 @@ export function createRenderer(canvas) {
       gl.uniformMatrix4fv(mainLoc.proj, false, proj);
       gl.uniformMatrix4fv(mainLoc.view, false, view);
       gl.uniform3fv(mainLoc.sunDir, sunDir);
-      gl.uniform3f(mainLoc.fogColor, 0.98, 0.62, 0.45);
+      gl.uniform3f(mainLoc.fogColor, 0.96, 0.55, 0.48); // orange-purple dusk haze
       gl.uniform2f(mainLoc.fogRange, 90, 320);
       return { view, proj };
     },

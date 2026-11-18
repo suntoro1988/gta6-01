@@ -14,23 +14,101 @@
   #stats { top: 14px; left: 16px; }
   #cash { font-size: 34px; font-weight: 800; color: #ffd23e; letter-spacing: 1px; }
   #stars { font-size: 26px; letter-spacing: 4px; color: #ffd23e; margin-top: 2px; }
-  #job { font-size: 15px; margin-top: 6px; max-width: 340px; line-height: 1.35; }
+  #heat-bar { width: 170px; height: 7px; background: rgba(0,0,0,0.55); border-radius: 4px; margin-top: 4px; overflow: hidden; }
+  #heat-fill { height: 100%; width: 0%; background: #ffd23e; border-radius: 4px; transition: width 0.2s; }
+  #heat-label { font-size: 10px; letter-spacing: 2px; color: rgba(255,255,255,0.75); margin-top: 2px; }
+  #rep-line { font-size: 13px; font-weight: 800; color: #7df9d4; margin-top: 5px; letter-spacing: 1px; }
+  #rep-bar { width: 170px; height: 5px; background: rgba(0,0,0,0.55); border-radius: 3px; margin-top: 3px; overflow: hidden; }
+  #rep-fill { height: 100%; width: 0%; background: #7df9d4; border-radius: 3px; }
+  #district { font-size: 13px; color: #ffe9a8; margin-top: 5px; letter-spacing: 1px; }
+  /* Mission card: number, name, big timer, stage bar, next objective. */
+  #mission-card { margin-top: 10px; width: 300px; background: rgba(20,10,30,0.62);
+    border: 1px solid rgba(255,210,62,0.45); border-left: 5px solid #ffd23e;
+    border-radius: 8px; padding: 9px 12px; }
+  #mission-num { font-size: 11px; letter-spacing: 2px; color: #ffd23e; font-weight: 800; }
+  #mission-name { font-size: 19px; font-weight: 800; margin-top: 2px; }
+  #mission-timer { font-size: 30px; font-weight: 800; color: #ffd23e; float: right; margin-top: -26px; }
+  #mission-stage { font-size: 13px; margin-top: 3px; color: #ffe9a8; }
+  #mission-stage-bar { height: 6px; background: rgba(0,0,0,0.55); border-radius: 3px; margin-top: 5px; overflow: hidden; }
+  #mission-stage-fill { height: 100%; width: 0%; background: #ffd23e; border-radius: 3px; transition: width 0.3s; }
+  #mission-next { font-size: 12px; margin-top: 5px; color: rgba(255,255,255,0.85); }
   #minimap { top: 14px; right: 16px; width: 150px; height: 150px;
     border: 2px solid rgba(255,255,255,0.55); border-radius: 8px; background: #101018; }
-  #speed { bottom: 18px; right: 20px; font-size: 30px; font-weight: 800; display: none; }
+  /* Police response panel, under the minimap. */
+  #police-panel { top: 172px; right: 16px; width: 250px; background: rgba(20,10,30,0.62);
+    border: 1px solid rgba(255,80,64,0.5); border-radius: 8px; padding: 8px 10px; }
+  #police-panel h3 { margin: 0 0 5px; font-size: 11px; letter-spacing: 2px; color: #ff8a7a; }
+  .unit { display: flex; gap: 6px; font-size: 12px; line-height: 1.7; align-items: baseline; }
+  .unit .uname { font-weight: 800; color: #fff; min-width: 52px; }
+  .unit .utactic { color: #ffd23e; flex: 1; }
+  .unit .udist { color: rgba(255,255,255,0.85); min-width: 34px; text-align: right; }
+  .unit .ustatus { font-weight: 800; font-size: 10px; letter-spacing: 1px; }
+  .unit .ustatus.sight { color: #ff5040; }
+  .unit .ustatus.search { color: #7df9d4; }
+  .unit .ustatus.down { color: #999; }
+  .unit.quiet { color: rgba(255,255,255,0.7); }
+  #heli-line { margin-top: 5px; padding-top: 5px; border-top: 1px solid rgba(255,154,60,0.5);
+    font-size: 12px; font-weight: 800; color: #ff9a3c; letter-spacing: 1px; display: none; }
+  #speed { bottom: 18px; right: 20px; text-align: right; display: none; }
+  #vehicle-name { font-size: 15px; font-weight: 800; color: #ffe9a8; letter-spacing: 2px; }
+  #speed-num { font-size: 52px; font-weight: 800; line-height: 1; }
+  #speed-unit { font-size: 15px; font-weight: 800; color: rgba(255,255,255,0.8); }
+  /* Vitals: health + armour, above the speedometer. */
+  #vitals { bottom: 118px; right: 20px; width: 170px; text-align: right; }
+  .vital-row { display: flex; align-items: center; gap: 6px; justify-content: flex-end; margin-top: 4px; }
+  .vital-row label { font-size: 10px; letter-spacing: 2px; color: rgba(255,255,255,0.85); }
+  .vital-bar { flex: 1; height: 8px; background: rgba(0,0,0,0.55); border-radius: 4px; overflow: hidden; }
+  .vital-bar div { height: 100%; border-radius: 4px; transition: width 0.2s; }
+  #health-fill { background: #2dd44f; width: 100%; }
+  #armour-fill { background: #5a8cff; width: 0%; }
+  #health-num { font-size: 13px; font-weight: 800; min-width: 26px; }
+  /* Radio widget, bottom left above the help box. */
+  #radio-widget { bottom: 108px; left: 16px; width: 300px; background: rgba(20,10,30,0.62);
+    border: 1px solid rgba(255,94,122,0.5); border-radius: 8px; padding: 8px 12px;
+    display: flex; align-items: center; gap: 10px; }
+  #radio-station { font-size: 15px; font-weight: 800; color: #ff8fb0; letter-spacing: 1px; }
+  #radio-track { font-size: 12px; color: #ffe9a8; margin-top: 2px; }
+  #radio-btn { margin-left: auto; font-size: 12px; font-weight: 800; background: #ff5e7a; color: #fff;
+    border: none; padding: 7px 12px; border-radius: 16px; cursor: pointer; white-space: nowrap; }
+  /* Weapon slots 1-4, bottom centre-left. */
+  #weapon-slots { bottom: 18px; left: 50%; transform: translateX(-50%); display: flex; gap: 6px; }
+  .wslot { width: 74px; background: rgba(20,10,30,0.62); border: 1px solid rgba(255,255,255,0.35);
+    border-radius: 6px; padding: 5px 6px; font-size: 11px; text-align: center; }
+  .wslot.active { border-color: #ffd23e; background: rgba(60,40,10,0.75); box-shadow: 0 0 10px rgba(255,210,62,0.5); }
+  .wslot.locked { opacity: 0.45; }
+  .wslot .wkey { float: left; font-weight: 800; color: #ffd23e; }
+  .wslot .wname { font-weight: 800; display: block; }
+  .wslot .wammo { color: #ffe9a8; }
+  /* Crew dialog card, bottom centre above the weapon slots. */
+  #dialog { bottom: 76px; left: 50%; transform: translateX(-50%); width: 460px; max-width: 90vw;
+    background: rgba(20,10,30,0.78); border: 1px solid rgba(255,255,255,0.35); border-radius: 10px;
+    padding: 10px 14px; display: none; align-items: center; gap: 12px; }
+  #dialog-portrait { width: 44px; height: 44px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: 800; color: #fff; }
+  #dialog-name { font-size: 13px; font-weight: 800; letter-spacing: 2px; color: #ffd23e; }
+  #dialog-text { font-size: 14px; line-height: 1.4; margin-top: 2px; }
+  #popups { top: 38%; right: 24px; text-align: right; pointer-events: none; }
+  .popup { font-size: 24px; font-weight: 800; color: #7df9d4; margin-top: 6px;
+    text-shadow: 0 2px 8px rgba(0,0,0,0.8); }
   #message { top: 16px; left: 50%; transform: translateX(-50%); font-size: 21px; font-weight: 700;
     color: #ffe9a8; background: rgba(20,10,30,0.55); padding: 8px 18px; border-radius: 20px;
     transition: opacity 0.4s; pointer-events: none; white-space: nowrap; }
   #beacon-arrow { top: 78px; left: 50%; font-size: 20px; font-weight: 800; color: #ffd23e;
     text-shadow: 0 2px 6px rgba(0,0,0,0.8); pointer-events: none; display: none; white-space: nowrap; }
-  #steal-prompt { bottom: 110px; left: 50%; transform: translateX(-50%); font-size: 19px; font-weight: 800;
+  #steal-prompt { bottom: 150px; left: 50%; transform: translateX(-50%); font-size: 19px; font-weight: 800;
     color: #fff; background: rgba(20,10,30,0.65); padding: 8px 18px; border-radius: 20px;
+    pointer-events: none; display: none; white-space: nowrap; }
+  #interact-prompt { bottom: 190px; left: 50%; transform: translateX(-50%); font-size: 16px; font-weight: 800;
+    color: #7df9d4; background: rgba(20,10,30,0.65); padding: 8px 18px; border-radius: 20px;
     pointer-events: none; display: none; white-space: nowrap; }
   #help { bottom: 14px; left: 16px; font-size: 13px; line-height: 1.6; color: rgba(255,255,255,0.85);
     background: rgba(20,10,30,0.45); padding: 8px 12px; border-radius: 8px; }
   .overlay { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
     align-items: center; justify-content: center; text-align: center; color: #fff; }
   #title { background: radial-gradient(ellipse at 50% 65%, rgba(20,8,28,0.05) 0%, rgba(20,8,28,0.55) 78%); }
+  #logo-sun { width: 150px; height: 150px; border-radius: 50%;
+    background: radial-gradient(circle at 50% 42%, #ffd23e 0%, #ff7a3c 52%, #ff5e7a 78%, rgba(255,94,122,0) 100%);
+    box-shadow: 0 0 60px rgba(255,122,60,0.75); margin-bottom: -42px; }
   #title h1 { font-size: 84px; margin: 0; letter-spacing: 6px; color: #ff5e7a;
     text-shadow: 0 0 24px rgba(255,94,122,0.8), 0 4px 0 #7a1030, 0 8px 24px rgba(0,0,0,0.8); }
   #title h2 { font-size: 22px; margin: 6px 0 26px; font-weight: 400; color: #ffe9a8; letter-spacing: 2px; }
@@ -38,6 +116,13 @@
     padding: 14px 42px; border-radius: 30px; cursor: pointer; box-shadow: 0 6px 24px rgba(255,94,122,0.6); }
   #title .controls { margin-top: 28px; font-size: 15px; line-height: 1.9; color: rgba(255,255,255,0.92);
     background: rgba(20,10,30,0.5); padding: 12px 22px; border-radius: 10px; }
+  #crew-row { display: flex; gap: 14px; margin-top: 22px; }
+  .crew-card { background: rgba(20,10,30,0.55); border: 1px solid rgba(255,255,255,0.3);
+    border-radius: 10px; padding: 10px 16px; min-width: 110px; }
+  .crew-card .face { width: 40px; height: 40px; border-radius: 50%; margin: 0 auto 6px;
+    display: flex; align-items: center; justify-content: center; font-size: 19px; font-weight: 800; }
+  .crew-card .cname { font-weight: 800; letter-spacing: 2px; font-size: 14px; }
+  .crew-card .crole { font-size: 12px; color: #ffe9a8; margin-top: 2px; }
   #busted { background: rgba(60,0,10,0.72); display: none; }
   #busted h1 { font-size: 72px; margin: 0; color: #ff5040; letter-spacing: 8px;
     text-shadow: 0 4px 0 #5a0a00, 0 8px 24px rgba(0,0,0,0.8); }
@@ -51,6 +136,25 @@
   #title .continue { font-size: 19px; font-weight: 800; background: #ffd23e; color: #40200a; border: none;
     padding: 12px 34px; border-radius: 26px; cursor: pointer; margin-top: 14px; display: none; }
   #best-line { font-size: 15px; color: #ffe9a8; margin: 14px 0 0; display: none; }
+  /* Full-screen city map (Tab). */
+  #map-overlay { position: fixed; inset: 0; z-index: 20; display: none; flex-direction: column;
+    align-items: center; justify-content: center; background: rgba(8,8,18,0.88); color: #fff; }
+  #map-overlay h1 { margin: 0 0 10px; font-size: 28px; letter-spacing: 4px; color: #ffd23e; }
+  #map-body { display: flex; gap: 20px; align-items: flex-start; }
+  #bigmap { width: 520px; height: 520px; border: 2px solid rgba(255,255,255,0.5); border-radius: 10px; background: #101018; }
+  #map-side { width: 300px; }
+  #map-side h2 { font-size: 13px; letter-spacing: 2px; color: #7df9d4; margin: 0 0 6px; }
+  .map-mission { display: flex; justify-content: space-between; font-size: 14px; padding: 5px 8px;
+    border-radius: 5px; margin-bottom: 3px; background: rgba(255,255,255,0.06); }
+  .map-mission.done { color: #7df9d4; }
+  .map-mission.active { background: rgba(255,210,62,0.2); color: #ffd23e; font-weight: 800; }
+  .map-mission.locked { color: rgba(255,255,255,0.45); }
+  #map-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 12px; }
+  .map-stat { background: rgba(255,255,255,0.06); border-radius: 5px; padding: 5px 8px; font-size: 13px;
+    display: flex; justify-content: space-between; }
+  #map-legend { margin-top: 12px; font-size: 12px; line-height: 1.8; color: rgba(255,255,255,0.85); }
+  #map-close { margin-top: 16px; font-size: 16px; font-weight: 800; background: #ffd23e; color: #40200a;
+    border: none; padding: 10px 28px; border-radius: 22px; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -59,23 +163,62 @@
 <div class="panel" id="stats">
   <div id="cash">$0</div>
   <div id="stars">☆☆☆☆☆</div>
-  <div id="job"></div>
+  <div id="heat-bar"><div id="heat-fill"></div></div>
+  <div id="heat-label">TRACE</div>
+  <div id="rep-line">REP LV 1 · ROOKIE</div>
+  <div id="rep-bar"><div id="rep-fill"></div></div>
+  <div id="district">Old Town</div>
+  <div id="mission-card">
+    <div id="mission-num">MISSION 1/8</div>
+    <div id="mission-timer">1:15</div>
+    <div id="mission-name">First Wheels — $100</div>
+    <div id="mission-stage">STAGE 1/1 · Steal a car</div>
+    <div id="mission-stage-bar"><div id="mission-stage-fill"></div></div>
+    <div id="mission-next">NEXT: Finish the job</div>
+  </div>
 </div>
 <canvas id="minimap" class="panel" width="150" height="150"></canvas>
+<div class="panel" id="police-panel">
+  <h3>POLICE RESPONSE</h3>
+  <div id="police-list"></div>
+  <div id="heli-line"></div>
+</div>
+<div class="panel" id="radio-widget">
+  <div>
+    <div id="radio-station">♪ Radio off</div>
+    <div id="radio-track">Press M for music</div>
+  </div>
+  <button id="radio-btn">STATION ▶</button>
+</div>
+<div class="panel" id="weapon-slots"></div>
+<div class="panel" id="vitals">
+  <div class="vital-row"><label>HEALTH</label><div class="vital-bar"><div id="health-fill"></div></div><span id="health-num">100</span></div>
+  <div class="vital-row"><label>ARMOUR</label><div class="vital-bar"><div id="armour-fill"></div></div></div>
+</div>
+<div class="panel" id="speed"><div id="vehicle-name">Comet</div><span id="speed-num">0</span> <span id="speed-unit">mph</span></div>
+<div class="panel" id="popups"></div>
+<div class="panel" id="dialog"><div id="dialog-portrait">M</div><div><div id="dialog-name">MARA</div><div id="dialog-text"></div></div></div>
 <div class="panel" id="message" style="opacity: 0"></div>
 <div class="panel" id="beacon-arrow"></div>
 <div class="panel" id="steal-prompt">Press E to steal this car</div>
-<div class="panel" id="speed">0 mph</div>
+<div class="panel" id="interact-prompt"></div>
 <div class="panel" id="help">
-  <b>WASD</b> move / drive &nbsp;·&nbsp; <b>Mouse drag</b> camera &nbsp;·&nbsp; <b>E</b> enter / exit car<br>
-  <b>Shift</b> run &nbsp;·&nbsp; <b>Space</b> handbrake &nbsp;·&nbsp; <b>R</b> restart &nbsp;·&nbsp; <b>P</b> pause &nbsp;·&nbsp; <b>M</b> mute
+  <b>WASD</b> move / drive &nbsp;·&nbsp; <b>E</b> steal car &nbsp;·&nbsp; <b>F</b> punch &nbsp;·&nbsp; <b>Click</b> shoot<br>
+  <b>Shift</b> run &nbsp;·&nbsp; <b>Space</b> brake &nbsp;·&nbsp; <b>1-4 / Q</b> weapon &nbsp;·&nbsp; <b>G</b> garage / shop<br>
+  <b>Tab</b> map &nbsp;·&nbsp; <b>M</b> radio &nbsp;·&nbsp; <b>N</b> mute &nbsp;·&nbsp; <b>R</b> restart &nbsp;·&nbsp; <b>P</b> pause
 </div>
 <div class="overlay" id="title">
+  <div id="logo-sun"></div>
   <h1>SUNSET BAY</h1>
   <h2>AN OPEN-WORLD CRIME GAME</h2>
   <button class="play" id="play-btn">▶ &nbsp;START ENGINE</button>
   <button class="continue" id="continue-btn">▶ &nbsp;CONTINUE</button>
   <p id="best-line"></p>
+  <div id="crew-row">
+    <div class="crew-card"><div class="face" style="background:#ff5e7a">M</div><div class="cname">MARA</div><div class="crole">Dispatcher</div></div>
+    <div class="crew-card"><div class="face" style="background:#ff9a3c">R</div><div class="cname">RICO</div><div class="crole">Mechanic</div></div>
+    <div class="crew-card"><div class="face" style="background:#2dd4bf">D</div><div class="cname">DEX</div><div class="crole">Wheelman</div></div>
+  </div>
   <div class="controls">
     Steal a car with <b>E</b>, follow the golden beacon to do jobs and earn cash.<br>
     The cops come when your wanted stars rise — outrun them to cool off.<br>
@@ -90,6 +233,25 @@
 <div class="overlay" id="paused">
   <h1>PAUSED</h1>
   <p>Press P to resume · R to restart</p>
+</div>
+<div id="map-overlay">
+  <h1>SUNSET BAY — CITY MAP</h1>
+  <div id="map-body">
+    <canvas id="bigmap" width="520" height="520"></canvas>
+    <div id="map-side">
+      <h2>MISSIONS</h2>
+      <div id="map-missions"></div>
+      <h2 style="margin-top:14px">STATS</h2>
+      <div id="map-stats"></div>
+      <div id="map-legend">
+        <span style="color:#ffd23e">●</span> Job target &nbsp; <span style="color:#fff">▲</span> You<br>
+        <span style="color:#ff4030">●</span> Police &nbsp; <span style="color:#ff9a3c">●</span> AIR-1 heli<br>
+        <span style="color:#ff9a3c">■</span> Garage &nbsp; <span style="color:#2dd44f">■</span> Shop &nbsp; <span style="color:#5a8cff">■</span> Safehouse<br>
+        <span style="color:#2dd4bf">■</span> Car to steal &nbsp; <span style="color:#20202a">■</span> Traffic
+      </div>
+    </div>
+  </div>
+  <button id="map-close">CLOSE MAP (TAB)</button>
 </div>
 <script type="module" src="./src/main.js"></script>
 </body>

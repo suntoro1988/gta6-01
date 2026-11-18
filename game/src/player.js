@@ -13,11 +13,16 @@ export function createPlayer(x, z) {
     moving: false,
     bob: 0,
     onFoot: true,
+    health: 100, // 0 = busted; restored at the safehouse, slowly when cool
+    punchT: 0, // melee swing cooldown (also drives the punch lean in render)
+    hurtT: 0, // invulnerable window after a cop shoves the player
   };
 }
 
 /** One step on foot. camYaw is the camera orbit angle (see main.js). */
 export function stepPlayer(p, input, camYaw, dt, colliders, cars) {
+  if (p.punchT > 0) p.punchT -= dt;
+  if (p.hurtT > 0) p.hurtT -= dt;
   const fwd = (input.forward ? 1 : 0) - (input.back ? 1 : 0);
   const strafe = (input.right ? 1 : 0) - (input.left ? 1 : 0);
   // Camera forward on the ground is (-sin yaw, -cos yaw); right is (cos yaw, -sin yaw).

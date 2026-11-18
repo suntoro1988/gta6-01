@@ -5,6 +5,12 @@ import { clamp, turnToward } from './math3.js';
 
 export const CAR_RADIUS = 1.7;
 
+/** Model names, so the HUD can name the car you are driving. */
+export const CAR_MODELS = [
+  'Comet', 'Sunrise', 'Bayliner', 'Marlin', 'Palms', 'Coral',
+  'Tide', 'Solstice', 'Lagoon', 'Dune', 'Reef', 'Sirocco',
+];
+
 /** Push a circle out of every building AABB it overlaps. Returns the
  * corrected position, whether it hit, and the push direction (nx, nz):
  * the wall normal, for wall-following steering. */
@@ -62,14 +68,18 @@ export function resolveCarPair(a, b) {
   return Math.abs(rel);
 }
 
-/** One step of the player's car. Returns { crashed, impact }. */
+/** One step of the player's car. Returns { crashed, impact }. Upgrades ride
+ * on car.upgrades { speed, armor, handling } (levels 0-3, from the garage);
+ * a car without them drives stock. Drift state rides on the car too:
+ * drifting while the handbrake is held at speed with steering input. */
 export function stepPlayerCar(car, input, dt, colliders, others) {
+  const up = car.upgrades || { speed: 0, armor: 0, handling: 0 };
   const road = onRoad(car.x, car.z);
-  const maxSpeed = road ? 38 : 25;
+  const maxSpeed = (road ? 38 : 25) * (1 + 0.12 * up.speed);
   // Top speed on a road (38) beats a police car (30): on a straight road
   // the player really does pull away. (Drag balances accel, so the accel
   // has to be well above drag * top speed, or the cap is never reached.)
-  const accel = road ? 20 : 10;
+  const accel = (road ? 20 : 10) * (1 + 0.1 * up.speed);
   if (input.forward) car.speed += accel * dt;
   if (input.back) {
     car.speed -= car.speed > 0.5 ? 26 * dt : 8 * dt;
@@ -80,11 +90,18 @@ export function stepPlayerCar(car, input, dt, colliders, others) {
   // a cop ramming a parked car must not make that car "fast".
   car.drivenSpeed = car.speed;
   const steerTarget = (input.left ? 1 : 0) - (input.right ? 1 : 0);
-  const steerMax = input.handbrake ? 0.85 : 0.55;
-  car.steer += clamp(steerTarget * steerMax - car.steer, -3 * dt, 3 * dt);
+  const steerMax = (input.handbrake ? 0.85 : 0.55) + 0.1 * up.handling;
+  car.steer += clamp(steerTarget * steerMax - car.steer, -(3 + up.handling) * dt, (3 + up.handling) * dt);
   if (Math.abs(car.speed) > 0.2) {
     car.heading += (car.steer * car.speed * dt) / 2.6;
   }
+  // Drift: handbrake + speed + steering. The timer only counts while all
+  // three hold, so a real slide pays and a tap of the brake does not.
+  const wasDrifting = !!car.drifting;
+  car.drifting = !!(input.handbrake && Math.abs(car.speed) > 15 && Math.abs(car.steer) > 0.35);
+  if (car.drifting) car.driftT = (car.driftT || 0) + dt;
+  else if (!wasDrifting) car.driftT = 0;
+  car.driftEnded = wasDrifting && !car.drifting;
   car.x += Math.sin(car.heading) * car.speed * dt;
   car.z += Math.cos(car.heading) * car.speed * dt;
   const before = car.speed;
@@ -150,6 +167,8 @@ export function createTrafficCar(rng, colors) {
     z: 0,
     heading: 0,
     color: rng.pick(colors),
+    model: rng.pick(CAR_MODELS),
+    nmT: 0, // near-miss cooldown: one payout per pass, not per frame
   };
 }
 
@@ -239,7 +258,9 @@ export function stepTraffic(cars, dt, rng, playerCar = null, player = null) {
   }
 }
 
-/** A police car chases the target point, steering and accelerating. */
+/** A police car chases the target point, steering and accelerating.
+ * hp: pistol shots / punches it takes before it is down (3). mode:
+ * 'chase' or 'roadblock' (drives ahead of the player and waits). */
 export function createPoliceCar(x, z) {
   return {
     kind: 'police',
@@ -250,14 +271,67 @@ export function createPoliceCar(x, z) {
     steer: 0,
     color: [0.92, 0.92, 0.95], // white livery, so a cop reads as a cop
     flash: 0,
+    hp: 3,
+    down: false,
+    downT: 0,
+    mode: 'chase',
+    name: '',
+    tactic: 'PURSUIT',
+    dist: 0,
+    // Stuck detection: where it was at the last check, and the timer.
+    lastX: x,
+    lastZ: z,
+    checkT: 0,
+    unstickT: 0,
+    wayX: 0,
+    wayZ: 0,
+    stuckCount: 0,
   };
 }
 
 /** Chase the target. Close in, the cop slows right down and steers hard
  * onto the target instead of orbiting it at speed; on foot the cop is
  * slower than a running player (9 vs 10), so running away really escapes,
- * while standing still gets you busted. */
+ * while standing still gets you busted. A down cop does not move at all. */
 export function stepPolice(car, tx, tz, dt, colliders, others, onFoot = false) {
+  car.flash += dt;
+  if (car.down) {
+    car.downT -= dt;
+    car.speed = 0;
+    return;
+  }
+  // --- Stuck detection: every 1.2 s, check how far the cop actually got.
+  // A cop that is trying to move (speed > 4) but barely moved while still
+  // far from the target is wedged — on a building corner, a parked car, or
+  // a traffic jam. Send it to the nearest road intersection for 2 seconds:
+  // a fresh, open starting point beats pushing at the same wall forever.
+  // The side alternates each time, so a cop wedged on both sides of a
+  // block does not ping-pong between the same two corners. ---
+  car.checkT += dt;
+  if (car.checkT >= 1.2) {
+    car.checkT = 0;
+    const moved = Math.hypot(car.x - car.lastX, car.z - car.lastZ);
+    const dist = Math.hypot(tx - car.x, tz - car.z);
+    if (car.speed > 4 && moved < 2 && dist > 12 && car.unstickT <= 0) {
+      car.stuckCount += 1;
+      car.unstickT = 2;
+      let bx = LINES[0];
+      let bz = LINES[0];
+      for (const line of LINES) {
+        if (Math.abs(line - car.x) < Math.abs(bx - car.x)) bx = line;
+        if (Math.abs(line - car.z) < Math.abs(bz - car.z)) bz = line;
+      }
+      // The intersection itself, nudged to the side that is open: alternate
+      // left/right of the cop's heading so repeated wedges try both ways.
+      const side = car.stuckCount % 2 === 0 ? 1 : -1;
+      const px = -Math.cos(car.heading) * side;
+      const pz = Math.sin(car.heading) * side;
+      car.wayX = bx + px * 10;
+      car.wayZ = bz + pz * 10;
+    }
+    car.lastX = car.x;
+    car.lastZ = car.z;
+  }
   const dist = Math.hypot(tx - car.x, tz - car.z);
   // If the cop is stuck behind something while still far from the target —
   // e.g. a traffic car stopped in the road between it and the player, which
@@ -266,7 +340,12 @@ export function stepPolice(car, tx, tz, dt, colliders, others, onFoot = false) {
   // forever. (At spawn the speed is also low, so only sidestep once close.)
   let aimX = tx;
   let aimZ = tz;
-  if (car.speed < 3 && dist > 6 && dist < 25) {
+  if (car.unstickT > 0) {
+    // Recovery run: aim at the intersection waypoint, at full speed.
+    aimX = car.wayX;
+    aimZ = car.wayZ;
+    car.unstickT -= dt;
+  } else if (car.speed < 3 && dist > 6 && dist < 25) {
     const dx = tx - car.x;
     const dz = tz - car.z;
     const d = Math.hypot(dx, dz) || 1;
@@ -311,5 +390,33 @@ export function stepPolice(car, tx, tz, dt, colliders, others, onFoot = false) {
   car.x = clamp(car.x, WORLD.minX, WORLD.maxX);
   car.z = clamp(car.z, WORLD.minZ, WORLD.maxZ);
   car.x = Math.min(car.x, 186); // police cars stay out of the ocean
-  car.flash += dt;
+}
+
+/** A police helicopter: orbits the player from above once the heat is high
+ * enough, its spotlight pinning the player so the heat drains slower. */
+export function createHeli(x, z) {
+  return {
+    kind: 'heli',
+    x,
+    z,
+    y: 34,
+    heading: 0,
+    angle: 0,
+    rotor: 0,
+    dist: 0,
+  };
+}
+
+/** Circle the target at a fixed radius and height, facing along the orbit. */
+export function stepHeli(heli, tx, tz, dt) {
+  heli.angle += dt * 0.35;
+  const radius = 34;
+  const wantX = tx + Math.sin(heli.angle) * radius;
+  const wantZ = tz + Math.cos(heli.angle) * radius;
+  heli.x += (wantX - heli.x) * Math.min(1, 1.2 * dt);
+  heli.z += (wantZ - heli.z) * Math.min(1, 1.2 * dt);
+  heli.y += (34 - heli.y) * Math.min(1, dt);
+  heli.heading = heli.angle + Math.PI / 2;
+  heli.rotor += dt * 28;
+  heli.dist = Math.hypot(heli.x - tx, heli.z - tz);
 }
