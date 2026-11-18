@@ -1,5 +1,5 @@
-// The city: a 6x6 grid of blocks on a sunset coast, generated from a seed so
-// every run (and every screenshot) shows the same streets.
+// The city: a 6x6 grid of blocks on a sunset coast, generated from a seed
+// so every run (and every screenshot) shows the same streets.
 import { MeshBuilder, shade } from './gl.js';
 
 export const ROAD_W = 12;
@@ -12,28 +12,32 @@ export const WORLD = { minX: -172, maxX: 198, minZ: -172, maxZ: 172 };
 
 const NEON = [
   [1.0, 0.25, 0.55], [0.2, 0.9, 1.0], [1.0, 0.85, 0.2], [0.65, 0.4, 1.0],
+  [0.5, 1.0, 0.3], [1.0, 0.45, 0.85],
 ];
 const WINDOW_LIT = [1.0, 0.85, 0.55];
 const WINDOW_DARK = [0.25, 0.3, 0.42];
 
-// --- Districts: 8 named neighbourhoods, one per region of the 6x6 grid.
-// Each has its own building palette and height range, so the city reads
-// as different places instead of one repeating pattern. The map is indexed
-// [bx][bz] over the block grid; the park block (2,2) is Bay Park itself. ---
+// --- Districts: 9 named neighbourhoods, one per region of the 6x6 grid.
+// Each has its own building palette (five colours in v4) and height range,
+// so the city reads as different places instead of one repeating pattern.
+// The map is indexed [bx][bz] over the block grid; the park block (2,2)
+// is Bay Park itself. v4 adds Hillcrest, a terracotta hillside quarter
+// in the far west blocks, with cypress trees and a lookout tower. ---
 export const DISTRICTS = [
-  { name: 'Old Town', colors: [[0.93, 0.82, 0.68], [0.9, 0.6, 0.5], [0.95, 0.75, 0.35]], h: [8, 18] },
-  { name: 'Downtown', colors: [[0.35, 0.65, 0.62], [0.65, 0.55, 0.85], [0.92, 0.9, 0.86]], h: [18, 34] },
-  { name: 'Marina', colors: [[0.95, 0.62, 0.72], [0.92, 0.9, 0.86], [0.95, 0.55, 0.45]], h: [22, 46] },
-  { name: 'West End', colors: [[0.6, 0.8, 0.65], [0.93, 0.82, 0.68], [0.9, 0.6, 0.5]], h: [8, 20] },
-  { name: 'The Strip', colors: [[0.65, 0.55, 0.85], [0.95, 0.62, 0.72], [0.95, 0.55, 0.45]], h: [16, 32] },
-  { name: 'Southside', colors: [[0.95, 0.55, 0.45], [0.9, 0.6, 0.5], [0.6, 0.8, 0.65]], h: [8, 22] },
-  { name: 'Midtown', colors: [[0.92, 0.9, 0.86], [0.35, 0.65, 0.62], [0.95, 0.75, 0.35]], h: [14, 28] },
-  { name: 'Harbor South', colors: [[0.35, 0.65, 0.62], [0.6, 0.8, 0.65], [0.93, 0.82, 0.68]], h: [8, 24] },
+  { name: 'Old Town', colors: [[0.93, 0.82, 0.68], [0.9, 0.6, 0.5], [0.95, 0.75, 0.35], [0.85, 0.7, 0.55], [0.8, 0.55, 0.45]], h: [8, 18] },
+  { name: 'Downtown', colors: [[0.35, 0.65, 0.62], [0.65, 0.55, 0.85], [0.92, 0.9, 0.86], [0.3, 0.45, 0.7], [0.55, 0.6, 0.75]], h: [18, 34] },
+  { name: 'Marina', colors: [[0.95, 0.62, 0.72], [0.92, 0.9, 0.86], [0.95, 0.55, 0.45], [0.5, 0.8, 0.85], [1.0, 0.7, 0.5]], h: [22, 46] },
+  { name: 'West End', colors: [[0.6, 0.8, 0.65], [0.93, 0.82, 0.68], [0.9, 0.6, 0.5], [0.75, 0.85, 0.6], [0.95, 0.85, 0.6]], h: [8, 20] },
+  { name: 'The Strip', colors: [[0.65, 0.55, 0.85], [0.95, 0.62, 0.72], [0.95, 0.55, 0.45], [1.0, 0.35, 0.6], [0.3, 0.85, 0.9]], h: [16, 32] },
+  { name: 'Southside', colors: [[0.95, 0.55, 0.45], [0.9, 0.6, 0.5], [0.6, 0.8, 0.65], [0.85, 0.5, 0.35], [0.7, 0.75, 0.55]], h: [8, 22] },
+  { name: 'Midtown', colors: [[0.92, 0.9, 0.86], [0.35, 0.65, 0.62], [0.95, 0.75, 0.35], [0.45, 0.55, 0.8], [0.9, 0.65, 0.4]], h: [14, 28] },
+  { name: 'Harbor South', colors: [[0.35, 0.65, 0.62], [0.6, 0.8, 0.65], [0.93, 0.82, 0.68], [0.5, 0.7, 0.75], [0.8, 0.7, 0.5]], h: [8, 24] },
+  { name: 'Hillcrest', colors: [[0.85, 0.55, 0.4], [0.95, 0.88, 0.72], [0.6, 0.7, 0.5], [0.9, 0.65, 0.55], [0.78, 0.68, 0.5]], h: [10, 26] },
 ];
 // [bx][bz] -> district index. Rows are bz (south to north), columns bx.
 const DISTRICT_MAP = [
-  [0, 0, 3, 5, 5, 5],
-  [0, 0, 3, 5, 5, 5],
+  [0, 0, 3, 5, 8, 8],
+  [0, 0, 3, 5, 8, 8],
   [1, 1, -1, 6, 6, 6],
   [1, 1, 6, 6, 6, 6],
   [2, 2, 4, 7, 7, 7],
@@ -78,6 +82,7 @@ export function generateCity(rng) {
   const buildings = [];
   const lamps = [];
   const trees = [];
+  const cypress = [];
   const signs = [];
   const parkSpots = [];
   const landmarks = [];
@@ -93,10 +98,12 @@ export function generateCity(rng) {
         continue;
       }
       const nearBeach = bx === 5;
-      const district = districtAt(
-        (blockBounds(bx, bz).x0 + blockBounds(bx, bz).x1) / 2,
-        (blockBounds(bx, bz).z0 + blockBounds(bx, bz).z1) / 2,
-      );
+      const mid = {
+        x: (b.x0 + b.x1) / 2,
+        z: (b.z0 + b.z1) / 2,
+      };
+      const district = districtAt(mid.x, mid.z);
+      const isHillcrest = district.name === 'Hillcrest';
       const count = rng.chance(0.55) ? 1 : rng.int(2, 4);
       for (let i = 0; i < count; i += 1) {
         const cols = count === 1 ? 1 : 2;
@@ -112,11 +119,11 @@ export function generateCity(rng) {
         const h = nearBeach
           ? rng.range(22, 46)
           : rng.range(district.h[0], district.h[1]) + (Math.abs(bx - 2.5) + Math.abs(bz - 2.5) < 2 ? 8 : 0);
-        // v3: a few landmark towers rise above their district's range, so
-        // the skyline has peaks instead of one flat band of heights.
+        // A few landmark towers rise above their district's range, so the
+        // skyline has peaks instead of one flat band of heights.
         const tall = rng.chance(0.08) ? Math.min(54, h * 1.45) : h;
-        // v3: gaussian jitter on top, so two buildings from the same
-        // district range never come out exactly the same height.
+        // Gaussian jitter on top, so two buildings from the same district
+        // range never come out exactly the same height.
         const hj = Math.max(6, tall + rng.gauss() * 1.5);
         const color = rng.pick(district.colors);
         const building = { x, z, w, d, h: hj, color };
@@ -137,6 +144,13 @@ export function generateCity(rng) {
       // Palm trees on the block corners.
       for (let i = 0; i < 2; i += 1) {
         trees.push({ x: rng.range(b.x0 + 2, b.x1 - 2), z: rng.chance(0.5) ? b.z0 + 2 : b.z1 - 2, s: rng.range(0.8, 1.2) });
+      }
+      // Hillcrest grows tall cypress instead of extra palms, so the
+      // hillside quarter reads green and vertical from across town.
+      if (isHillcrest) {
+        for (let i = 0; i < 3; i += 1) {
+          cypress.push({ x: rng.range(b.x0 + 3, b.x1 - 3), z: rng.range(b.z0 + 3, b.z1 - 3), s: rng.range(0.9, 1.5) });
+        }
       }
       // Parked cars along the block edge.
       if (rng.chance(0.7)) {
@@ -162,18 +176,23 @@ export function generateCity(rng) {
     trees.push({ x: 172 + rng.range(-2, 4), z: z + rng.range(-4, 4), s: rng.range(1.0, 1.5) });
   }
 
-  // Landmarks for jobs: hotel tower by the beach, the pier, the mall, the docks.
+  // Landmarks for jobs: hotel tower by the beach, the pier, the mall,
+  // the docks, the park — and, in v4, the Hillcrest lookout.
   landmarks.push({ name: 'Hotel Bayview', x: 138, z: -78, kind: 'hotel' });
   landmarks.push({ name: 'The Pier', x: 196, z: 0, kind: 'pier' });
   landmarks.push({ name: 'Sunset Mall', x: -130, z: 130, kind: 'mall' });
   landmarks.push({ name: 'The Docks', x: -130, z: -130, kind: 'docks' });
   landmarks.push({ name: 'Bay Park', x: -26, z: -26, kind: 'park' });
+  landmarks.push({ name: 'Hillcrest Lookout', x: -140, z: 104, kind: 'lookout' });
 
   // The hotel tower: tall, by the beach.
   buildings.push({ x: 138, z: -78, w: 26, d: 22, h: 52, color: [0.95, 0.62, 0.72] });
   signs.push({ x: 138, y: 46, z: -78 + 11 + 0.15, w: 14, h: 3, alongX: true, color: [1.0, 0.25, 0.55] });
+  // The lookout tower: a terracotta block in Hillcrest, drawn with its
+  // round tower and cone roof in buildCityMesh.
+  buildings.push({ x: -140, z: 104, w: 14, d: 14, h: 24, color: [0.85, 0.55, 0.4] });
 
-  return { buildings, lamps, trees, signs, parkSpots, landmarks };
+  return { buildings, lamps, trees, cypress, signs, parkSpots, landmarks };
 }
 
 /** Build the one big static mesh for the whole city. */
@@ -220,7 +239,7 @@ export function buildCityMesh(city) {
     m.box(b.x, b.h / 2, b.z, b.w, b.h, b.d, b.color, shade(b.color, 0.75));
     // Roof rim.
     m.box(b.x, b.h + 0.4, b.z, b.w * 0.7, 0.8, b.d * 0.7, shade(b.color, 0.6));
-    // v3 facade variation: a neon-trim band near the top (one of the four
+    // Facade variation: a neon-trim band near the top (one of the six
     // neon colours, picked from the building's position so it is stable),
     // plus rooftop props — an AC box on every roof, a water tower on the
     // tall ones — so roofs read as roofs, not flat caps.
@@ -267,10 +286,18 @@ export function buildCityMesh(city) {
     m.octa(t.x + 1.2 * s, 5.6 * s, t.z + 0.6 * s, 1.5 * s, [0.3, 0.62, 0.28]);
     m.octa(t.x - 1.1 * s, 5.7 * s, t.z - 0.7 * s, 1.4 * s, [0.22, 0.5, 0.24]);
   }
+  // Hillcrest cypress: a thin trunk and two stacked dark-green crowns,
+  // tall and narrow where palms are wide and round.
+  for (const t of city.cypress || []) {
+    const s = t.s;
+    m.cylinder(t.x, 0, t.z, 0.18 * s, 4.5 * s, [0.4, 0.32, 0.22], 6);
+    m.octa(t.x, 6.5 * s, t.z, 1.3 * s, [0.16, 0.4, 0.2]);
+    m.octa(t.x, 9.0 * s, t.z, 0.9 * s, [0.2, 0.48, 0.24]);
+  }
   // The pier: wooden deck into the ocean, with posts and a little shack.
   m.box(208, 0.6, 0, 36, 1.2, 8, [0.55, 0.42, 0.28], [0.62, 0.48, 0.32]);
-  // v3 water: pale wave bands rolling across the ocean, and beach
-  // umbrellas on the sand, so the coast reads as a beach, not a blue slab.
+  // Water: pale wave bands rolling across the ocean, and beach umbrellas
+  // on the sand, so the coast reads as a beach, not a blue slab.
   for (const wx of [198, 214, 232, 252]) {
     for (let wz = -170; wz < 170; wz += 34) {
       m.groundQuad(wx, wz, wx + 1.6, wz + 18, 0.06, [0.42, 0.68, 0.8], 0.25);
@@ -281,18 +308,46 @@ export function buildCityMesh(city) {
     { x: 176, z: 24, c: [0.25, 0.85, 0.95] },
     { x: 171, z: 78, c: [1.0, 0.85, 0.25] },
     { x: 178, z: 132, c: [0.65, 0.45, 1.0] },
+    { x: 173, z: -120, c: [0.35, 0.9, 0.5] },
+    { x: 179, z: -8, c: [1.0, 0.55, 0.25] },
   ];
   for (const u of UMBRELLAS) {
     m.cylinder(u.x, 0, u.z, 0.12, 2.6, [0.9, 0.88, 0.8], 6);
     m.octa(u.x, 3.1, u.z, 2.4, u.c);
     m.box(u.x + 1.6, 0.25, u.z + 1.2, 2.2, 0.5, 1.2, [0.95, 0.6, 0.4]);
   }
+  // Lifeguard tower on the sand: four legs, a cabin and a cone roof.
+  for (const dx of [-1.6, 1.6]) {
+    for (const dz of [-1.4, 1.4]) {
+      m.cylinder(180 + dx, 0, -100 + dz, 0.16, 4.2, [0.85, 0.85, 0.8], 6);
+    }
+  }
+  m.box(180, 4.8, -100, 4.2, 2.2, 3.4, [0.95, 0.95, 0.9], [0.9, 0.9, 0.85]);
+  m.cone(180, 5.9, -100, 3.0, 2.0, [1.0, 0.35, 0.3], 8);
+  // Boardwalk along the sand: wooden planks with a cross-plank rhythm,
+  // so the beach edge reads as a promenade, not a hard concrete line.
+  m.groundQuad(164, -160, 170, 160, 0.05, [0.6, 0.48, 0.32]);
+  for (let z = -158; z < 160; z += 8) {
+    m.groundQuad(164.4, z, 169.6, z + 1.2, 0.06, [0.52, 0.4, 0.26]);
+  }
+  // Beach volleyball court: a pale sand square, two net poles and a net.
+  m.groundQuad(172, 52, 184, 64, 0.05, [0.95, 0.87, 0.68]);
+  m.cylinder(178, 0, 52.5, 0.12, 2.4, [0.9, 0.9, 0.85], 6);
+  m.cylinder(178, 0, 63.5, 0.12, 2.4, [0.9, 0.9, 0.85], 6);
+  m.box(178, 2.0, 58, 0.15, 0.9, 11, [0.95, 0.95, 0.9]);
   for (let x = 194; x <= 224; x += 6) {
     m.cylinder(x, -1, -3.4, 0.5, 2.4, [0.4, 0.3, 0.2], 6);
     m.cylinder(x, -1, 3.4, 0.5, 2.4, [0.4, 0.3, 0.2], 6);
   }
   m.box(222, 2.6, 0, 5, 4, 6, [0.85, 0.5, 0.4], [0.7, 0.4, 0.32]);
   m.box(222, 5.2, 0, 6, 1, 7, [0.5, 0.3, 0.25]);
+
+  // Hillcrest Lookout: a stone plaza, a round tower with a cone roof and
+  // a glowing beacon cap, so the new district has a skyline of its own.
+  m.groundQuad(-152, 92, -128, 116, 0.06, [0.68, 0.62, 0.52]);
+  m.cylinder(-140, 24, 104, 4.5, 12, [0.85, 0.55, 0.4], 10);
+  m.cone(-140, 36, 104, 5.6, 5, [0.7, 0.35, 0.28], 10);
+  m.octa(-140, 43.5, 104, 1.6, [1.0, 0.85, 0.3], 0.9);
 
   // Garage, shop and safehouse kiosks: a low canopy in the place colour
   // with a glowing sign, so each one reads from down the street.

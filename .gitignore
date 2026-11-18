@@ -1,4 +1,14 @@
+# Sunset Bay v4 — build output, dependencies and local clutter.
+# Only generated or machine-local files are listed here; nothing the
+# game needs to run is ignored, so a fresh checkout builds and plays.
+
+# Build output
 out/
+
+# Dependencies
 node_modules/
+
+# macOS / editor leftovers and temporary files
 .DS_Store
 *.log
+*.tmp

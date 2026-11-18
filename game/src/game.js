@@ -1,8 +1,11 @@
-// The game itself: 12 named missions in stages, money, the wanted system,
-// on-foot combat, the police helicopter, garage/shop/safehouse, pedestrians,
-// pickups and hidden stash packs. Rendering lives in main.js; this file only
-// moves the world forward. Deterministic: every random choice comes from the
-// seeded rng.
+// Sunset Bay — the game simulation: missions, money, wanted level,
+// on-foot combat, the police helicopter, garage / shop / safehouse,
+// pedestrians, pickups and the six hidden stash packs.
+//
+// This file only advances the world. Drawing lives in main.js, the HUD in
+// hud.js, driving in vehicles.js and the player on foot in player.js.
+// Everything random comes from the seeded rng, so a seed replays the same
+// city, the same stash spots and the same mission order every time.
 import { LINES, WORLD, PLACES, districtAt, generateCity, buildingColliders } from './city.js';
 import { createRng } from './rng.js';
 import {
@@ -19,30 +22,43 @@ import {
 } from './vehicles.js';
 import { createPlayer, stepPlayer } from './player.js';
 import { clamp, dist2 } from './math3.js';
+// v4: paint & clothing palettes live in meshes.js (Builder 1) — merging
+// them here activates the extra variety for every spawned car and
+// pedestrian, since all spawn code below picks from these lists.
+import { CAR_PAINTS, PED_SHIRTS, PED_SKINS } from './meshes.js';
 
+// Traffic paint jobs, picked at random for every car that spawns: the v3
+// set plus the v4 set from meshes.js, 24 colours in all.
 export const CAR_COLORS = [
   [0.85, 0.2, 0.2], [0.2, 0.4, 0.85], [0.95, 0.8, 0.2], [0.9, 0.9, 0.88],
   [0.2, 0.7, 0.7], [0.55, 0.35, 0.8], [0.95, 0.5, 0.15], [0.3, 0.65, 0.3],
   [0.95, 0.3, 0.6], [0.2, 0.85, 0.45], [1.0, 0.6, 0.1], [0.4, 0.85, 0.95],
+  ...CAR_PAINTS,
 ];
+// The player's ride is always this red, so it reads instantly in traffic.
 export const PLAYER_CAR_COLOR = [0.95, 0.25, 0.15];
+
+// Pedestrian shirts and skins, shuffled per spawn: the v3 set plus the
+// v4 set from meshes.js (22 shirts, 9 skins — the v3 skins are inside the
+// v4 set, so they appear once).
 const SHIRTS = [
   [0.9, 0.3, 0.3], [0.3, 0.5, 0.9], [0.95, 0.85, 0.3], [0.4, 0.8, 0.4],
   [0.9, 0.6, 0.9], [0.95, 0.95, 0.95], [0.3, 0.7, 0.75], [1.0, 0.45, 0.1],
   [0.55, 0.3, 0.9], [0.2, 0.9, 0.6],
+  ...PED_SHIRTS,
 ];
-const SKINS = [[0.9, 0.7, 0.55], [0.75, 0.55, 0.4], [0.95, 0.8, 0.65]];
+const SKINS = [...PED_SKINS];
 
-// --- The crew: mission contacts. MARA dispatches the jobs, RICO runs the
-// garage. Their lines brief each mission and show on the dialog card. ---
+// The crew who hand out the jobs. MARA dispatches, RICO runs the garage,
+// DEX sets up the races — their lines brief every mission on the dialog card.
 export const CREW = [
   { name: 'MARA', role: 'Dispatcher', color: '#ff5e7a', initial: 'M' },
   { name: 'RICO', role: 'Mechanic', color: '#ff9a3c', initial: 'R' },
   { name: 'DEX', role: 'Wheelman', color: '#2dd4bf', initial: 'D' },
 ];
 
-// --- Weapons: 4 slots (1-4 / Q to cycle). Fists are always there; guns
-// unlock the first time you pick up their ammo. Ammo is bought at the shop. ---
+// The four weapon slots (keys 1-4, Q cycles). Fists are always available;
+// a gun only unlocks once its ammo has been picked up or bought.
 export const WEAPONS = [
   { name: 'FISTS', key: null, range: 2.4, rate: 0.45, dmg: 1, pellets: 1, spread: 0, auto: false },
   { name: 'PISTOL', key: 'pistol', range: 45, rate: 0.35, dmg: 1, pellets: 1, spread: 0, auto: false },
@@ -55,19 +71,18 @@ const AMMO_PRICE = {
   smg: { price: 80, amount: 24 },
 };
 
-// --- Garage upgrades: bought with G at the garage, level 0-3 each. ---
+// Garage upgrades, levels 0-3 each. Bought with G at the garage.
 export const UPGRADE_DEFS = [
   { key: 'speed', name: 'Engine', base: 300 },
   { key: 'armor', name: 'Armor', base: 250 },
   { key: 'handling', name: 'Handling', base: 200 },
 ];
 
-// --- Missions: 12 named jobs, each in 1-4 stages. A stage is one objective:
+// Missions: 15 named jobs, each in 1-4 stages. A stage is one objective:
 // steal (get in any car), goto (reach a beacon), safehouse (reach the
 // safehouse), collect (grab a stash drop), hide (get the heat under 50).
-// The first three missions are the original chain, kept as-is; missions
-// 9-12 are the v3 additions, reusing the same stage kinds so every job
-// stays completable with the existing mechanics. ---
+// Missions 13-15 are the v4 additions, built from the same stage kinds so
+// every job stays completable with the existing mechanics.
 const MISSIONS = [
   {
     name: 'First Wheels', reward: 100, time: 75, from: 'MARA',
@@ -169,10 +184,39 @@ const MISSIONS = [
       { kind: 'safehouse', text: 'Vanish at the safehouse' },
     ],
   },
+  {
+    name: 'Pier Pressure', reward: 850, time: 180, from: 'DEX',
+    brief: 'A drop is waiting at the end of the pier and a buyer at the mall. Out to the water, back through town — keep it smooth.',
+    stages: [
+      { kind: 'goto', fixed: 'The Pier', text: 'Reach the end of the pier' },
+      { kind: 'collect', text: 'Grab the pier drop' },
+      { kind: 'goto', fixed: 'Sunset Mall', text: 'Deliver to the mall buyer' },
+    ],
+  },
+  {
+    name: 'Beach Run', reward: 950, time: 180, from: 'RICO',
+    brief: 'A checkpoint on the sand, a stash on the way back, and home before the tide of cops rolls in. Beach driving, rookie — sand is slow, so stay on the road till the last turn.',
+    stages: [
+      { kind: 'goto', checkpoint: true, text: 'Race to the beach checkpoint' },
+      { kind: 'collect', text: 'Grab the stash' },
+      { kind: 'safehouse', text: 'Get back to the safehouse' },
+    ],
+  },
+  {
+    name: 'Midnight Courier', reward: 1100, time: 210, from: 'MARA',
+    brief: 'One parcel, four stops, and the whole city watching. Mall pickup, far drop, shake the tail, then disappear. This is the job that makes your name.',
+    stages: [
+      { kind: 'goto', fixed: 'Sunset Mall', text: 'Pick up the parcel at the mall' },
+      { kind: 'goto', far: true, text: 'Deliver to the far side of town' },
+      { kind: 'hide', text: 'Shake the heat' },
+      { kind: 'safehouse', text: 'Vanish at the safehouse' },
+    ],
+  },
 ];
 
 const REP_TITLES = ['ROOKIE', 'STREET', 'HUSTLER', 'BIG SHOT', 'BAY KING'];
 
+// A point on a road: pick a road line, then a random spot along it.
 function randomRoadPoint(rng) {
   const line = rng.pick(LINES);
   if (rng.chance(0.5)) return { x: rng.range(-150, 150), z: line };
@@ -250,9 +294,9 @@ export class Game {
     return this.starLevel;
   }
 
-  /** Stars rise the instant heat crosses a boundary, but only fall once
-   * heat has dropped 15 below it — so a cop is not despawned the moment
-   * heat dips 200 -> 199.95. */
+  // Stars rise the instant heat crosses a boundary, but only fall once heat
+  // has dropped 15 below it — so a cop is not despawned the moment heat
+  // dips 200 -> 199.95.
   updateStars() {
     const raw = Math.min(5, Math.floor(this.heat / 100));
     if (this.heat <= 0) this.starLevel = 0;
@@ -260,8 +304,8 @@ export class Game {
     else if (raw < this.starLevel && this.heat < this.starLevel * 100 - 15) this.starLevel = raw;
   }
 
-  /** Respect: missions, cops downed, cars stolen, coins and stash packs
-   * all count — a full stash sweep is worth almost half a mission. */
+  // Respect: missions, cops downed, cars stolen, coins and stash packs all
+  // count — a full stash sweep is worth almost half a mission.
   get repPoints() {
     return this.jobsDone * 150 + this.copsDowned * 25 + this.carsStolen * 10 + this.coinsCollected * 5 + this.stashesCollected * 15;
   }
@@ -381,8 +425,8 @@ export class Game {
     };
   }
 
-  /** Snap a landmark to the nearest road line, so the beacon never sits
-   * inside a building no car or foot can reach. */
+  // Snap a landmark to the nearest road line, so the beacon never sits
+  // inside a building no car or foot can reach.
   snapToRoad(spot) {
     const nx = LINES.reduce((a, b) => (Math.abs(b - spot.x) < Math.abs(a - spot.x) ? b : a));
     const nz = LINES.reduce((a, b) => (Math.abs(b - spot.z) < Math.abs(a - spot.z) ? b : a));
@@ -533,7 +577,7 @@ export class Game {
     }
   }
 
-  /** F pressed (or click with fists): a swing at whatever is in front. */
+  // F pressed (or click with fists): a swing at whatever is in front.
   tryMelee() {
     if (this.state !== 'playing' || !this.player.onFoot) return;
     if (this.player.punchT > 0) return;
@@ -564,7 +608,7 @@ export class Game {
     }
   }
 
-  /** Click on foot: fire the selected gun (fists fall back to a punch). */
+  // Click on foot: fire the selected gun (fists fall back to a punch).
   tryShoot() {
     if (this.state !== 'playing' || !this.player.onFoot) return;
     const w = this.weapon;
@@ -624,7 +668,7 @@ export class Game {
     }
   }
 
-  /** G pressed: garage upgrades / respray, or shop ammo + armour. */
+  // G pressed: garage upgrades / respray, or shop ammo + armour.
   tryInteract() {
     if (this.state !== 'playing') return;
     const px = this.playerCar ? this.playerCar.x : this.player.x;
@@ -636,13 +680,10 @@ export class Game {
         this.setMessage('Get in a car to use the garage.');
         return;
       }
-      // v3 (playtest round 2, case a): a respray used to come first whenever
-      // any heat existed — but stealing a car (the first thing every player
-      // does) already puts 1 star on you, so the upgrade path always cost
-      // an extra $200 first, silently. Now the respray only jumps the queue
-      // at 2+ stars, when losing the heat is the urgent need; at 1 star G
-      // buys the upgrade you came for, and the heat can still be driven off
-      // or cleared at the safehouse. (Case b still passes: heat 250 resprays.)
+      // A respray only jumps the queue at 2+ stars, when losing the heat is
+      // the urgent need. At 1 star G buys the upgrade you came for — stealing
+      // a car (the first thing every player does) already puts 1 star on
+      // you, so a respray-first rule would silently tax every upgrade $200.
       if (this.heat >= 200 && this.money >= 200) {
         this.money -= 200;
         this.heat = 0;
@@ -709,7 +750,7 @@ export class Game {
     }
   }
 
-  /** E pressed: get in the nearest car, or get out of the one being driven. */
+  // E pressed: get in the nearest car, or get out of the one being driven.
   tryEnterExit() {
     if (this.state !== 'playing') return;
     if (this.playerCar) {
@@ -785,7 +826,9 @@ export class Game {
         this.setMessage('Crash!');
       }
       // A finished drift pays: $50 times the multiplier (seconds held).
-      if (this.playerCar.driftEnded && (this.playerCar.driftT || 0) > 0.8) {
+      // v4: the bar is 0.5 s, not 0.8 s — a stock car with the lighter
+      // handbrake can now actually hold a slide long enough to cash in.
+      if (this.playerCar.driftEnded && (this.playerCar.driftT || 0) > 0.5) {
         const mult = Math.min(5, 1 + Math.floor(this.playerCar.driftT));
         const pay = 50 * mult;
         this.money += pay;
@@ -1085,12 +1128,18 @@ export class Game {
 
     // Busted: a cop sits on you while you are slow. The speed that counts is
     // the one you are driving at, not speed a ramming cop pushed into you.
+    // v4 (playtest): on foot the arrest is fairer — the cop must stay
+    // closer (5 units, not 6) and hold you longer (4.5 s, not 3 s), and the
+    // player now sprints at 12 u/s against a cop's 9, so a running player
+    // can actually break away instead of being busted mid-stride.
     const mySpeed = this.playerCar
       ? Math.abs(this.playerCar.drivenSpeed ?? this.playerCar.speed)
       : this.player.speed;
-    if (want > 0 && nearestCop < 6 && mySpeed < 4) {
+    const bustDist = this.playerCar ? 6 : 5;
+    const bustLimit = this.playerCar ? 3 : 4.5;
+    if (want > 0 && nearestCop < bustDist && mySpeed < 4) {
       this.bustTimer += dt;
-      if (this.bustTimer > 3) {
+      if (this.bustTimer > bustLimit) {
         this.state = 'busted';
         this.setMessage('BUSTED!');
       }

@@ -6,6 +6,7 @@
 import { PLAYER_CAR_COLOR } from './game.js';
 import { createPoliceCar } from './vehicles.js';
 
+// Hand the player a car at a spot, already driving.
 function giveCar(game, x, z, heading, speed) {
   const car = {
     kind: 'player',
@@ -22,6 +23,7 @@ function giveCar(game, x, z, heading, speed) {
   return car;
 }
 
+// Run the world forward with a fixed input, 60 steps a second.
 function driveFor(game, seconds, input) {
   const steps = Math.round(seconds * 60);
   for (let i = 0; i < steps; i += 1) {
@@ -29,7 +31,7 @@ function driveFor(game, seconds, input) {
   }
 }
 
-/** Place police cars relative to the player's car: back = units behind it. */
+// Place police cars relative to the player's car: back = units behind it.
 function placePolice(game, car, offsets) {
   const fx = Math.sin(car.heading);
   const fz = Math.cos(car.heading);
@@ -49,7 +51,7 @@ function placePolice(game, car, offsets) {
   });
 }
 
-/** Put one traffic car and one pedestrian in the frame, ahead of the car. */
+// Put one traffic car and one pedestrian in the frame, ahead of the car.
 function stageTrafficAndPed(game, car, trafficX, trafficZ, trafficHeading, pedX, pedZ, pedHeading) {
   const t = game.traffic[0];
   t.x = trafficX;
@@ -65,10 +67,8 @@ function stageTrafficAndPed(game, car, trafficX, trafficZ, trafficHeading, pedX,
 const DRIVE = { forward: true, back: false, left: false, right: false, run: false, handbrake: false };
 const IDLE = { forward: false, back: false, left: false, right: false, run: false, handbrake: false };
 
-/**
- * Stage the named scene and return the camera to shoot it with:
- * { target: [x, y, z], yaw, pitch, dist }.
- */
+// Stage the named scene and return the camera to shoot it with:
+// { target: [x, y, z], yaw, pitch, dist }.
 export function stageShot(name, game) {
   if (name === 'play') {
     game.state = 'playing';
@@ -129,7 +129,7 @@ export function stageShot(name, game) {
     }
     stageTrafficAndPed(game, car, car.x + 45, 0, Math.PI / 2, car.x + 32, 7, -Math.PI / 2);
     game.pickups[0] = { x: car.x + 24, z: 2, amount: 25, taken: false, spin: -2.3, respawn: 0 };
-    // v3: a stash pack sits in frame on the roadside — the golden briefcase
+    // A stash pack sits in frame on the roadside — the golden briefcase
     // reads next to the coin, and the STASH 0/6 line shows in the HUD pill.
     const stash = game.pickups.find((p) => p.kind === 'stash' && !p.taken);
     if (stash) { stash.x = car.x + 18; stash.z = 6; stash.spin = -2.3; }

@@ -1,8 +1,10 @@
 // The HUD: cash, wanted stars + TRACE heat bar, rep, the mission card,
 // the police response panel, radio widget, weapon slots, health/armour,
 // speedometer, a minimap, the crew dialog card, score popups, the steal /
-// interact prompts, and the full-screen city map (Tab). All DOM except the
-// two map canvases; the 3D view stays a plain canvas underneath.
+// interact prompts, the crosshair, and the full-screen city map (Tab).
+// All DOM except the two map canvases; the 3D view stays a plain canvas
+// underneath. The crosshair element is created here (not in index.html),
+// so this file owns it end to end.
 import { CITY_MAX, BEACH_X, PLACES, LINES, districtAt } from './city.js';
 import { clamp01 } from './math3.js';
 
@@ -16,8 +18,8 @@ function worldToMap(x, z, size = MAP_SIZE) {
   ];
 }
 
-/** Shared map painter: the 150px minimap and the 520px full-screen map.
- * big adds district colours + names and the POI markers. */
+// Shared map painter: the 150px minimap and the 520px full-screen map.
+// big adds district colours + names and the POI markers.
 function drawMap(ctx, game, size, big) {
   const s = size / WORLD_SPAN;
   ctx.fillStyle = '#101018';
@@ -46,8 +48,9 @@ function drawMap(ctx, game, size, big) {
     // Name each district once, near its middle block.
     const spots = [
       ['Old Town', -130, -130], ['Downtown', -26, -130], ['Marina', 130, -130],
-      ['West End', -130, -26], ['The Strip', 130, -26], ['Southside', -130, 104],
+      ['West End', -130, -26], ['The Strip', 130, -26], ['Southside', -130, 26],
       ['Midtown', -26, 78], ['Harbor South', 104, 104],
+      ['Hillcrest', -130, 130],
     ];
     ctx.fillStyle = 'rgba(255,255,255,0.85)';
     ctx.strokeStyle = 'rgba(0,0,0,0.6)';
@@ -173,6 +176,28 @@ function drawMap(ctx, game, size, big) {
   ctx.restore();
 }
 
+// The crosshair: a small plus with a dot, built once and toggled by
+// updateHud. It lives in the DOM (not the canvas) so it stays crisp and
+// centred whatever the 3D camera does.
+function buildCrosshair() {
+  const el = document.createElement('div');
+  el.id = 'crosshair';
+  el.style.cssText = [
+    'position:fixed', 'left:50%', 'top:50%', 'width:22px', 'height:22px',
+    'margin:-11px 0 0 -11px', 'pointer-events:none', 'z-index:30',
+    'display:none',
+  ].join(';');
+  // Four arms + centre dot, white with a dark outline so it reads on
+  // bright sand and dark asphalt alike.
+  const arm = (w, h, l, t) => `<span style="position:absolute;width:${w};height:${h};left:${l};top:${t};background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,0.8);"></span>`;
+  el.innerHTML =
+    arm('2px', '7px', '10px', '0') + arm('2px', '7px', '10px', '15px') +
+    arm('7px', '2px', '0', '10px') + arm('7px', '2px', '15px', '10px') +
+    '<span style="position:absolute;width:3px;height:3px;left:9.5px;top:9.5px;background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,0.8);border-radius:50%;"></span>';
+  document.body.appendChild(el);
+  return el;
+}
+
 export function createHud() {
   const slots = document.getElementById('weapon-slots');
   const slotEls = [];
@@ -233,10 +258,11 @@ export function createHud() {
     bigmap: document.getElementById('bigmap'),
     mapMissions: document.getElementById('map-missions'),
     mapStats: document.getElementById('map-stats'),
+    crosshair: buildCrosshair(),
   };
 }
 
-const MISSION_NAMES = ['First Wheels', 'Package Run', 'Cool Down', 'Street Race', 'Stash Grab', 'Getaway', 'The Big Heist', 'Bay King', 'Dockside Deal', 'Neon Nights', 'Payback Run', 'Sunset Showdown'];
+const MISSION_NAMES = ['First Wheels', 'Package Run', 'Cool Down', 'Street Race', 'Stash Grab', 'Getaway', 'The Big Heist', 'Bay King', 'Dockside Deal', 'Neon Nights', 'Payback Run', 'Sunset Showdown', 'Pier Pressure', 'Beach Run', 'Midnight Courier'];
 
 export function updateHud(hud, game, camYaw = 0, paused = false, mapOpen = false) {
   const onTitle = game.state === 'title';
@@ -279,6 +305,16 @@ export function updateHud(hud, game, camYaw = 0, paused = false, mapOpen = false
   if (inCar) {
     hud.speedNum.textContent = `${Math.round(Math.abs(game.playerCar.speed) * 3.2)}`;
     hud.vehicleName.textContent = game.playerCar.model || 'Car';
+  }
+
+  // Crosshair (v4): dead centre whenever a gun is in hand on foot — the
+  // player finally sees where a click will land. Hidden on the title
+  // screen, in a car (no shooting from the driver's seat), with fists,
+  // while paused, or with the map open.
+  if (hud.crosshair) {
+    const showCrosshair = !onTitle && game.state === 'playing' && !inCar
+      && game.weaponIndex > 0 && !paused && !mapOpen;
+    hud.crosshair.style.display = showCrosshair ? 'block' : 'none';
   }
 
   // Police response panel: named units, distance, tactic, sight status.

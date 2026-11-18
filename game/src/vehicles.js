@@ -5,15 +5,15 @@ import { clamp, turnToward } from './math3.js';
 
 export const CAR_RADIUS = 1.7;
 
-/** Model names, so the HUD can name the car you are driving. */
+// Model names, so the HUD can name the car you are driving.
 export const CAR_MODELS = [
   'Comet', 'Sunrise', 'Bayliner', 'Marlin', 'Palms', 'Coral',
   'Tide', 'Solstice', 'Lagoon', 'Dune', 'Reef', 'Sirocco', 'Taxi',
 ];
 
-/** Push a circle out of every building AABB it overlaps. Returns the
- * corrected position, whether it hit, and the push direction (nx, nz):
- * the wall normal, for wall-following steering. */
+// Push a circle out of every building AABB it overlaps. Returns the
+// corrected position, whether it hit, and the push direction (nx, nz):
+// the wall normal, for wall-following steering.
 export function collideCircle(x, z, r, colliders) {
   const ox = x;
   const oz = z;
@@ -48,7 +48,7 @@ export function collideCircle(x, z, r, colliders) {
   return { x, z, hit, nx: pl > 0.0001 ? px / pl : 0, nz: pl > 0.0001 ? pz / pl : 0 };
 }
 
-/** Push two circular cars apart and swap a little speed along the impact line. */
+// Push two circular cars apart and swap a little speed along the impact line.
 export function resolveCarPair(a, b) {
   const dx = b.x - a.x;
   const dz = b.z - a.z;
@@ -68,10 +68,10 @@ export function resolveCarPair(a, b) {
   return Math.abs(rel);
 }
 
-/** One step of the player's car. Returns { crashed, impact }. Upgrades ride
- * on car.upgrades { speed, armor, handling } (levels 0-3, from the garage);
- * a car without them drives stock. Drift state rides on the car too:
- * drifting while the handbrake is held at speed with steering input. */
+// One step of the player's car. Returns { crashed, impact }. Upgrades ride
+// on car.upgrades { speed, armor, handling } (levels 0-3, from the garage);
+// a car without them drives stock. Drift state rides on the car too:
+// drifting while the handbrake is held at speed with steering input.
 export function stepPlayerCar(car, input, dt, colliders, others) {
   const up = car.upgrades || { speed: 0, armor: 0, handling: 0 };
   const road = onRoad(car.x, car.z);
@@ -84,21 +84,32 @@ export function stepPlayerCar(car, input, dt, colliders, others) {
   if (input.back) {
     car.speed -= car.speed > 0.5 ? 26 * dt : 8 * dt;
   }
-  car.speed -= car.speed * (input.handbrake ? 1.6 : 0.4) * dt;
+  // v4: the handbrake drags less (1.1, was 1.6), so a stock car keeps
+  // enough speed through a slide for the drift timer to actually pay.
+  car.speed -= car.speed * (input.handbrake ? 1.1 : 0.4) * dt;
   car.speed = clamp(car.speed, -9, maxSpeed);
   // The speed the player is driving at, before any collision shoves it around:
   // a cop ramming a parked car must not make that car "fast".
   car.drivenSpeed = car.speed;
   const steerTarget = (input.left ? 1 : 0) - (input.right ? 1 : 0);
-  const steerMax = (input.handbrake ? 0.85 : 0.55) + 0.1 * up.handling;
+  // v4 (playtest): progressive steering. The wheel turns less the faster
+  // you go — full lock at a crawl, about a third of it at top speed — so
+  // holding a turn for 1.5 s at medium speed arcs down the road instead of
+  // spinning the car straight into the nearest wall.
+  const speedFactor = clamp(1 - Math.abs(car.speed) / 55, 0.35, 1);
+  const steerMax = ((input.handbrake ? 0.85 : 0.55) + 0.1 * up.handling) * speedFactor;
   car.steer += clamp(steerTarget * steerMax - car.steer, -(3 + up.handling) * dt, (3 + up.handling) * dt);
   if (Math.abs(car.speed) > 0.2) {
-    car.heading += (car.steer * car.speed * dt) / 2.6;
+    // The turning divisor grows with speed too: the same steer input bends
+    // a slow car tightly and a fast car in a wide, controllable arc.
+    const turnDiv = 2.2 + Math.abs(car.speed) * 0.18;
+    car.heading += (car.steer * car.speed * dt) / turnDiv;
   }
   // Drift: handbrake + speed + steering. The timer only counts while all
   // three hold, so a real slide pays and a tap of the brake does not.
+  // v4: the steer bar is 0.3 (was 0.35) — a stock car can hold a slide.
   const wasDrifting = !!car.drifting;
-  car.drifting = !!(input.handbrake && Math.abs(car.speed) > 15 && Math.abs(car.steer) > 0.35);
+  car.drifting = !!(input.handbrake && Math.abs(car.speed) > 15 && Math.abs(car.steer) > 0.3);
   if (car.drifting) car.driftT = (car.driftT || 0) + dt;
   else if (!wasDrifting) car.driftT = 0;
   car.driftEnded = wasDrifting && !car.drifting;
@@ -110,10 +121,47 @@ export function stepPlayerCar(car, input, dt, colliders, others) {
   car.z = fixed.z;
   let impact = 0;
   let wallImpact = 0;
-  if (fixed.hit && Math.abs(before) > 6) {
-    wallImpact = Math.abs(before);
-    impact = wallImpact;
-    car.speed *= 0.3;
+  if (fixed.hit) {
+    // v4 (playtest): walls slide and bounce, they no longer swallow cars.
+    // Split the velocity into the part pushing into the wall and the part
+    // running along it. Only the into-wall part is a crash; the along-wall
+    // part keeps the car moving, the nose bends toward the wall's tangent,
+    // and a small bounce-out nudge keeps the car from grinding in place.
+    const vx = Math.sin(car.heading) * before;
+    const vz = Math.cos(car.heading) * before;
+    const vn = vx * fixed.nx + vz * fixed.nz;
+    if (vn < 0) {
+      wallImpact = Math.abs(vn);
+      impact = wallImpact;
+      const tx = vx - vn * fixed.nx;
+      const tz = vz - vn * fixed.nz;
+      const tSpeed = Math.hypot(tx, tz);
+      if (tSpeed > 2) {
+        // A glancing hit: slide along the wall, keeping most of the speed.
+        const wallHeading = Math.atan2(tx, tz);
+        let diff = wallHeading - car.heading;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        car.heading += diff * 0.7;
+        // Positive along the new heading: the nose now points where the
+        // car is sliding, so the speed stays forward, not reversed.
+        car.speed = tSpeed * 0.92;
+      } else {
+        // Nose-first into the wall: pivot along the wall in the steered
+        // direction and creep, so holding full throttle for a second or two
+        // walks the car out instead of leaving it wedged forever.
+        const steerDir = car.steer !== 0 ? Math.sign(car.steer) : 1;
+        const wallHeading = Math.atan2(-fixed.nz * steerDir, fixed.nx * steerDir);
+        let diff = wallHeading - car.heading;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        car.heading += clamp(diff, -1.5 * dt, 1.5 * dt);
+        car.speed = Math.max(car.speed, 2.5);
+        car.drivenSpeed = Math.max(car.drivenSpeed, 2.5);
+      }
+      car.x += fixed.nx * 0.35;
+      car.z += fixed.nz * 0.35;
+    }
   }
   let carBump = 0;
   for (const o of others) {
@@ -149,14 +197,14 @@ export function stepPlayerCar(car, input, dt, colliders, others) {
   return { crashed: impact > 0, impact, wallImpact, carBump };
 }
 
-/** A traffic car drives along one road line and turns at intersections. */
+  // A traffic car drives along one road line and turns at intersections.
 export function createTrafficCar(rng, colors) {
   const axis = rng.chance(0.5) ? 'x' : 'z';
   const line = rng.pick(LINES);
   const s = rng.range(-150, 150);
   const dir = rng.chance(0.5) ? 1 : -1;
-  // v3: about one in eight traffic cars is a yellow taxi — a little more
-  // life on the roads, and a cab reads instantly in the rear-view mirror.
+  // About one in eight traffic cars is a yellow taxi — a little more life
+  // on the roads, and a cab reads instantly in the rear-view mirror.
   const taxi = rng.chance(0.12);
   return {
     kind: 'traffic',
@@ -261,9 +309,9 @@ export function stepTraffic(cars, dt, rng, playerCar = null, player = null) {
   }
 }
 
-/** A police car chases the target point, steering and accelerating.
- * hp: pistol shots / punches it takes before it is down (3). mode:
- * 'chase' or 'roadblock' (drives ahead of the player and waits). */
+// A police car chases the target point, steering and accelerating.
+// hp: pistol shots / punches it takes before it is down (3). mode:
+// 'chase' or 'roadblock' (drives ahead of the player and waits).
 export function createPoliceCar(x, z) {
   return {
     kind: 'police',
@@ -292,10 +340,10 @@ export function createPoliceCar(x, z) {
   };
 }
 
-/** Chase the target. Close in, the cop slows right down and steers hard
- * onto the target instead of orbiting it at speed; on foot the cop is
- * slower than a running player (9 vs 10), so running away really escapes,
- * while standing still gets you busted. A down cop does not move at all. */
+// Chase the target. Close in, the cop slows right down and steers hard
+// onto the target instead of orbiting it at speed; on foot the cop is
+// slower than a running player (9 vs 12), so running away really escapes,
+// while standing still gets you busted. A down cop does not move at all.
 export function stepPolice(car, tx, tz, dt, colliders, others, onFoot = false) {
   car.flash += dt;
   if (car.down) {
@@ -395,8 +443,8 @@ export function stepPolice(car, tx, tz, dt, colliders, others, onFoot = false) {
   car.x = Math.min(car.x, 186); // police cars stay out of the ocean
 }
 
-/** A police helicopter: orbits the player from above once the heat is high
- * enough, its spotlight pinning the player so the heat drains slower. */
+// A police helicopter: orbits the player from above once the heat is high
+// enough, its spotlight pinning the player so the heat drains slower.
 export function createHeli(x, z) {
   return {
     kind: 'heli',
@@ -410,7 +458,7 @@ export function createHeli(x, z) {
   };
 }
 
-/** Circle the target at a fixed radius and height, facing along the orbit. */
+// Circle the target at a fixed radius and height, facing along the orbit.
 export function stepHeli(heli, tx, tz, dt) {
   heli.angle += dt * 0.35;
   const radius = 34;

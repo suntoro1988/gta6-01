@@ -19,7 +19,7 @@ export function createPlayer(x, z) {
   };
 }
 
-/** One step on foot. camYaw is the camera orbit angle (see main.js). */
+// One step on foot. camYaw is the camera orbit angle (see main.js).
 export function stepPlayer(p, input, camYaw, dt, colliders, cars) {
   if (p.punchT > 0) p.punchT -= dt;
   if (p.hurtT > 0) p.hurtT -= dt;
@@ -37,7 +37,10 @@ export function stepPlayer(p, input, camYaw, dt, colliders, cars) {
   if (p.moving) {
     dx /= len;
     dz /= len;
-    const targetSpeed = input.run ? 10 : 6;
+    // v4 (playtest): sprint is 12 u/s, not 10 — a cop chasing on foot tops
+    // out at 9, so a player who actually runs now pulls away instead of
+    // being caught mid-stride. Walking stays at 6.
+    const targetSpeed = input.run ? 12 : 6;
     p.speed += clamp(targetSpeed - p.speed, -30 * dt, 14 * dt);
     const targetHeading = Math.atan2(dx, dz);
     // Sprinting turns a touch sharper and bobs faster — running should

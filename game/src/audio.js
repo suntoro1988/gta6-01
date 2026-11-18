@@ -76,7 +76,7 @@ export function createAudio() {
       leadType: 'triangle',
     },
     {
-      // v3: a slower, breezier fourth station for the beach side of town.
+      // A slower, breezier fourth station for the beach side of town.
       name: 'PALM COURT',
       bpm: 88,
       bass: [98, 0, 0, 98, 0, 0, 123.47, 0, 87.31, 0, 0, 87.31, 0, 0, 110, 0],
@@ -108,6 +108,7 @@ export function createAudio() {
     return ctx;
   }
 
+  // A one-shot sound effect: an oscillator with a fast decay envelope.
   function tone(freq, dur, type, gain, delay = 0) {
     if (muted) return;
     const ac = ensure();
@@ -125,7 +126,7 @@ export function createAudio() {
     osc.stop(t0 + dur + 0.02);
   }
 
-  /** One radio note, through the radio bus (quieter than SFX). */
+  // One radio note, through the radio bus (quieter than SFX).
   function radioTone(freq, t0, dur, type, gain) {
     const ac = ctx;
     if (!ac || !radioGain) return;
@@ -142,7 +143,7 @@ export function createAudio() {
     osc.stop(t0 + dur + 0.02);
   }
 
-  /** Schedule the radio's next steps, called every frame. */
+  // Schedule the radio's next steps, called every frame.
   function radioTick() {
     if (stationIndex < 0 || muted) return;
     const ac = ensure();
@@ -185,7 +186,7 @@ export function createAudio() {
     get muted() {
       return muted;
     },
-    /** Start the radio on the first station (called when play begins). */
+    // Start the radio on the first station (called when play begins).
     startRadio() {
       ensure();
       if (stationIndex < 0) {
@@ -195,7 +196,7 @@ export function createAudio() {
       }
       return STATIONS[stationIndex].name;
     },
-    /** Cycle OFF -> BAY FM -> SUNSET DRIVE -> NEON NIGHTS -> PALM COURT -> OFF ... */
+    // Cycle OFF -> BAY FM -> SUNSET DRIVE -> NEON NIGHTS -> PALM COURT -> OFF ...
     cycleStation() {
       ensure();
       stationIndex = stationIndex >= STATIONS.length - 1 ? -1 : stationIndex + 1;
@@ -206,7 +207,7 @@ export function createAudio() {
     get stationName() {
       return stationIndex < 0 ? null : STATIONS[stationIndex].name;
     },
-    /** The track now playing: rotates every 4 bars, per station. */
+    // The track now playing: rotates every 4 bars, per station.
     get currentTrack() {
       if (stationIndex < 0) return null;
       const tracks = TRACKS[stationIndex];
@@ -215,7 +216,7 @@ export function createAudio() {
     get stationCount() {
       return STATIONS.length;
     },
-    /** Call every frame while playing; schedules radio notes ahead. */
+    // Call every frame while playing; schedules radio notes ahead.
     radio(dt) {
       void dt;
       radioTick();
@@ -224,7 +225,7 @@ export function createAudio() {
       tone(880, 0.12, 'sine', 0.16);
       tone(1318, 0.2, 'sine', 0.14, 0.08);
     },
-    /** A stash pack is worth more than a road coin: a longer, rising chime. */
+    // A stash pack is worth more than a road coin: a longer, rising chime.
     stash() {
       tone(659, 0.12, 'sine', 0.16);
       tone(880, 0.12, 'sine', 0.16, 0.09);
@@ -263,7 +264,7 @@ export function createAudio() {
     denied() {
       tone(180, 0.16, 'square', 0.12);
     },
-    /** Call every frame; beeps the siren while the player is wanted. */
+    // Call every frame; beeps the siren while the player is wanted.
     siren(dt, wanted) {
       if (wanted <= 0 || muted) return;
       sirenTimer -= dt;

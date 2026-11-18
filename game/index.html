@@ -11,10 +11,9 @@
   #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
   #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .panel { position: fixed; color: #fff; text-shadow: 0 2px 6px rgba(0,0,0,0.7); z-index: 5; }
-  /* v3: the whole top-left cluster sits on one dark pill, so cash, stars
-   * and the REP line stay readable over a bright sunset sky or pale sand
-   * (QA v2: "REP LV 3" washed out in shot 4). The mission card keeps its
-   * own darker panel below it. */
+  /* The top-left cluster sits on one dark pill, so cash, stars and the REP
+   * line stay readable over a bright sunset sky or pale sand. The mission
+   * card keeps its own darker panel below it. */
   #stats { top: 14px; left: 16px; background: rgba(12,8,22,0.78);
     border: 1px solid rgba(255,255,255,0.22); border-radius: 10px; padding: 10px 12px 12px;
     box-shadow: 0 4px 18px rgba(0,0,0,0.45); }
@@ -32,6 +31,9 @@
   #stash-line { font-size: 13px; font-weight: 800; color: #ffe9a8; margin-top: 5px; letter-spacing: 1px;
     text-shadow: 0 1px 3px rgba(0,0,0,0.95), 0 0 8px rgba(0,0,0,0.8); }
   #district { font-size: 13px; color: #ffe9a8; margin-top: 5px; letter-spacing: 1px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.95); }
+  /* v4: the in-game clock, driven by the renderer's day-night cycle. */
+  #clock { font-size: 13px; font-weight: 800; color: #ffb37a; margin-top: 5px; letter-spacing: 2px;
     text-shadow: 0 1px 3px rgba(0,0,0,0.95); }
   /* Mission card: number, name, big timer, stage bar, next objective. */
   #mission-card { margin-top: 10px; width: 300px; background: rgba(20,10,30,0.62);
@@ -65,9 +67,8 @@
   #vehicle-name { font-size: 15px; font-weight: 800; color: #ffe9a8; letter-spacing: 2px; }
   #speed-num { font-size: 52px; font-weight: 800; line-height: 1; }
   #speed-unit { font-size: 15px; font-weight: 800; color: rgba(255,255,255,0.8); }
-  /* Vitals: health + armour, above the speedometer. Same dark pill as
-   * #stats — the HEALTH / ARMOUR labels washed out over pale sand in v3
-   * shot 4, the same failure mode as the REP line. */
+  /* Vitals: health + armour, above the speedometer, on the same dark pill
+   * as #stats so the labels stay readable over pale sand. */
   #vitals { bottom: 118px; right: 20px; width: 170px; text-align: right;
     background: rgba(12,8,22,0.72); border: 1px solid rgba(255,255,255,0.18);
     border-radius: 8px; padding: 6px 10px; }
@@ -185,6 +186,7 @@
   <div id="rep-bar"><div id="rep-fill"></div></div>
   <div id="stash-line">STASH 0/6</div>
   <div id="district">Old Town</div>
+  <div id="clock">18:00 · DUSK</div>
   <div id="mission-card">
     <div id="mission-num">MISSION 1/12</div>
     <div id="mission-timer">1:15</div>
