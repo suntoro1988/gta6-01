@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sunset Bay — Open World Crime</title>
+<link rel="icon" href="./favicon.ico">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1020;
+    font-family: "Trebuchet MS", "Segoe UI", Verdana, sans-serif; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .panel { position: fixed; color: #fff; text-shadow: 0 2px 6px rgba(0,0,0,0.7); z-index: 5; }
+  #stats { top: 14px; left: 16px; }
+  #cash { font-size: 34px; font-weight: 800; color: #ffd23e; letter-spacing: 1px; }
+  #stars { font-size: 26px; letter-spacing: 4px; color: #ffd23e; margin-top: 2px; }
+  #job { font-size: 15px; margin-top: 6px; max-width: 340px; line-height: 1.35; }
+  #minimap { top: 14px; right: 16px; width: 150px; height: 150px;
+    border: 2px solid rgba(255,255,255,0.55); border-radius: 8px; background: #101018; }
+  #speed { bottom: 18px; right: 20px; font-size: 30px; font-weight: 800; display: none; }
+  #message { top: 16px; left: 50%; transform: translateX(-50%); font-size: 21px; font-weight: 700;
+    color: #ffe9a8; background: rgba(20,10,30,0.55); padding: 8px 18px; border-radius: 20px;
+    transition: opacity 0.4s; pointer-events: none; white-space: nowrap; }
+  #beacon-arrow { top: 78px; left: 50%; font-size: 20px; font-weight: 800; color: #ffd23e;
+    text-shadow: 0 2px 6px rgba(0,0,0,0.8); pointer-events: none; display: none; white-space: nowrap; }
+  #steal-prompt { bottom: 110px; left: 50%; transform: translateX(-50%); font-size: 19px; font-weight: 800;
+    color: #fff; background: rgba(20,10,30,0.65); padding: 8px 18px; border-radius: 20px;
+    pointer-events: none; display: none; white-space: nowrap; }
+  #help { bottom: 14px; left: 16px; font-size: 13px; line-height: 1.6; color: rgba(255,255,255,0.85);
+    background: rgba(20,10,30,0.45); padding: 8px 12px; border-radius: 8px; }
+  .overlay { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center; color: #fff; }
+  #title { background: radial-gradient(ellipse at 50% 65%, rgba(20,8,28,0.05) 0%, rgba(20,8,28,0.55) 78%); }
+  #title h1 { font-size: 84px; margin: 0; letter-spacing: 6px; color: #ff5e7a;
+    text-shadow: 0 0 24px rgba(255,94,122,0.8), 0 4px 0 #7a1030, 0 8px 24px rgba(0,0,0,0.8); }
+  #title h2 { font-size: 22px; margin: 6px 0 26px; font-weight: 400; color: #ffe9a8; letter-spacing: 2px; }
+  #title .play { font-size: 24px; font-weight: 800; background: #ff5e7a; color: #fff; border: none;
+    padding: 14px 42px; border-radius: 30px; cursor: pointer; box-shadow: 0 6px 24px rgba(255,94,122,0.6); }
+  #title .controls { margin-top: 28px; font-size: 15px; line-height: 1.9; color: rgba(255,255,255,0.92);
+    background: rgba(20,10,30,0.5); padding: 12px 22px; border-radius: 10px; }
+  #busted { background: rgba(60,0,10,0.72); display: none; }
+  #busted h1 { font-size: 72px; margin: 0; color: #ff5040; letter-spacing: 8px;
+    text-shadow: 0 4px 0 #5a0a00, 0 8px 24px rgba(0,0,0,0.8); }
+  #busted p { font-size: 19px; color: #ffe9a8; }
+  #busted .retry { font-size: 20px; font-weight: 800; background: #fff; color: #a01020; border: none;
+    padding: 12px 34px; border-radius: 26px; cursor: pointer; margin-top: 12px; }
+  #paused { background: rgba(10,10,25,0.55); display: none; }
+  #paused h1 { font-size: 64px; margin: 0; color: #fff; letter-spacing: 10px;
+    text-shadow: 0 4px 0 #202040, 0 8px 24px rgba(0,0,0,0.8); }
+  #paused p { font-size: 19px; color: #ffe9a8; }
+  #title .continue { font-size: 19px; font-weight: 800; background: #ffd23e; color: #40200a; border: none;
+    padding: 12px 34px; border-radius: 26px; cursor: pointer; margin-top: 14px; display: none; }
+  #best-line { font-size: 15px; color: #ffe9a8; margin: 14px 0 0; display: none; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Sunset Bay: an open-world crime game. Drive, steal cars, do jobs and outrun the police."></canvas>
+<p id="status" role="status" aria-live="polite"></p>
+<div class="panel" id="stats">
+  <div id="cash">$0</div>
+  <div id="stars">☆☆☆☆☆</div>
+  <div id="job"></div>
+</div>
+<canvas id="minimap" class="panel" width="150" height="150"></canvas>
+<div class="panel" id="message" style="opacity: 0"></div>
+<div class="panel" id="beacon-arrow"></div>
+<div class="panel" id="steal-prompt">Press E to steal this car</div>
+<div class="panel" id="speed">0 mph</div>
+<div class="panel" id="help">
+  <b>WASD</b> move / drive &nbsp;·&nbsp; <b>Mouse drag</b> camera &nbsp;·&nbsp; <b>E</b> enter / exit car<br>
+  <b>Shift</b> run &nbsp;·&nbsp; <b>Space</b> handbrake &nbsp;·&nbsp; <b>R</b> restart &nbsp;·&nbsp; <b>P</b> pause &nbsp;·&nbsp; <b>M</b> mute
+</div>
+<div class="overlay" id="title">
+  <h1>SUNSET BAY</h1>
+  <h2>AN OPEN-WORLD CRIME GAME</h2>
+  <button class="play" id="play-btn">▶ &nbsp;START ENGINE</button>
+  <button class="continue" id="continue-btn">▶ &nbsp;CONTINUE</button>
+  <p id="best-line"></p>
+  <div class="controls">
+    Steal a car with <b>E</b>, follow the golden beacon to do jobs and earn cash.<br>
+    The cops come when your wanted stars rise — outrun them to cool off.<br>
+    <b>WASD</b> move / drive &nbsp;·&nbsp; <b>Mouse drag</b> camera &nbsp;·&nbsp; <b>Shift</b> run &nbsp;·&nbsp; <b>Space</b> handbrake
+  </div>
+</div>
+<div class="overlay" id="busted">
+  <h1>BUSTED!</h1>
+  <p id="busted-stats"></p>
+  <button class="retry" id="retry-btn">TRY AGAIN (R)</button>
+</div>
+<div class="overlay" id="paused">
+  <h1>PAUSED</h1>
+  <p>Press P to resume · R to restart</p>
+</div>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
