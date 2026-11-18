@@ -11,16 +11,28 @@
   #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
   #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .panel { position: fixed; color: #fff; text-shadow: 0 2px 6px rgba(0,0,0,0.7); z-index: 5; }
-  #stats { top: 14px; left: 16px; }
-  #cash { font-size: 34px; font-weight: 800; color: #ffd23e; letter-spacing: 1px; }
-  #stars { font-size: 26px; letter-spacing: 4px; color: #ffd23e; margin-top: 2px; }
+  /* v3: the whole top-left cluster sits on one dark pill, so cash, stars
+   * and the REP line stay readable over a bright sunset sky or pale sand
+   * (QA v2: "REP LV 3" washed out in shot 4). The mission card keeps its
+   * own darker panel below it. */
+  #stats { top: 14px; left: 16px; background: rgba(12,8,22,0.78);
+    border: 1px solid rgba(255,255,255,0.22); border-radius: 10px; padding: 10px 12px 12px;
+    box-shadow: 0 4px 18px rgba(0,0,0,0.45); }
+  #cash { font-size: 34px; font-weight: 800; color: #ffd23e; letter-spacing: 1px;
+    text-shadow: 0 2px 4px rgba(0,0,0,0.9), 0 0 12px rgba(0,0,0,0.6); }
+  #stars { font-size: 26px; letter-spacing: 4px; color: #ffd23e; margin-top: 2px;
+    text-shadow: 0 2px 4px rgba(0,0,0,0.9); }
   #heat-bar { width: 170px; height: 7px; background: rgba(0,0,0,0.55); border-radius: 4px; margin-top: 4px; overflow: hidden; }
   #heat-fill { height: 100%; width: 0%; background: #ffd23e; border-radius: 4px; transition: width 0.2s; }
   #heat-label { font-size: 10px; letter-spacing: 2px; color: rgba(255,255,255,0.75); margin-top: 2px; }
-  #rep-line { font-size: 13px; font-weight: 800; color: #7df9d4; margin-top: 5px; letter-spacing: 1px; }
+  #rep-line { font-size: 13px; font-weight: 800; color: #7df9d4; margin-top: 5px; letter-spacing: 1px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.95), 0 0 8px rgba(0,0,0,0.8); }
   #rep-bar { width: 170px; height: 5px; background: rgba(0,0,0,0.55); border-radius: 3px; margin-top: 3px; overflow: hidden; }
   #rep-fill { height: 100%; width: 0%; background: #7df9d4; border-radius: 3px; }
-  #district { font-size: 13px; color: #ffe9a8; margin-top: 5px; letter-spacing: 1px; }
+  #stash-line { font-size: 13px; font-weight: 800; color: #ffe9a8; margin-top: 5px; letter-spacing: 1px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.95), 0 0 8px rgba(0,0,0,0.8); }
+  #district { font-size: 13px; color: #ffe9a8; margin-top: 5px; letter-spacing: 1px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.95); }
   /* Mission card: number, name, big timer, stage bar, next objective. */
   #mission-card { margin-top: 10px; width: 300px; background: rgba(20,10,30,0.62);
     border: 1px solid rgba(255,210,62,0.45); border-left: 5px solid #ffd23e;
@@ -53,8 +65,12 @@
   #vehicle-name { font-size: 15px; font-weight: 800; color: #ffe9a8; letter-spacing: 2px; }
   #speed-num { font-size: 52px; font-weight: 800; line-height: 1; }
   #speed-unit { font-size: 15px; font-weight: 800; color: rgba(255,255,255,0.8); }
-  /* Vitals: health + armour, above the speedometer. */
-  #vitals { bottom: 118px; right: 20px; width: 170px; text-align: right; }
+  /* Vitals: health + armour, above the speedometer. Same dark pill as
+   * #stats — the HEALTH / ARMOUR labels washed out over pale sand in v3
+   * shot 4, the same failure mode as the REP line. */
+  #vitals { bottom: 118px; right: 20px; width: 170px; text-align: right;
+    background: rgba(12,8,22,0.72); border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 8px; padding: 6px 10px; }
   .vital-row { display: flex; align-items: center; gap: 6px; justify-content: flex-end; margin-top: 4px; }
   .vital-row label { font-size: 10px; letter-spacing: 2px; color: rgba(255,255,255,0.85); }
   .vital-bar { flex: 1; height: 8px; background: rgba(0,0,0,0.55); border-radius: 4px; overflow: hidden; }
@@ -167,9 +183,10 @@
   <div id="heat-label">TRACE</div>
   <div id="rep-line">REP LV 1 · ROOKIE</div>
   <div id="rep-bar"><div id="rep-fill"></div></div>
+  <div id="stash-line">STASH 0/6</div>
   <div id="district">Old Town</div>
   <div id="mission-card">
-    <div id="mission-num">MISSION 1/8</div>
+    <div id="mission-num">MISSION 1/12</div>
     <div id="mission-timer">1:15</div>
     <div id="mission-name">First Wheels — $100</div>
     <div id="mission-stage">STAGE 1/1 · Steal a car</div>
@@ -205,7 +222,8 @@
 <div class="panel" id="help">
   <b>WASD</b> move / drive &nbsp;·&nbsp; <b>E</b> steal car &nbsp;·&nbsp; <b>F</b> punch &nbsp;·&nbsp; <b>Click</b> shoot<br>
   <b>Shift</b> run &nbsp;·&nbsp; <b>Space</b> brake &nbsp;·&nbsp; <b>1-4 / Q</b> weapon &nbsp;·&nbsp; <b>G</b> garage / shop<br>
-  <b>Tab</b> map &nbsp;·&nbsp; <b>M</b> radio &nbsp;·&nbsp; <b>N</b> mute &nbsp;·&nbsp; <b>R</b> restart &nbsp;·&nbsp; <b>P</b> pause
+  <b>Tab</b> map &nbsp;·&nbsp; <b>M</b> radio &nbsp;·&nbsp; <b>N</b> mute &nbsp;·&nbsp; <b>R</b> restart &nbsp;·&nbsp; <b>P</b> pause<br>
+  6 stash packs hide around town — grab them all for $100 each
 </div>
 <div class="overlay" id="title">
   <div id="logo-sun"></div>

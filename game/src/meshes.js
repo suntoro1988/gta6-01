@@ -2,7 +2,9 @@
 // Local space: forward is +Z, ground is y = 0. All vertex colours are baked in.
 import { MeshBuilder, shade } from './gl.js';
 
-/** A low-poly car: body, glass cabin, wheels, lights. */
+/** A low-poly car: body, glass cabin, wheels, lights, rear spoiler and
+ * sunroof strip — v3 adds the spoiler and roof detail so cars read less
+ * like plain boxes from the chase camera. */
 export function buildCarMesh(bodyColor) {
   const m = new MeshBuilder();
   const dark = shade(bodyColor, 0.55);
@@ -13,6 +15,11 @@ export function buildCarMesh(bodyColor) {
   m.box(0, 0.32, -2.12, 1.92, 0.22, 0.18, dark);
   // Glass cabin.
   m.box(0, 1.08, -0.35, 1.7, 0.55, 2.1, [0.14, 0.18, 0.26], [0.2, 0.26, 0.36]);
+  // Sunroof strip and rear spoiler.
+  m.box(0, 1.38, -0.35, 1.1, 0.06, 1.2, [0.08, 0.1, 0.14]);
+  m.box(0, 1.0, -2.05, 1.7, 0.1, 0.35, dark);
+  m.box(-0.7, 0.82, -2.05, 0.12, 0.3, 0.12, dark);
+  m.box(0.7, 0.82, -2.05, 0.12, 0.3, 0.12, dark);
   // Wheels.
   const wheel = [0.08, 0.08, 0.09];
   m.box(-0.88, 0.32, 1.35, 0.32, 0.62, 0.85, wheel);
@@ -65,6 +72,17 @@ export function buildShadowMesh() {
 export function buildCoinMesh() {
   const m = new MeshBuilder();
   m.cylinder(0, 0, 0, 0.55, 0.3, [1.0, 0.8, 0.2], 12, 0.9);
+  return m;
+}
+
+/** A stash pack pickup: a golden briefcase with a glowing clasp, bigger
+ * and boxier than a road coin so a hidden pack reads as something special
+ * when you spot it — drawn with a gold tint in main.js. */
+export function buildStashMesh() {
+  const m = new MeshBuilder();
+  m.box(0, 0.35, 0, 1.3, 0.7, 0.9, [0.85, 0.65, 0.15], [1.0, 0.8, 0.3], 0.55);
+  m.box(0, 0.78, 0, 0.5, 0.18, 0.2, [0.5, 0.38, 0.08]);
+  m.box(0, 0.35, 0.47, 0.3, 0.3, 0.06, [1.0, 0.9, 0.4], [1.0, 0.9, 0.4], 0.95);
   return m;
 }
 

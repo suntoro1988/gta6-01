@@ -8,7 +8,7 @@ export const CAR_RADIUS = 1.7;
 /** Model names, so the HUD can name the car you are driving. */
 export const CAR_MODELS = [
   'Comet', 'Sunrise', 'Bayliner', 'Marlin', 'Palms', 'Coral',
-  'Tide', 'Solstice', 'Lagoon', 'Dune', 'Reef', 'Sirocco',
+  'Tide', 'Solstice', 'Lagoon', 'Dune', 'Reef', 'Sirocco', 'Taxi',
 ];
 
 /** Push a circle out of every building AABB it overlaps. Returns the
@@ -155,6 +155,9 @@ export function createTrafficCar(rng, colors) {
   const line = rng.pick(LINES);
   const s = rng.range(-150, 150);
   const dir = rng.chance(0.5) ? 1 : -1;
+  // v3: about one in eight traffic cars is a yellow taxi — a little more
+  // life on the roads, and a cab reads instantly in the rear-view mirror.
+  const taxi = rng.chance(0.12);
   return {
     kind: 'traffic',
     axis,
@@ -166,8 +169,8 @@ export function createTrafficCar(rng, colors) {
     x: 0,
     z: 0,
     heading: 0,
-    color: rng.pick(colors),
-    model: rng.pick(CAR_MODELS),
+    color: taxi ? [0.95, 0.8, 0.2] : rng.pick(colors),
+    model: taxi ? 'Taxi' : rng.pick(CAR_MODELS),
     nmT: 0, // near-miss cooldown: one payout per pass, not per frame
   };
 }

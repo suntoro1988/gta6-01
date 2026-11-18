@@ -82,6 +82,11 @@ export function clamp(v, lo, hi) {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+/** Clamp to [0, 1] — for bar widths and progress fills. */
+export function clamp01(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
 /** Shortest signed angle from `from` to `to`, in (-PI, PI]. */
 export function angleDelta(from, to) {
   let d = (to - from) % (Math.PI * 2);

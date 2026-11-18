@@ -112,8 +112,14 @@ export function generateCity(rng) {
         const h = nearBeach
           ? rng.range(22, 46)
           : rng.range(district.h[0], district.h[1]) + (Math.abs(bx - 2.5) + Math.abs(bz - 2.5) < 2 ? 8 : 0);
+        // v3: a few landmark towers rise above their district's range, so
+        // the skyline has peaks instead of one flat band of heights.
+        const tall = rng.chance(0.08) ? Math.min(54, h * 1.45) : h;
+        // v3: gaussian jitter on top, so two buildings from the same
+        // district range never come out exactly the same height.
+        const hj = Math.max(6, tall + rng.gauss() * 1.5);
         const color = rng.pick(district.colors);
-        const building = { x, z, w, d, h, color };
+        const building = { x, z, w, d, h: hj, color };
         buildings.push(building);
         // A neon sign on some buildings, facing a random street.
         if (rng.chance(0.35)) {
@@ -214,6 +220,18 @@ export function buildCityMesh(city) {
     m.box(b.x, b.h / 2, b.z, b.w, b.h, b.d, b.color, shade(b.color, 0.75));
     // Roof rim.
     m.box(b.x, b.h + 0.4, b.z, b.w * 0.7, 0.8, b.d * 0.7, shade(b.color, 0.6));
+    // v3 facade variation: a neon-trim band near the top (one of the four
+    // neon colours, picked from the building's position so it is stable),
+    // plus rooftop props — an AC box on every roof, a water tower on the
+    // tall ones — so roofs read as roofs, not flat caps.
+    const accent = NEON[(((Math.floor(b.x * 7 + b.z * 3) % NEON.length) + NEON.length) % NEON.length)];
+    m.box(b.x, b.h - 1.4, b.z + b.d / 2 + 0.06, b.w * 0.92, 0.9, 0.12, accent, accent, 0.55);
+    m.box(b.x, b.h - 1.4, b.z - b.d / 2 - 0.06, b.w * 0.92, 0.9, 0.12, accent, accent, 0.55);
+    m.box(b.x - b.w * 0.22, b.h + 1.1, b.z - b.d * 0.15, Math.min(3.2, b.w * 0.28), 1.4, 2.2, [0.55, 0.56, 0.6]);
+    if (b.h >= 22) {
+      m.cylinder(b.x + b.w * 0.22, b.h + 0.8, b.z + b.d * 0.18, 1.1, 3.4, [0.45, 0.36, 0.28], 8);
+      m.box(b.x + b.w * 0.22, b.h + 4.6, b.z + b.d * 0.18, 2.8, 0.7, 2.8, [0.4, 0.32, 0.25]);
+    }
     // Window strips: a few glowing bands on the two long faces.
     const rows = Math.max(1, Math.floor(b.h / 7));
     for (let r = 0; r < rows; r += 1) {
@@ -224,6 +242,11 @@ export function buildCityMesh(city) {
       const glow = lit ? 0.7 : 0;
       m.box(b.x, wy, b.z + b.d / 2 + 0.06, b.w * 0.8, 1.6, 0.12, wc, wc, glow);
       m.box(b.x, wy, b.z - b.d / 2 - 0.06, b.w * 0.8, 1.6, 0.12, wc, wc, glow);
+      // Tall buildings get lit windows on the side face too, so they do
+      // not look blank from the street running alongside them.
+      if (b.h >= 22) {
+        m.box(b.x + b.w / 2 + 0.06, wy, b.z, 0.12, 1.6, b.d * 0.8, wc, wc, glow);
+      }
     }
   }
   // Neon signs.
@@ -246,6 +269,24 @@ export function buildCityMesh(city) {
   }
   // The pier: wooden deck into the ocean, with posts and a little shack.
   m.box(208, 0.6, 0, 36, 1.2, 8, [0.55, 0.42, 0.28], [0.62, 0.48, 0.32]);
+  // v3 water: pale wave bands rolling across the ocean, and beach
+  // umbrellas on the sand, so the coast reads as a beach, not a blue slab.
+  for (const wx of [198, 214, 232, 252]) {
+    for (let wz = -170; wz < 170; wz += 34) {
+      m.groundQuad(wx, wz, wx + 1.6, wz + 18, 0.06, [0.42, 0.68, 0.8], 0.25);
+    }
+  }
+  const UMBRELLAS = [
+    { x: 170, z: -60, c: [1.0, 0.35, 0.45] },
+    { x: 176, z: 24, c: [0.25, 0.85, 0.95] },
+    { x: 171, z: 78, c: [1.0, 0.85, 0.25] },
+    { x: 178, z: 132, c: [0.65, 0.45, 1.0] },
+  ];
+  for (const u of UMBRELLAS) {
+    m.cylinder(u.x, 0, u.z, 0.12, 2.6, [0.9, 0.88, 0.8], 6);
+    m.octa(u.x, 3.1, u.z, 2.4, u.c);
+    m.box(u.x + 1.6, 0.25, u.z + 1.2, 2.2, 0.5, 1.2, [0.95, 0.6, 0.4]);
+  }
   for (let x = 194; x <= 224; x += 6) {
     m.cylinder(x, -1, -3.4, 0.5, 2.4, [0.4, 0.3, 0.2], 6);
     m.cylinder(x, -1, 3.4, 0.5, 2.4, [0.4, 0.3, 0.2], 6);

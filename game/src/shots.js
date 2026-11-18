@@ -129,6 +129,10 @@ export function stageShot(name, game) {
     }
     stageTrafficAndPed(game, car, car.x + 45, 0, Math.PI / 2, car.x + 32, 7, -Math.PI / 2);
     game.pickups[0] = { x: car.x + 24, z: 2, amount: 25, taken: false, spin: -2.3, respawn: 0 };
+    // v3: a stash pack sits in frame on the roadside — the golden briefcase
+    // reads next to the coin, and the STASH 0/6 line shows in the HUD pill.
+    const stash = game.pickups.find((p) => p.kind === 'stash' && !p.taken);
+    if (stash) { stash.x = car.x + 18; stash.z = 6; stash.spin = -2.3; }
     // Rear view, raised and pulled back so all four cops read — the two
     // behind between camera and car, the roadblock ahead — and the beacon
     // at the pier stands in the middle of the frame.

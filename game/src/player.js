@@ -40,10 +40,12 @@ export function stepPlayer(p, input, camYaw, dt, colliders, cars) {
     const targetSpeed = input.run ? 10 : 6;
     p.speed += clamp(targetSpeed - p.speed, -30 * dt, 14 * dt);
     const targetHeading = Math.atan2(dx, dz);
-    p.heading = turnToward(p.heading, targetHeading, 10 * dt);
+    // Sprinting turns a touch sharper and bobs faster — running should
+    // feel like running, not a faster walk.
+    p.heading = turnToward(p.heading, targetHeading, (input.run ? 12 : 10) * dt);
     p.x += dx * p.speed * dt;
     p.z += dz * p.speed * dt;
-    p.bob += p.speed * dt * 1.7;
+    p.bob += p.speed * dt * (input.run ? 2.1 : 1.7);
   } else {
     p.speed = Math.max(0, p.speed - 30 * dt);
   }

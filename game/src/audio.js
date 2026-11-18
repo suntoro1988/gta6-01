@@ -1,5 +1,5 @@
 // A tiny WebAudio synth for game sounds: pickup chimes, crash thuds, the
-// wanted sting, a two-tone police siren — and three looping radio stations
+// wanted sting, a two-tone police siren — and four looping radio stations
 // of synth music (bass, chords and a lead line, all oscillators, no files).
 // Everything is guarded so the game plays fine with sound off or blocked.
 export function createAudio() {
@@ -28,6 +28,11 @@ export function createAudio() {
       { title: 'Ultraviolet', artist: 'DJ Sunset' },
       { title: 'After Dark', artist: 'Midnight Static' },
       { title: 'Chrome Hearts', artist: 'Midnight Static' },
+    ],
+    [
+      { title: 'Palm Shadows', artist: 'The Palms' },
+      { title: 'Boardwalk Breeze', artist: 'Marina Lights' },
+      { title: 'Low Tide', artist: 'The Palms' },
     ],
   ];
   const STATIONS = [
@@ -70,8 +75,22 @@ export function createAudio() {
       lead: [0, 220, 0, 261.63, 0, 0, 329.63, 0, 0, 392, 0, 329.63, 0, 261.63, 0, 0],
       leadType: 'triangle',
     },
+    {
+      // v3: a slower, breezier fourth station for the beach side of town.
+      name: 'PALM COURT',
+      bpm: 88,
+      bass: [98, 0, 0, 98, 0, 0, 123.47, 0, 87.31, 0, 0, 87.31, 0, 0, 110, 0],
+      chords: [
+        [196, 246.94, 293.66],
+        [164.81, 207.65, 246.94],
+        [174.61, 220, 261.63],
+        [146.83, 185, 220],
+      ],
+      lead: [0, 0, 392, 0, 493.88, 0, 0, 0, 440, 0, 0, 523.25, 0, 0, 587.33, 0],
+      leadType: 'sine',
+    },
   ];
-  let stationIndex = -1; // -1 = radio off; 0..2 = a station is playing
+  let stationIndex = -1; // -1 = radio off; 0..3 = a station is playing
   let radioStep = 0;
   let nextStepTime = 0;
 
@@ -176,7 +195,7 @@ export function createAudio() {
       }
       return STATIONS[stationIndex].name;
     },
-    /** Cycle OFF -> BAY FM -> SUNSET DRIVE -> NEON NIGHTS -> OFF ... */
+    /** Cycle OFF -> BAY FM -> SUNSET DRIVE -> NEON NIGHTS -> PALM COURT -> OFF ... */
     cycleStation() {
       ensure();
       stationIndex = stationIndex >= STATIONS.length - 1 ? -1 : stationIndex + 1;
@@ -204,6 +223,12 @@ export function createAudio() {
     pickup() {
       tone(880, 0.12, 'sine', 0.16);
       tone(1318, 0.2, 'sine', 0.14, 0.08);
+    },
+    /** A stash pack is worth more than a road coin: a longer, rising chime. */
+    stash() {
+      tone(659, 0.12, 'sine', 0.16);
+      tone(880, 0.12, 'sine', 0.16, 0.09);
+      tone(1318, 0.26, 'sine', 0.15, 0.18);
     },
     jobDone() {
       tone(523, 0.12, 'triangle', 0.16);

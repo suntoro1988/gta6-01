@@ -42,7 +42,12 @@ void main() {
   vec3 n = normalize(vNormal);
   float diff = max(dot(n, uSunDir), 0.0);
   vec3 base = vColor * uTint;
-  vec3 col = base * (0.52 + 0.72 * diff) + base * vGlow * 0.9;
+  // v3 lighting: a warmer ambient so shadowed faces do not go flat grey,
+  // plus a faint warm bounce from the low sun's opposite side, so the
+  // dusk reads golden rather than muddy at street level.
+  float bounce = max(dot(n, vec3(0.5, 0.25, 0.6)), 0.0);
+  vec3 col = base * (0.58 + 0.66 * diff) + base * vec3(0.10, 0.04, 0.0) * (1.0 - diff) + base * bounce * 0.10;
+  col += base * vGlow * 0.9;
   float f = smoothstep(uFogRange[0], uFogRange[1], vDist);
   gl_FragColor = vec4(mix(col, uFogColor, f), uAlpha);
 }

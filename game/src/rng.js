@@ -23,6 +23,13 @@ export function createRng(seed) {
     chance(p) {
       return next() < p;
     },
+    /** A standard-normal sample (Box-Muller, from the same seeded stream),
+     * for natural-looking jitter — building heights, tree scales. */
+    gauss() {
+      const u = Math.max(next(), 1e-9);
+      const v = next();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    },
     /** Fisher-Yates shuffle, in place, from the same seeded stream. */
     shuffle(list) {
       for (let i = list.length - 1; i > 0; i -= 1) {

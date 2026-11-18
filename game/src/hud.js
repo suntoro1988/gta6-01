@@ -4,6 +4,7 @@
 // interact prompts, and the full-screen city map (Tab). All DOM except the
 // two map canvases; the 3D view stays a plain canvas underneath.
 import { CITY_MAX, BEACH_X, PLACES, LINES, districtAt } from './city.js';
+import { clamp01 } from './math3.js';
 
 const MAP_SIZE = 150;
 const WORLD_SPAN = 400;
@@ -222,6 +223,7 @@ export function createHud() {
     healthFill: document.getElementById('health-fill'),
     armourFill: document.getElementById('armour-fill'),
     healthNum: document.getElementById('health-num'),
+    stashLine: document.getElementById('stash-line'),
     popups: document.getElementById('popups'),
     dialog: document.getElementById('dialog'),
     dialogPortrait: document.getElementById('dialog-portrait'),
@@ -234,7 +236,7 @@ export function createHud() {
   };
 }
 
-const MISSION_NAMES = ['First Wheels', 'Package Run', 'Cool Down', 'Street Race', 'Stash Grab', 'Getaway', 'The Big Heist', 'Bay King'];
+const MISSION_NAMES = ['First Wheels', 'Package Run', 'Cool Down', 'Street Race', 'Stash Grab', 'Getaway', 'The Big Heist', 'Bay King', 'Dockside Deal', 'Neon Nights', 'Payback Run', 'Sunset Showdown'];
 
 export function updateHud(hud, game, camYaw = 0, paused = false, mapOpen = false) {
   const onTitle = game.state === 'title';
@@ -248,11 +250,16 @@ export function updateHud(hud, game, camYaw = 0, paused = false, mapOpen = false
   const stars = game.stars;
   hud.stars.textContent = '★'.repeat(stars) + '☆'.repeat(5 - stars);
   hud.stars.style.color = stars >= 3 ? '#ff5040' : '#ffd23e';
-  hud.heatFill.style.width = `${Math.round((game.heat / 500) * 100)}%`;
+  hud.heatFill.style.width = `${Math.round(clamp01(game.heat / 500) * 100)}%`;
   hud.heatFill.style.background = stars >= 3 ? '#ff5040' : '#ffd23e';
   const rep = game.repLevel;
   hud.repLine.textContent = `REP LV ${rep.level} · ${rep.title}`;
   hud.repFill.style.width = `${Math.round(rep.progress * 100)}%`;
+  // Stash hunt: how many of the 6 hidden packs this run has found.
+  if (hud.stashLine) {
+    hud.stashLine.textContent = `STASH ${game.stashesCollected}/${game.stashTotal}`;
+    hud.stashLine.style.color = game.stashesCollected >= game.stashTotal ? '#ffd23e' : '#ffe9a8';
+  }
 
   // Mission card: number, name, big timer, stage bar, next objective.
   const card = game.missionCard;
@@ -366,7 +373,7 @@ export function updateHud(hud, game, camYaw = 0, paused = false, mapOpen = false
   // Context prompt: garage / shop / safehouse.
   let interact = '';
   if (!onTitle && game.state === 'playing') {
-    if (game.nearGarage && inCar) interact = game.heat > 0 ? 'G — Respray $200 (lose the heat)' : 'G — Garage: buy upgrade';
+    if (game.nearGarage && inCar) interact = game.heat >= 200 ? 'G — Respray $200 (lose the heat)' : 'G — Garage: buy upgrade';
     else if (game.nearGarage) interact = 'Get in a car to use the garage';
     else if (game.nearShop && !inCar) interact = 'G — Shop: ammo $50 · armour $120';
     else if (game.nearSafehouse) interact = 'Safehouse — healing, heat fading, progress saved';
@@ -426,6 +433,7 @@ export function updateHud(hud, game, camYaw = 0, paused = false, mapOpen = false
       ['Near misses', String(game.nearMisses)],
       ['Drifts', String(game.drifts)],
       ['Coins', String(game.coinsCollected)],
+      ['Stash packs', `${game.stashesCollected}/${game.stashTotal}`],
       ['Top district', topDistrict ? `${topDistrict[0]} (${topDistrict[1]})` : '—'],
     ].map(([k, v]) => `<div class="map-stat"><span>${k}</span><b>${v}</b></div>`).join('');
   }

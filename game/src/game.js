@@ -1,7 +1,8 @@
-// The game itself: 8 named missions in stages, money, the wanted system,
-// on-foot combat, the police helicopter, garage/shop/safehouse, pedestrians
-// and pickups. Rendering lives in main.js; this file only moves the world
-// forward. Deterministic: every random choice comes from the seeded rng.
+// The game itself: 12 named missions in stages, money, the wanted system,
+// on-foot combat, the police helicopter, garage/shop/safehouse, pedestrians,
+// pickups and hidden stash packs. Rendering lives in main.js; this file only
+// moves the world forward. Deterministic: every random choice comes from the
+// seeded rng.
 import { LINES, WORLD, PLACES, districtAt, generateCity, buildingColliders } from './city.js';
 import { createRng } from './rng.js';
 import {
@@ -17,7 +18,7 @@ import {
   stepTraffic,
 } from './vehicles.js';
 import { createPlayer, stepPlayer } from './player.js';
-import { clamp } from './math3.js';
+import { clamp, dist2 } from './math3.js';
 
 export const CAR_COLORS = [
   [0.85, 0.2, 0.2], [0.2, 0.4, 0.85], [0.95, 0.8, 0.2], [0.9, 0.9, 0.88],
@@ -61,10 +62,12 @@ export const UPGRADE_DEFS = [
   { key: 'handling', name: 'Handling', base: 200 },
 ];
 
-// --- Missions: 8 named jobs, each in 1-4 stages. A stage is one objective:
+// --- Missions: 12 named jobs, each in 1-4 stages. A stage is one objective:
 // steal (get in any car), goto (reach a beacon), safehouse (reach the
 // safehouse), collect (grab a stash drop), hide (get the heat under 50).
-// The first three missions are the original chain, kept as-is. ---
+// The first three missions are the original chain, kept as-is; missions
+// 9-12 are the v3 additions, reusing the same stage kinds so every job
+// stays completable with the existing mechanics. ---
 const MISSIONS = [
   {
     name: 'First Wheels', reward: 100, time: 75, from: 'MARA',
@@ -129,6 +132,43 @@ const MISSIONS = [
       { kind: 'safehouse', text: 'Return to the safehouse' },
     ],
   },
+  {
+    name: 'Dockside Deal', reward: 700, time: 180, from: 'RICO',
+    brief: 'A buyer is waiting at the Docks with cash in hand. Bring the goods, no cops.',
+    stages: [
+      { kind: 'goto', fixed: 'The Docks', text: 'Reach the Docks' },
+      { kind: 'collect', text: 'Pick up the goods' },
+      { kind: 'goto', fixed: 'Hotel Bayview', text: 'Deliver to the buyer' },
+    ],
+  },
+  {
+    name: 'Neon Nights', reward: 750, time: 180, from: 'DEX',
+    brief: 'Three checkpoints, one night, no brakes. The Strip is watching — make it look easy.',
+    stages: [
+      { kind: 'goto', checkpoint: true, text: 'Reach checkpoint 1/3' },
+      { kind: 'goto', checkpoint: true, text: 'Reach checkpoint 2/3' },
+      { kind: 'goto', checkpoint: true, text: 'Reach checkpoint 3/3' },
+    ],
+  },
+  {
+    name: 'Payback Run', reward: 800, time: 180, from: 'MARA',
+    brief: 'They set you up. Shake the heat, cross town, and lay low till it blows over.',
+    stages: [
+      { kind: 'hide', text: 'Lose the heat first' },
+      { kind: 'goto', far: true, text: 'Cross to the far side of town' },
+      { kind: 'safehouse', text: 'Lay low at the safehouse' },
+    ],
+  },
+  {
+    name: 'Sunset Showdown', reward: 1500, time: 240, from: 'MARA',
+    brief: 'The final score. Race the checkpoint, grab the stash, deliver it, vanish. All of it.',
+    stages: [
+      { kind: 'goto', checkpoint: true, text: 'Race to the checkpoint' },
+      { kind: 'collect', text: 'Grab the stash' },
+      { kind: 'goto', text: 'Deliver the take' },
+      { kind: 'safehouse', text: 'Vanish at the safehouse' },
+    ],
+  },
 ];
 
 const REP_TITLES = ['ROOKIE', 'STREET', 'HUSTLER', 'BIG SHOT', 'BAY KING'];
@@ -154,6 +194,10 @@ export class Game {
     this.pedsHit = 0;
     this.copsDowned = 0;
     this.coinsCollected = 0;
+    // Stash packs: 6 hidden money packs per run, worth $100 each. They never
+    // respawn once taken — the counter is the collection goal for the run.
+    this.stashesCollected = 0;
+    this.stashTotal = 6;
     this.nearMisses = 0;
     this.drifts = 0;
     this.bustTimer = 0;
@@ -216,9 +260,10 @@ export class Game {
     else if (raw < this.starLevel && this.heat < this.starLevel * 100 - 15) this.starLevel = raw;
   }
 
-  /** Respect: missions, cops downed, cars stolen and coins all count. */
+  /** Respect: missions, cops downed, cars stolen, coins and stash packs
+   * all count — a full stash sweep is worth almost half a mission. */
   get repPoints() {
-    return this.jobsDone * 150 + this.copsDowned * 25 + this.carsStolen * 10 + this.coinsCollected * 5;
+    return this.jobsDone * 150 + this.copsDowned * 25 + this.carsStolen * 10 + this.coinsCollected * 5 + this.stashesCollected * 15;
   }
 
   get repLevel() {
@@ -295,6 +340,17 @@ export class Game {
       const p = randomRoadPoint(rng);
       const amount = type === 'pistol' ? 12 : type === 'shotgun' ? 6 : 24;
       this.pickups.push({ kind: 'ammo', ammoType: type, x: p.x, z: p.z, amount, taken: false, spin: rng.range(0, 6), respawn: 0 });
+    }
+    // Stash packs: 3 on random roads, 3 at fixed hiding spots a player can
+    // actually learn — the pier end, Bay Park, and the far beach — so the
+    // hunt is part exploration, part memory. Seeded, so the same seed hides
+    // them in the same places every run.
+    for (let i = 0; i < 3; i += 1) {
+      const p = randomRoadPoint(rng);
+      this.pickups.push({ kind: 'stash', x: p.x, z: p.z, amount: 100, taken: false, spin: rng.range(0, 6), respawn: 0 });
+    }
+    for (const spot of [{ x: 186, z: 0 }, { x: -26, z: -26 }, { x: 175, z: 100 }]) {
+      this.pickups.push({ kind: 'stash', x: spot.x, z: spot.z, amount: 100, taken: false, spin: rng.range(0, 6), respawn: 0 });
     }
     this.startMission(0);
   }
@@ -580,8 +636,14 @@ export class Game {
         this.setMessage('Get in a car to use the garage.');
         return;
       }
-      // A respray comes first while wanted: $200 wipes the heat clean.
-      if (this.heat > 0 && this.money >= 200) {
+      // v3 (playtest round 2, case a): a respray used to come first whenever
+      // any heat existed — but stealing a car (the first thing every player
+      // does) already puts 1 star on you, so the upgrade path always cost
+      // an extra $200 first, silently. Now the respray only jumps the queue
+      // at 2+ stars, when losing the heat is the urgent need; at 1 star G
+      // buys the upgrade you came for, and the heat can still be driven off
+      // or cleared at the safehouse. (Case b still passes: heat 250 resprays.)
+      if (this.heat >= 200 && this.money >= 200) {
         this.money -= 200;
         this.heat = 0;
         this.updateStars();
@@ -589,7 +651,7 @@ export class Game {
         this.setMessage('Respray — the heat is gone!');
         return;
       }
-      if (this.heat > 0 && this.money < 200) {
+      if (this.heat >= 200 && this.money < 200) {
         this.setMessage('Respray costs $200 — earn a little more first.');
         return;
       }
@@ -827,7 +889,8 @@ export class Game {
       coin.spin += dt * 1.5;
       if (coin.taken) {
         coin.respawn -= dt;
-        if (coin.respawn <= 0 && coin.kind !== 'job') {
+        // Job drops and stash packs never come back: a taken stash stays taken.
+        if (coin.respawn <= 0 && coin.kind !== 'job' && coin.kind !== 'stash') {
           const p = randomRoadPoint(this.rng);
           coin.x = p.x;
           coin.z = p.z;
@@ -835,7 +898,7 @@ export class Game {
         }
         continue;
       }
-      if (Math.hypot(coin.x - px, coin.z - pz) < 2.4) {
+      if (dist2(coin.x, coin.z, px, pz) < 2.4 * 2.4) {
         coin.taken = true;
         coin.respawn = 20;
         if (coin.kind === 'cash') {
@@ -843,6 +906,13 @@ export class Game {
           this.money += coin.amount;
           this.coinsCollected += 1;
           this.setMessage(`+$${coin.amount} cash!`);
+        } else if (coin.kind === 'stash') {
+          // A hidden stash pack: $100, a rep bump, and a popup — the hunt
+          // pays better than a road coin, and it never respawns.
+          this.money += coin.amount || 100;
+          this.stashesCollected += 1;
+          this.addPopup(`STASH PACK  +$${coin.amount || 100}`);
+          this.setMessage(`Stash pack found! ${this.stashesCollected}/${this.stashTotal} collected.`);
         } else if (coin.kind === 'ammo') {
           this.ammo[coin.ammoType] += coin.amount;
           const first = !this.unlocked[coin.ammoType];
@@ -1039,6 +1109,7 @@ export class Game {
     this.pedsHit = 0;
     this.copsDowned = 0;
     this.coinsCollected = 0;
+    this.stashesCollected = 0;
     this.nearMisses = 0;
     this.drifts = 0;
     this.bustTimer = 0;

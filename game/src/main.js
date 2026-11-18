@@ -5,7 +5,7 @@ import { createRenderer } from './gl.js';
 import { matIdentity, matModel, matModelScale, matModelTilt, turnToward, clamp } from './math3.js';
 import { buildCityMesh, PLACES } from './city.js';
 import { Game, PLAYER_CAR_COLOR } from './game.js';
-import { buildAmmoMesh, buildCarMesh, buildHeliMesh, buildLightBarMesh, buildMarkerMesh, buildPersonMesh, buildRotorMesh, buildShadowMesh, buildCoinMesh, buildBeaconMesh, buildTracerMesh } from './meshes.js';
+import { buildAmmoMesh, buildCarMesh, buildHeliMesh, buildLightBarMesh, buildMarkerMesh, buildPersonMesh, buildRotorMesh, buildShadowMesh, buildCoinMesh, buildStashMesh, buildBeaconMesh, buildTracerMesh } from './meshes.js';
 import { createHud, updateHud } from './hud.js';
 import { createAudio } from './audio.js';
 import { stageShot } from './shots.js';
@@ -45,6 +45,7 @@ function personMesh(p) {
 }
 const shadowMesh = renderer.upload(buildShadowMesh());
 const coinMesh = renderer.upload(buildCoinMesh());
+const stashMesh = renderer.upload(buildStashMesh());
 const ammoMesh = renderer.upload(buildAmmoMesh());
 const beaconMesh = renderer.upload(buildBeaconMesh());
 const lightBarMesh = renderer.upload(buildLightBarMesh());
@@ -125,6 +126,8 @@ function persistSave() {
       ammo: { ...game.ammo },
       weaponIndex: game.weaponIndex,
       armour: game.armour,
+      // v3: the stash hunt rides along too; a v2 save lacks it and starts 0/6.
+      stashesCollected: game.stashesCollected,
     };
     localStorage.setItem(SAVE_KEY, JSON.stringify(data));
     savedProgress = data;
@@ -159,6 +162,16 @@ function startGame(fromContinue = false) {
     }
     if (Number.isInteger(savedProgress.weaponIndex)) game.weaponIndex = savedProgress.weaponIndex;
     if (typeof savedProgress.armour === 'number') game.armour = savedProgress.armour;
+    if (typeof savedProgress.stashesCollected === 'number') {
+      game.stashesCollected = savedProgress.stashesCollected;
+      // The packs themselves respawn with a fresh world, so mark the ones
+      // already collected as taken — otherwise a Continue could collect 9/6.
+      let left = game.stashesCollected;
+      for (const p of game.pickups) {
+        if (left <= 0) break;
+        if (p.kind === 'stash' && !p.taken) { p.taken = true; left -= 1; }
+      }
+    }
   }
   game.state = 'playing';
   audio.startRadio();
@@ -273,6 +286,10 @@ function render() {
     const bob = 1.1 + Math.sin(game.time * 2 + coin.spin) * 0.15;
     if (coin.kind === 'ammo') {
       renderer.drawMesh(ammoMesh, matModel(coin.spin, coin.x, 0.4, coin.z));
+    } else if (coin.kind === 'stash') {
+      // The hidden packs: a bigger golden briefcase, bobbing and spinning
+      // so it catches the eye from down the street.
+      renderer.drawMesh(stashMesh, matModel(coin.spin, coin.x, bob, coin.z), { tint: [1.15, 0.95, 0.45] });
     } else if (coin.kind === 'job') {
       renderer.drawMesh(coinMesh, matModelTilt(coin.spin, Math.PI / 2, coin.x, bob, coin.z, 2.2), { tint: [1, 0.5, 0.9] });
     } else {
@@ -340,6 +357,7 @@ function render() {
 let last = performance.now();
 let acc = 0;
 let prevMoney = 0;
+let prevStashes = 0;
 let prevStars = 0;
 let prevState = game.state;
 let prevShots = 0;
@@ -376,9 +394,11 @@ function frame(now) {
     camera.yaw = turnToward(camera.yaw, game.playerCar.heading + Math.PI, 1.4 * dt);
   }
   // Sounds on what just happened.
+  if (game.stashesCollected > prevStashes) audio.stash();
   if (game.money > prevMoney) {
     if (game.message.startsWith('Job done')) { audio.jobDone(); persistSave(); }
-    else audio.pickup();
+    // A stash pack already played its own chime above — don't double it.
+    else if (game.stashesCollected <= prevStashes) audio.pickup();
   }
   if (game.stars > prevStars) audio.sting();
   if (game.message === 'Crash!' && game.messageT > 2.9) audio.crash();
@@ -394,6 +414,7 @@ function frame(now) {
   }
   wasNearSafehouse = game.nearSafehouse;
   prevMoney = game.money;
+  prevStashes = game.stashesCollected;
   prevStars = game.stars;
   prevState = game.state;
   prevShots = game.shotsFired;
