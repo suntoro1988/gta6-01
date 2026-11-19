@@ -1,473 +1,426 @@
-// Cars: arcade driving physics, road traffic and the police chase.
-// Forward is (sin(heading), cos(heading)); heading grows turning left.
-import { LINES, WORLD, onRoad } from './city.js';
-import { clamp, turnToward } from './math3.js';
+// vehicles.js — Sunset Bay v5 (Builder D)
+// Fisika kendaraan + traffic AI + speedboat. Modul mandiri, tanpa impor.
+// Ditulis fresh dari design-spec, sesi recording 01a1f13f-5466-77cb-9088-12e78d473c06.
 
-export const CAR_RADIUS = 1.7;
+'use strict';
 
-// Model names, so the HUD can name the car you are driving.
-export const CAR_MODELS = [
-  'Comet', 'Sunrise', 'Bayliner', 'Marlin', 'Palms', 'Coral',
-  'Tide', 'Solstice', 'Lagoon', 'Dune', 'Reef', 'Sirocco', 'Taxi',
+// ---------- util lokal ----------
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function wrapAngle(a) {
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
+}
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// Palet warna mobil (24 warna, dari spec: warna acak dari palet).
+export const CAR_COLORS = [
+  '#e33e2b', '#f2a007', '#f5d90a', '#2fae4e', '#1f8fff', '#2447d6',
+  '#7a3fd1', '#e26fb5', '#f2f2f2', '#1c1c22', '#8a8f98', '#5b3a1e',
+  '#0fa3a3', '#9be15d', '#ff7a1a', '#b3123f', '#3a6ea5', '#c9a227',
+  '#6b7c93', '#d94f70', '#2b2b4a', '#a8e063', '#ffcf3f', '#4ecdc4',
 ];
 
-// Push a circle out of every building AABB it overlaps. Returns the
-// corrected position, whether it hit, and the push direction (nx, nz):
-// the wall normal, for wall-following steering.
-export function collideCircle(x, z, r, colliders) {
-  const ox = x;
-  const oz = z;
-  let hit = false;
-  for (const c of colliders) {
-    const nx = Math.max(c.x0, Math.min(x, c.x1));
-    const nz = Math.max(c.z0, Math.min(z, c.z1));
-    const dx = x - nx;
-    const dz = z - nz;
-    const d2 = dx * dx + dz * dz;
-    if (d2 >= r * r) continue;
-    hit = true;
-    if (d2 > 0.0001) {
-      const d = Math.sqrt(d2);
-      x = nx + (dx / d) * r;
-      z = nz + (dz / d) * r;
-    } else {
-      const pl = x - c.x0;
-      const pr = c.x1 - x;
-      const pt = z - c.z0;
-      const pb = c.z1 - z;
-      const m = Math.min(pl, pr, pt, pb);
-      if (m === pl) x = c.x0 - r;
-      else if (m === pr) x = c.x1 + r;
-      else if (m === pt) z = c.z0 - r;
-      else z = c.z1 + r;
-    }
+export const CAR_MODELS = ['sport', 'sedan', 'truck', 'taxi'];
+
+// Spesifikasi per model: akselerasi, top speed, grip, ukuran.
+const MODEL_SPEC = {
+  sport: { accel: 26, topSpeed: 38, reverse: 12, grip: 3.4, len: 4.4, wid: 2.0, brake: 34 },
+  sedan: { accel: 20, topSpeed: 30, reverse: 10, grip: 3.0, len: 4.6, wid: 2.0, brake: 30 },
+  truck: { accel: 14, topSpeed: 24, reverse: 8,  grip: 2.4, len: 6.2, wid: 2.4, brake: 24 },
+  taxi:  { accel: 20, topSpeed: 30, reverse: 10, grip: 3.0, len: 4.6, wid: 2.0, brake: 30 },
+  police:{ accel: 24, topSpeed: 34, reverse: 11, grip: 3.2, len: 4.6, wid: 2.0, brake: 32 },
+  boat:  { accel: 18, topSpeed: 32, reverse: 8,  grip: 1.6, len: 6.0, wid: 2.4, brake: 18 },
+};
+
+// ---------- tabrakan / dinding ----------
+// Gedung dianggap kotak axis-aligned {x, z, w, d}. Air dianggap penghalang mobil.
+function blockedAt(city, x, z, margin) {
+  if (!city) return false;
+  const b = city.bounds;
+  if (b) {
+    if (x < b.minX + margin || x > b.maxX - margin) return true;
+    if (z < b.minZ + margin || z > b.maxZ - margin) return true;
   }
-  const px = x - ox;
-  const pz = z - oz;
-  const pl = Math.hypot(px, pz);
-  return { x, z, hit, nx: pl > 0.0001 ? px / pl : 0, nz: pl > 0.0001 ? pz / pl : 0 };
+  const list = city.buildings || [];
+  for (let i = 0; i < list.length; i++) {
+    const g = list[i];
+    const hw = (g.w || 10) / 2 + margin;
+    const hd = (g.d || 10) / 2 + margin;
+    if (Math.abs(x - g.x) < hw && Math.abs(z - g.z) < hd) return true;
+  }
+  return false;
 }
 
-// Push two circular cars apart and swap a little speed along the impact line.
-export function resolveCarPair(a, b) {
-  const dx = b.x - a.x;
-  const dz = b.z - a.z;
-  const d = Math.hypot(dx, dz);
-  const min = CAR_RADIUS * 2 - 0.2;
-  if (d >= min || d < 0.0001) return 0;
-  const nx = dx / d;
-  const nz = dz / d;
-  const push = (min - d) / 2;
-  a.x -= nx * push;
-  a.z -= nz * push;
-  b.x += nx * push;
-  b.z += nz * push;
-  const rel = (b.speed - a.speed) * 0.5;
-  a.speed += rel * 0.4;
-  b.speed -= rel * 0.4;
-  return Math.abs(rel);
+function inWaterAt(city, x, z) {
+  if (!city) return false;
+  if (typeof city.isWater === 'function') {
+    try { return !!city.isWater(city, x, z); } catch (e) { /* jatuh ke cek manual */ }
+  }
+  const areas = city.water || [];
+  for (let i = 0; i < areas.length; i++) {
+    const w = areas[i];
+    const hw = (w.w || 0) / 2, hd = (w.d || 0) / 2;
+    if (Math.abs(x - (w.x || 0)) < hw && Math.abs(z - (w.z || 0)) < hd) return true;
+  }
+  return false;
 }
 
-// One step of the player's car. Returns { crashed, impact }. Upgrades ride
-// on car.upgrades { speed, armor, handling } (levels 0-3, from the garage);
-// a car without them drives stock. Drift state rides on the car too:
-// drifting while the handbrake is held at speed with steering input.
-export function stepPlayerCar(car, input, dt, colliders, others) {
-  const up = car.upgrades || { speed: 0, armor: 0, handling: 0 };
-  const road = onRoad(car.x, car.z);
-  const maxSpeed = (road ? 38 : 25) * (1 + 0.12 * up.speed);
-  // Top speed on a road (38) beats a police car (30): on a straight road
-  // the player really does pull away. (Drag balances accel, so the accel
-  // has to be well above drag * top speed, or the cap is never reached.)
-  const accel = (road ? 20 : 10) * (1 + 0.1 * up.speed);
-  if (input.forward) car.speed += accel * dt;
-  if (input.back) {
-    car.speed -= car.speed > 0.5 ? 26 * dt : 8 * dt;
+// Geser posisi dengan wall-slide: coba gerak penuh, bila tertabrak coba
+// sumbu X saja lalu sumbu Z saja, sehingga mobil meluncur sepanjang dinding
+// dan tidak pernah macet menempel dinding.
+function moveWithSlide(obj, nx, nz, city, margin) {
+  if (!blockedAt(city, nx, nz, margin) && !inWaterAt(city, nx, nz)) {
+    obj.x = nx; obj.z = nz;
+    return;
   }
-  // v4: the handbrake drags less (1.1, was 1.6), so a stock car keeps
-  // enough speed through a slide for the drift timer to actually pay.
-  car.speed -= car.speed * (input.handbrake ? 1.1 : 0.4) * dt;
-  car.speed = clamp(car.speed, -9, maxSpeed);
-  // The speed the player is driving at, before any collision shoves it around:
-  // a cop ramming a parked car must not make that car "fast".
-  car.drivenSpeed = car.speed;
-  const steerTarget = (input.left ? 1 : 0) - (input.right ? 1 : 0);
-  // v4 (playtest): progressive steering. The wheel turns less the faster
-  // you go — full lock at a crawl, about a third of it at top speed — so
-  // holding a turn for 1.5 s at medium speed arcs down the road instead of
-  // spinning the car straight into the nearest wall.
-  const speedFactor = clamp(1 - Math.abs(car.speed) / 55, 0.35, 1);
-  const steerMax = ((input.handbrake ? 0.85 : 0.55) + 0.1 * up.handling) * speedFactor;
-  car.steer += clamp(steerTarget * steerMax - car.steer, -(3 + up.handling) * dt, (3 + up.handling) * dt);
-  if (Math.abs(car.speed) > 0.2) {
-    // The turning divisor grows with speed too: the same steer input bends
-    // a slow car tightly and a fast car in a wide, controllable arc.
-    const turnDiv = 2.2 + Math.abs(car.speed) * 0.18;
-    car.heading += (car.steer * car.speed * dt) / turnDiv;
+  // Coba X saja.
+  if (!blockedAt(city, nx, obj.z, margin) && !inWaterAt(city, nx, obj.z)) {
+    obj.x = nx;
+    return;
   }
-  // Drift: handbrake + speed + steering. The timer only counts while all
-  // three hold, so a real slide pays and a tap of the brake does not.
-  // v4: the steer bar is 0.3 (was 0.35) — a stock car can hold a slide.
-  const wasDrifting = !!car.drifting;
-  car.drifting = !!(input.handbrake && Math.abs(car.speed) > 15 && Math.abs(car.steer) > 0.3);
-  if (car.drifting) car.driftT = (car.driftT || 0) + dt;
-  else if (!wasDrifting) car.driftT = 0;
-  car.driftEnded = wasDrifting && !car.drifting;
-  car.x += Math.sin(car.heading) * car.speed * dt;
-  car.z += Math.cos(car.heading) * car.speed * dt;
-  const before = car.speed;
-  const fixed = collideCircle(car.x, car.z, CAR_RADIUS, colliders);
-  car.x = fixed.x;
-  car.z = fixed.z;
-  let impact = 0;
-  let wallImpact = 0;
-  if (fixed.hit) {
-    // v4 (playtest): walls slide and bounce, they no longer swallow cars.
-    // Split the velocity into the part pushing into the wall and the part
-    // running along it. Only the into-wall part is a crash; the along-wall
-    // part keeps the car moving, the nose bends toward the wall's tangent,
-    // and a small bounce-out nudge keeps the car from grinding in place.
-    const vx = Math.sin(car.heading) * before;
-    const vz = Math.cos(car.heading) * before;
-    const vn = vx * fixed.nx + vz * fixed.nz;
-    if (vn < 0) {
-      wallImpact = Math.abs(vn);
-      impact = wallImpact;
-      const tx = vx - vn * fixed.nx;
-      const tz = vz - vn * fixed.nz;
-      const tSpeed = Math.hypot(tx, tz);
-      if (tSpeed > 2) {
-        // A glancing hit: slide along the wall, keeping most of the speed.
-        const wallHeading = Math.atan2(tx, tz);
-        let diff = wallHeading - car.heading;
-        while (diff > Math.PI) diff -= Math.PI * 2;
-        while (diff < -Math.PI) diff += Math.PI * 2;
-        car.heading += diff * 0.7;
-        // Positive along the new heading: the nose now points where the
-        // car is sliding, so the speed stays forward, not reversed.
-        car.speed = tSpeed * 0.92;
-      } else {
-        // Nose-first into the wall: pivot along the wall in the steered
-        // direction and creep, so holding full throttle for a second or two
-        // walks the car out instead of leaving it wedged forever.
-        const steerDir = car.steer !== 0 ? Math.sign(car.steer) : 1;
-        const wallHeading = Math.atan2(-fixed.nz * steerDir, fixed.nx * steerDir);
-        let diff = wallHeading - car.heading;
-        while (diff > Math.PI) diff -= Math.PI * 2;
-        while (diff < -Math.PI) diff += Math.PI * 2;
-        car.heading += clamp(diff, -1.5 * dt, 1.5 * dt);
-        car.speed = Math.max(car.speed, 2.5);
-        car.drivenSpeed = Math.max(car.drivenSpeed, 2.5);
-      }
-      car.x += fixed.nx * 0.35;
-      car.z += fixed.nz * 0.35;
-    }
+  // Coba Z saja.
+  if (!blockedAt(city, obj.x, nz, margin) && !inWaterAt(city, obj.x, nz)) {
+    obj.z = nz;
+    return;
   }
-  let carBump = 0;
-  for (const o of others) {
-    if (o === car) continue;
-    if (o.kind === 'parked') {
-      // A parked car does not move: shove only the player car off it.
-      const dx = car.x - o.x;
-      const dz = car.z - o.z;
-      const d = Math.hypot(dx, dz);
-      const min = CAR_RADIUS * 2 - 0.2;
-      if (d < min && d > 0.0001) {
-        car.x = o.x + (dx / d) * min;
-        car.z = o.z + (dz / d) * min;
-        impact = Math.max(impact, Math.abs(before));
-        carBump = Math.max(carBump, Math.abs(before));
-        car.speed *= 0.5;
-      }
-      continue;
-    }
-    const bump = resolveCarPair(car, o);
-    if (bump > 6) {
-      impact = Math.max(impact, bump);
-      carBump = Math.max(carBump, bump);
-    }
-  }
-  // A ram must shove the car, not make it "fast": cap the speed at what the
-  // player was driving at, so a cop ramming a parked car cannot keep it from
-  // ever being busted (or fake a cop-ram by the player).
-  if (car.drivenSpeed !== undefined) car.speed = Math.min(car.speed, car.drivenSpeed);
-  car.x = clamp(car.x, WORLD.minX, WORLD.maxX);
-  car.z = clamp(car.z, WORLD.minZ, WORLD.maxZ);
-  car.x = Math.min(car.x, 186); // cars stay out of the ocean
-  return { crashed: impact > 0, impact, wallImpact, carBump };
+  // Kedua sumbu tertabrak: diam di tempat (kecepatan dipotong pemanggil).
+  obj._hitWall = true;
 }
 
-  // A traffic car drives along one road line and turns at intersections.
-export function createTrafficCar(rng, colors) {
-  const axis = rng.chance(0.5) ? 'x' : 'z';
-  const line = rng.pick(LINES);
-  const s = rng.range(-150, 150);
-  const dir = rng.chance(0.5) ? 1 : -1;
-  // About one in eight traffic cars is a yellow taxi — a little more life
-  // on the roads, and a cab reads instantly in the rear-view mirror.
-  const taxi = rng.chance(0.12);
+// ---------- mobil pemain ----------
+
+export function createCar(x, z, heading, model, color) {
+  const m = MODEL_SPEC[model] ? model : 'sedan';
+  const spec = MODEL_SPEC[m];
   return {
-    kind: 'traffic',
-    axis,
-    line,
-    s,
-    dir,
-    speed: rng.range(8, 12),
-    baseSpeed: rng.range(8, 12),
-    x: 0,
-    z: 0,
-    heading: 0,
-    color: taxi ? [0.95, 0.8, 0.2] : rng.pick(colors),
-    model: taxi ? 'Taxi' : rng.pick(CAR_MODELS),
-    nmT: 0, // near-miss cooldown: one payout per pass, not per frame
-  };
-}
-
-function trafficPose(car) {
-  if (car.axis === 'x') {
-    car.x = car.s;
-    car.z = car.line;
-    car.heading = car.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
-  } else {
-    car.x = car.line;
-    car.z = car.s;
-    car.heading = car.dir > 0 ? 0 : Math.PI;
-  }
-}
-
-export function stepTraffic(cars, dt, rng, playerCar = null, player = null) {
-  for (const car of cars) trafficPose(car);
-  for (const car of cars) {
-    // Slow down for the car ahead on the same lane.
-    let want = car.baseSpeed;
-    for (const other of cars) {
-      if (other === car || other.axis !== car.axis || other.line !== car.line || other.dir !== car.dir) continue;
-      const ahead = (other.s - car.s) * car.dir;
-      if (ahead > 0 && ahead < 8) want = Math.min(want, Math.max(0, other.speed - 1));
-      if (ahead > 0 && ahead < 4) want = 0;
-    }
-    // Traffic never stops for the player's car — that deadlocks the player
-    // behind a stopped car. Instead it speeds up to get out of the way.
-    if (playerCar) {
-      const onSameRoad = car.axis === 'x'
-        ? Math.abs(playerCar.z - car.line) < 4
-        : Math.abs(playerCar.x - car.line) < 4;
-      if (onSameRoad) {
-        const ahead = car.axis === 'x'
-          ? (playerCar.x - car.s) * car.dir
-          : (playerCar.z - car.s) * car.dir;
-        if (ahead > 0 && ahead < 12) want = Math.max(want, 16);
-      }
-    }
-    // Traffic DOES stop for a pedestrian on foot in the road. A car must
-    // not bulldoze a standing player along the street — that let a wanted
-    // player escape the police for free just by standing in traffic.
-    if (player) {
-      const onSameRoad = car.axis === 'x'
-        ? Math.abs(player.z - car.line) < 4
-        : Math.abs(player.x - car.line) < 4;
-      if (onSameRoad) {
-        const ahead = car.axis === 'x'
-          ? (player.x - car.s) * car.dir
-          : (player.z - car.s) * car.dir;
-        if (ahead > 0 && ahead < 12) want = 0;
-      }
-    }
-    let turned = false;
-    car.speed += clamp(want - car.speed, -14 * dt, 6 * dt);
-    car.s += car.dir * car.speed * dt;
-    // Turn at an intersection, sometimes.
-    for (const line of LINES) {
-      if (Math.abs(car.s - line) < 1.2 && rng.chance(dt * 0.35)) {
-        const oldLine = car.line;
-        car.axis = car.axis === 'x' ? 'z' : 'x';
-        car.line = line;
-        car.s = oldLine;
-        car.dir = rng.chance(0.5) ? 1 : -1;
-        turned = true;
-        break;
-      }
-    }
-    if (car.s > 168 || car.s < -168) car.dir *= -1;
-    trafficPose(car);
-    // Never drive through the player (in a car or on foot): shove this car
-    // along its road away from the player (forward if the player is behind
-    // it, back if the player is ahead of it) and give it speed to pull away.
-    const blocker = playerCar || player;
-    if (!turned && blocker) {
-      const d = Math.hypot(car.x - blocker.x, car.z - blocker.z);
-      const min = CAR_RADIUS * 2 - 0.2;
-      if (d < min) {
-        const tx = car.axis === 'x' ? car.dir : 0;
-        const tz = car.axis === 'x' ? 0 : car.dir;
-        const proj = (blocker.x - car.x) * tx + (blocker.z - car.z) * tz;
-        car.s += car.dir * (proj > 0 ? -(min - d + 1) : (min - d + 1));
-        car.speed = Math.max(car.speed, 14);
-        trafficPose(car);
-      }
-    }
-  }
-}
-
-// A police car chases the target point, steering and accelerating.
-// hp: pistol shots / punches it takes before it is down (3). mode:
-// 'chase' or 'roadblock' (drives ahead of the player and waits).
-export function createPoliceCar(x, z) {
-  return {
-    kind: 'police',
-    x,
-    z,
-    heading: 0,
+    x: x || 0,
+    z: z || 0,
+    heading: heading || 0,
     speed: 0,
-    steer: 0,
-    color: [0.92, 0.92, 0.95], // white livery, so a cop reads as a cop
-    flash: 0,
-    hp: 3,
-    down: false,
-    downT: 0,
-    mode: 'chase',
-    name: '',
-    tactic: 'PURSUIT',
-    dist: 0,
-    // Stuck detection: where it was at the last check, and the timer.
-    lastX: x,
-    lastZ: z,
-    checkT: 0,
-    unstickT: 0,
-    wayX: 0,
-    wayZ: 0,
-    stuckCount: 0,
+    model: m,
+    color: color || CAR_COLORS[Math.floor(Math.random() * CAR_COLORS.length)],
+    steer: 0,            // sudut kemudi saat ini (rad, visual + fisika)
+    driftTime: 0,        // durasi drift berjalan (detik)
+    drifting: false,
+    driftCount: 0,       // total drift berbayar yang terjadi
+    driftRewarded: false,// drift berjalan sudah dibayar atau belum
+    driftPayout: 0,      // $ yang menunggu diklaim game.js (50 per drift)
+    topSpeedBonus: 0,    // tambahan dari upgrade garage (diisi game.js)
+    upgrade: 0,          // level engine 0..3 (diisi game.js)
+    len: spec.len,
+    wid: spec.wid,
+    _hitWall: false,
   };
 }
 
-// Chase the target. Close in, the cop slows right down and steers hard
-// onto the target instead of orbiting it at speed; on foot the cop is
-// slower than a running player (9 vs 12), so running away really escapes,
-// while standing still gets you busted. A down cop does not move at all.
-export function stepPolice(car, tx, tz, dt, colliders, others, onFoot = false) {
-  car.flash += dt;
-  if (car.down) {
-    car.downT -= dt;
+// input: {up, down, left, right, handbrake} — semua boolean.
+// dt: detik. city: objek kota dari buildCity (boleh null saat tes).
+export function stepCar(car, input, dt, city) {
+  if (!car || !dt || dt <= 0) return car;
+  input = input || {};
+  const spec = MODEL_SPEC[car.model] || MODEL_SPEC.sedan;
+  // Top speed: base + garage upgrade. game.js sets BOTH car.upgrade and
+  // car.engineLevel (same level 0..3); honour either so upgrades work
+  // whichever field the caller filled.
+  const top = spec.topSpeed + (car.topSpeedBonus || 0) + Math.max(car.upgrade || 0, car.engineLevel || 0) * 3;
+  car._hitWall = false;
+
+  const forward = car.speed >= 0 ? 1 : -1;
+  const absSpeed = Math.abs(car.speed);
+
+  // --- akselerasi / rem / mundur ---
+  if (input.up) {
+    car.speed += spec.accel * dt * (car.speed < 0 ? 2.2 : 1);
+  } else if (input.down) {
+    if (car.speed > 0.5) car.speed -= spec.brake * dt;      // rem
+    else car.speed -= spec.accel * 0.55 * dt;                // mundur
+  } else {
+    // Gesekan gelinding + hambatan udara.
+    const drag = 2.2 + absSpeed * 0.045;
+    if (car.speed > 0) car.speed = Math.max(0, car.speed - drag * dt);
+    else if (car.speed < 0) car.speed = Math.min(0, car.speed + drag * dt);
+  }
+  car.speed = clamp(car.speed, -spec.reverse, top);
+
+  // --- kemudi progresif: makin cepat, makin kecil sudut belok ---
+  // Pada 0 u/s belok penuh, pada top speed hanya ~28% — mobil tetap
+  // terkendali di kecepatan tinggi dan tidak spin liar.
+  const steerAuthority = 1 / (1 + absSpeed * 0.055);
+  const maxSteer = 0.62 * steerAuthority + 0.10;
+  const steerTarget = (input.left ? 1 : 0) * maxSteer - (input.right ? 1 : 0) * maxSteer;
+  const steerRate = input.handbrake ? 6.5 : 5.0;
+  car.steer += clamp(steerTarget - car.steer, -steerRate * dt, steerRate * dt);
+
+  const handbrake = !!input.handbrake && absSpeed > 6;
+  const grip = handbrake ? spec.grip * 0.45 : spec.grip;
+
+  // Putaran heading sebanding kecepatan & kemudi, dibagi grip saat drift.
+  const turnRate = (car.steer * car.speed) / (spec.len * (handbrake ? 0.75 : 1));
+  car.heading = wrapAngle(car.heading + turnRate * dt);
+
+  // --- drift: handbrake + belok + kecepatan ---
+  const wantDrift = handbrake && Math.abs(car.steer) > 0.12 && absSpeed > 8;
+  if (wantDrift) {
+    car.drifting = true;
+    car.driftTime += dt;
+    // Saat drift, mobil sedikit meluncur menyamping: kurangi kecepatan
+    // lebih lambat dan tambah selip lateral kecil ke arah luar belokan.
+    car.speed -= car.speed * 0.12 * dt;
+    if (car.driftTime >= 0.5 && !car.driftRewarded) {
+      // Payout dicatat di sini; game.js yang mengklaimnya ke uang pemain
+      // (stepCar tidak memegang state S, jadi tidak menyentuh S.money).
+      car.driftRewarded = true;
+      car.driftCount += 1;
+      car.driftPayout += 50;
+    }
+  } else {
+    if (car.drifting && car.driftTime < 0.5) {
+      // Drift putus sebelum 0,5 detik: tidak dibayar.
+    }
+    car.drifting = false;
+    car.driftTime = 0;
+    car.driftRewarded = false;
+  }
+  void grip;
+
+  // --- gerak maju + wall slide ---
+  const nx = car.x + Math.sin(car.heading) * car.speed * dt;
+  const nz = car.z + Math.cos(car.heading) * car.speed * dt;
+  moveWithSlide(car, nx, nz, city, 1.6);
+  if (car._hitWall) {
+    // Menabrak dinding: potong kecepatan sebagian, jangan sampai nol total
+    // supaya wall-slide tetap terasa meluncur.
+    car.speed *= 0.55;
+  }
+  return car;
+}
+
+// ---------- speedboat ----------
+
+export function createBoat(x, z, heading) {
+  return {
+    x: x || 0,
+    z: z || 0,
+    heading: heading || 0,
+    speed: 0,
+    model: 'boat',
+    color: '#f2f2f2',
+    steer: 0,
+    bobPhase: Math.random() * Math.PI * 2,
+    bobY: 0,          // tinggi ombak saat ini (dipakai renderer)
+    wake: 0,          // intensitas jejak air
+    len: 6.0,
+    wid: 2.4,
+    _hitWall: false,
+  };
+}
+
+// Fisika boat: akselerasi lebih lambat, belok lebih lebar dari mobil,
+// ada goyangan ombak (bobY) dan hambatan air yang kuat saat gas dilepas.
+export function stepBoat(boat, input, dt, city) {
+  if (!boat || !dt || dt <= 0) return boat;
+  input = input || {};
+  const spec = MODEL_SPEC.boat;
+  boat._hitWall = false;
+
+  if (input.up) boat.speed += spec.accel * dt;
+  else if (input.down) boat.speed -= spec.accel * 0.5 * dt;
+  else {
+    // Hambatan air: boat melambat jelas tanpa gas.
+    const drag = 3.0 + Math.abs(boat.speed) * 0.08;
+    if (boat.speed > 0) boat.speed = Math.max(0, boat.speed - drag * dt);
+    else if (boat.speed < 0) boat.speed = Math.min(0, boat.speed + drag * dt);
+  }
+  boat.speed = clamp(boat.speed, -spec.reverse, spec.topSpeed);
+
+  // Belok lebar: otoritas kemudi lebih kecil dan respons lebih lambat.
+  const absSpeed = Math.abs(boat.speed);
+  const maxSteer = 0.42 / (1 + absSpeed * 0.03);
+  const steerTarget = (input.left ? 1 : 0) * maxSteer - (input.right ? 1 : 0) * maxSteer;
+  boat.steer += clamp(steerTarget - boat.steer, -2.2 * dt, 2.2 * dt);
+  boat.heading = wrapAngle(boat.heading + (boat.steer * boat.speed * dt) / 7.5);
+
+  // Ombak: naik-turun sinusoidal, amplitudo membesar saat laju.
+  boat.bobPhase += dt * (1.6 + absSpeed * 0.06);
+  boat.bobY = Math.sin(boat.bobPhase) * (0.12 + absSpeed * 0.012);
+  boat.wake = clamp(absSpeed / spec.topSpeed, 0, 1);
+
+  const nx = boat.x + Math.sin(boat.heading) * boat.speed * dt;
+  const nz = boat.z + Math.cos(boat.heading) * boat.speed * dt;
+
+  // Boat hanya boleh di air; darat / dermaga = dinding (slide di tepi).
+  if (!inWaterAt(city, nx, nz) && city && (city.water || []).length) {
+    // Coba slide sepanjang tepi air.
+    if (inWaterAt(city, nx, boat.z)) boat.x = nx;
+    else if (inWaterAt(city, boat.x, nz)) boat.z = nz;
+    else { boat._hitWall = true; boat.speed *= 0.5; }
+  } else {
+    boat.x = nx; boat.z = nz;
+  }
+  // Jaga tetap di dalam bounds kota.
+  if (city && city.bounds) {
+    boat.x = clamp(boat.x, city.bounds.minX + 2, city.bounds.maxX - 2);
+    boat.z = clamp(boat.z, city.bounds.minZ + 2, city.bounds.maxZ - 2);
+  }
+  return boat;
+}
+
+// ---------- traffic AI ----------
+
+function randomRoadPoint(city, rng) {
+  const roads = (city && city.roads) || [];
+  if (!roads.length) return { x: 0, z: 0 };
+  const r = roads[Math.floor((rng ? rng.next() : Math.random()) * roads.length)];
+  const t = rng ? rng.next() : Math.random();
+  return { x: lerp(r.x1, r.x2, t), z: lerp(r.z1, r.z2, t) };
+}
+
+function roadHeading(road) {
+  return Math.atan2(road.x2 - road.x1, road.z2 - road.z1);
+}
+
+// Satu mobil traffic: mengikuti satu ruas jalan dari ujung ke ujung,
+// lalu memilih ruas lanjutan yang tersambung di persimpangan.
+function makeTrafficCar(city, rng) {
+  const roads = (city && city.roads) || [];
+  const pickModel = () => {
+    const roll = rng ? rng.next() : Math.random();
+    if (roll < 0.55) return 'sedan';
+    if (roll < 0.75) return 'taxi';
+    if (roll < 0.92) return 'sport';
+    return 'truck';
+  };
+  let car;
+  if (roads.length) {
+    const road = roads[Math.floor((rng ? rng.next() : Math.random()) * roads.length)];
+    const t = rng ? rng.next() : Math.random();
+    const x = lerp(road.x1, road.x2, t);
+    const z = lerp(road.z1, road.z2, t);
+    const dir = (rng ? rng.next() : Math.random()) < 0.5 ? 1 : -1;
+    // Heading awal HARUS searah dir, kalau tidak mobil berputar dulu dan
+    // langsung keluar dari garis jalan.
+    car = createCar(x, z, roadHeading(road) + (dir === -1 ? Math.PI : 0), pickModel());
+    car.road = road;
+    car.roadT = t;
+    car.dir = dir;
+  } else {
+    car = createCar((rng ? rng.range(-60, 60) : 0), (rng ? rng.range(-60, 60) : 0), 0, pickModel());
+    car.road = null;
+    car.dir = 1;
+  }
+  car.cruise = 9 + (rng ? rng.next() : Math.random()) * 7; // 9..16 u/s
+  car.wait = 0;          // jeda berhenti di persimpangan
+  car.stuck = 0;
+  car.isTraffic = true;
+  return car;
+}
+
+export function createTraffic(city, rng) {
+  const count = 14;
+  const cars = [];
+  for (let i = 0; i < count; i++) cars.push(makeTrafficCar(city, rng));
+  return { cars: cars };
+}
+
+// Cari ruas jalan yang tersambung di ujung ruas saat ini (persimpangan).
+function nextRoad(city, road, endX, endZ) {
+  const roads = (city && city.roads) || [];
+  const near = [];
+  for (let i = 0; i < roads.length; i++) {
+    const r = roads[i];
+    if (r === road) continue;
+    const d1 = Math.hypot(r.x1 - endX, r.z1 - endZ);
+    const d2 = Math.hypot(r.x2 - endX, r.z2 - endZ);
+    if (Math.min(d1, d2) < 6) near.push(r);
+  }
+  if (!near.length) return null;
+  return near[Math.floor(Math.random() * near.length)];
+}
+
+function stepTrafficCar(car, city, S, dt) {
+  const roads = (city && city.roads) || [];
+  if (!car.road || !roads.length) {
+    // Tanpa jalan: jalan pelan mengitari pusat kota.
+    car.heading = wrapAngle(car.heading + 0.25 * dt);
+    car.speed = 8;
+    const nx = car.x + Math.sin(car.heading) * car.speed * dt;
+    const nz = car.z + Math.cos(car.heading) * car.speed * dt;
+    moveWithSlide(car, nx, nz, city, 1.6);
+    return;
+  }
+
+  if (car.wait > 0) {
+    car.wait -= dt;
     car.speed = 0;
     return;
   }
-  // --- Stuck detection: every 1.2 s, check how far the cop actually got.
-  // A cop that is trying to move (speed > 4) but barely moved while still
-  // far from the target is wedged — on a building corner, a parked car, or
-  // a traffic jam. Send it to the nearest road intersection for 2 seconds:
-  // a fresh, open starting point beats pushing at the same wall forever.
-  // The side alternates each time, so a cop wedged on both sides of a
-  // block does not ping-pong between the same two corners. ---
-  car.checkT += dt;
-  if (car.checkT >= 1.2) {
-    car.checkT = 0;
-    const moved = Math.hypot(car.x - car.lastX, car.z - car.lastZ);
-    const dist = Math.hypot(tx - car.x, tz - car.z);
-    if (car.speed > 4 && moved < 2 && dist > 12 && car.unstickT <= 0) {
-      car.stuckCount += 1;
-      car.unstickT = 2;
-      let bx = LINES[0];
-      let bz = LINES[0];
-      for (const line of LINES) {
-        if (Math.abs(line - car.x) < Math.abs(bx - car.x)) bx = line;
-        if (Math.abs(line - car.z) < Math.abs(bz - car.z)) bz = line;
-      }
-      // The intersection itself, nudged to the side that is open: alternate
-      // left/right of the cop's heading so repeated wedges try both ways.
-      const side = car.stuckCount % 2 === 0 ? 1 : -1;
-      const px = -Math.cos(car.heading) * side;
-      const pz = Math.sin(car.heading) * side;
-      car.wayX = bx + px * 10;
-      car.wayZ = bz + pz * 10;
+
+  // Berhenti sejenak bila ada mobil pemain / traffic lain di depan.
+  const aheadX = car.x + Math.sin(car.heading) * 9;
+  const aheadZ = car.z + Math.cos(car.heading) * 9;
+  let blocked = false;
+  if (S) {
+    const others = [];
+    if (S.car) others.push(S.car);
+    if (S.player) others.push(S.player);
+    const cops = S.cops || S.police || [];
+    for (let i = 0; i < cops.length; i++) others.push(cops[i]);
+    for (let i = 0; i < others.length; i++) {
+      const o = others[i];
+      if (!o || o === car) continue;
+      if (Math.hypot((o.x || 0) - aheadX, (o.z || 0) - aheadZ) < 4.5) { blocked = true; break; }
     }
-    car.lastX = car.x;
-    car.lastZ = car.z;
   }
-  const dist = Math.hypot(tx - car.x, tz - car.z);
-  // If the cop is stuck behind something while still far from the target —
-  // e.g. a traffic car stopped in the road between it and the player, which
-  // pins the cop's speed near zero — aim 10 units to the side of the target
-  // instead, so it drives around the blockage rather than pushing at it
-  // forever. (At spawn the speed is also low, so only sidestep once close.)
-  let aimX = tx;
-  let aimZ = tz;
-  if (car.unstickT > 0) {
-    // Recovery run: aim at the intersection waypoint, at full speed.
-    aimX = car.wayX;
-    aimZ = car.wayZ;
-    car.unstickT -= dt;
-  } else if (car.speed < 3 && dist > 6 && dist < 25) {
-    const dx = tx - car.x;
-    const dz = tz - car.z;
-    const d = Math.hypot(dx, dz) || 1;
-    aimX = tx + (-dz / d) * 10;
-    aimZ = tz + (dx / d) * 10;
+  if (blocked) { car.speed = Math.max(0, car.speed - 20 * dt); }
+  else car.speed = lerp(car.speed, car.cruise, clamp(dt * 1.5, 0, 1));
+
+  // Pure pursuit: bidik titik 8 unit di depan pada ruas jalan. Ini yang
+  // menjaga mobil tetap di garis tengah jalan — bila terdorong keluar
+  // (mis. habis berputar di ujung ruas), kemudi otomatis mengarahkannya
+  // kembali ke jalan, bukan sekadar mengikuti heading ruas.
+  const road = car.road;
+  const dx = road.x2 - road.x1, dz = road.z2 - road.z1;
+  const segLen = Math.hypot(dx, dz) || 1;
+  let tt = ((car.x - road.x1) * dx + (car.z - road.z1) * dz) / (segLen * segLen);
+  tt = clamp(tt, 0, 1);
+  const along = tt * segLen;
+  const look = car.dir === 1 ? Math.min(segLen, along + 8) : Math.max(0, along - 8);
+  const tx = road.x1 + dx * (look / segLen);
+  const tz = road.z1 + dz * (look / segLen);
+  const targetHeading = Math.atan2(tx - car.x, tz - car.z);
+  let dh = wrapAngle(targetHeading - car.heading);
+  car.heading = wrapAngle(car.heading + clamp(dh, -2.2 * dt, 2.2 * dt));
+
+  const nx = car.x + Math.sin(car.heading) * car.speed * dt;
+  const nz = car.z + Math.cos(car.heading) * car.speed * dt;
+  moveWithSlide(car, nx, nz, city, 1.6);
+  if (car._hitWall) car.speed *= 0.4;
+
+  // Sampai ujung ruas? Pilih ruas lanjutan atau putar balik.
+  const endX = car.dir === 1 ? road.x2 : road.x1;
+  const endZ = car.dir === 1 ? road.z2 : road.z1;
+  if (Math.hypot(car.x - endX, car.z - endZ) < 4) {
+    const nxt = nextRoad(city, road, endX, endZ);
+    if (nxt) {
+      // Berhenti sejenak di persimpangan (20% peluang, 0,8–2 detik).
+      if (Math.random() < 0.2) car.wait = 0.8 + Math.random() * 1.2;
+      car.road = nxt;
+      // Masuk dari ujung ruas baru yang terdekat dengan posisi sekarang.
+      const d1 = Math.hypot(nxt.x1 - car.x, nxt.z1 - car.z);
+      const d2 = Math.hypot(nxt.x2 - car.x, nxt.z2 - car.z);
+      car.dir = d1 <= d2 ? 1 : -1;
+    } else {
+      car.dir = -car.dir; // jalan buntu: putar balik
+      car.wait = 0.5;
+    }
   }
-  const desired = Math.atan2(aimX - car.x, aimZ - car.z);
-  car.heading = turnToward(car.heading, desired, (dist < 15 ? 6 : 2.6) * dt);
-  let want;
-  // The cop brakes earlier the closer it gets, so it arrives on the
-  // target instead of overshooting into an orbit — and it keeps creeping
-  // at 2 u/s once it is on the target, so it never just parks at range.
-  if (onFoot) want = dist > 15 ? 9 : dist > 6 ? 7 : 2;
-  else want = dist > 30 ? 30 : dist > 15 ? 20 : dist > 6 ? 10 : 2;
-  car.speed += clamp(want - car.speed, -20 * dt, 12 * dt);
-  car.x += Math.sin(car.heading) * car.speed * dt;
-  car.z += Math.cos(car.heading) * car.speed * dt;
-  const fixed = collideCircle(car.x, car.z, CAR_RADIUS, colliders);
-  car.x = fixed.x;
-  car.z = fixed.z;
-  if (fixed.hit && (fixed.nx !== 0 || fixed.nz !== 0)) {
-    // Wall-following: a cop that just drives into a building stalls there
-    // forever (every step halves its speed). Instead, drive along the wall
-    // on the side that leads toward the target, keeping speed up — once
-    // past the corner, normal steering takes over again.
-    const dx = tx - car.x;
-    const dz = tz - car.z;
-    const t1x = -fixed.nz;
-    const t1z = fixed.nx;
-    const t2x = fixed.nz;
-    const t2z = -fixed.nx;
-    const useFirst = t1x * dx + t1z * dz >= t2x * dx + t2z * dz;
-    car.heading = Math.atan2(useFirst ? t1x : t2x, useFirst ? t1z : t2z);
-    car.speed = Math.max(car.speed, 12);
-  } else if (fixed.hit) {
-    car.speed *= 0.5;
-  }
-  for (const o of others) {
-    if (o === car || o.kind === 'parked') continue; // never shove a parked car
-    resolveCarPair(car, o);
-  }
-  car.x = clamp(car.x, WORLD.minX, WORLD.maxX);
-  car.z = clamp(car.z, WORLD.minZ, WORLD.maxZ);
-  car.x = Math.min(car.x, 186); // police cars stay out of the ocean
 }
 
-// A police helicopter: orbits the player from above once the heat is high
-// enough, its spotlight pinning the player so the heat drains slower.
-export function createHeli(x, z) {
-  return {
-    kind: 'heli',
-    x,
-    z,
-    y: 34,
-    heading: 0,
-    angle: 0,
-    rotor: 0,
-    dist: 0,
-  };
-}
-
-// Circle the target at a fixed radius and height, facing along the orbit.
-export function stepHeli(heli, tx, tz, dt) {
-  heli.angle += dt * 0.35;
-  const radius = 34;
-  const wantX = tx + Math.sin(heli.angle) * radius;
-  const wantZ = tz + Math.cos(heli.angle) * radius;
-  heli.x += (wantX - heli.x) * Math.min(1, 1.2 * dt);
-  heli.z += (wantZ - heli.z) * Math.min(1, 1.2 * dt);
-  heli.y += (34 - heli.y) * Math.min(1, dt);
-  heli.heading = heli.angle + Math.PI / 2;
-  heli.rotor += dt * 28;
-  heli.dist = Math.hypot(heli.x - tx, heli.z - tz);
+export function stepTraffic(T, S, dt) {
+  if (!T || !T.cars || !dt || dt <= 0) return;
+  const city = (S && S.city) || null;
+  for (let i = 0; i < T.cars.length; i++) {
+    stepTrafficCar(T.cars[i], city, S, dt);
+  }
 }

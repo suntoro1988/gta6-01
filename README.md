@@ -1,39 +1,110 @@
-# gta6-01
+# Sunset Bay — Open-World Crime Game
 
-[![make.fun · gta6-01](https://make.fun/badge/gta6-01.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
-[![rank](https://make.fun/badge/gta6-01/suntoro1988/gta6-01/rank.svg)](https://make.fun/bounty/gta6-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
-[![reward](https://make.fun/badge/gta6-01/suntoro1988/gta6-01/reward.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
+**Sunset Bay** is a fictional sunny coastal city you can explore on foot or
+behind the wheel, right in your browser — no install, no network, no account
+needed. Steal cars, outrun the police, run jobs across 10 districts, chase
+the sunset, and work your way from ROOKIE to KINGPIN.
 
-Sunset Bay — an open-world crime game: drive and run through a low-poly sun-soaked coastal city at sunset, steal cars, run jobs for cash, and outrun the police as your wanted stars rise.
+## How to play
 
-## Run it
+Open `game/index.html` in a desktop browser (or run the local server below)
+and hit **START ENGINE**.
+
+### Controls
+
+| Key | Action |
+| --- | --- |
+| WASD / arrows | Walk / drive |
+| Shift | Sprint on foot |
+| Space | Handbrake (drift in a car) |
+| E | Steal a nearby car or speedboat |
+| F | Punch (on foot) |
+| Mouse click | Shoot (when armed) |
+| 1–4 | Switch weapon: fists, pistol, SMG, shotgun |
+| M | Change radio station |
+| N | Mute / unmute sound |
+| Tab | Full-screen city map |
+| P / Esc | Pause |
+| Enter | Start from the title screen |
+
+### The city
+
+Sunset Bay has **10 districts** — Downtown, Old Town, Southside, Hillcrest,
+Beachfront, The Pier, Sunset Mall, Marina Bay, Northside and Uptown — each
+with its own look. Drive the boardwalk at Beachfront, watch the sun drop
+from the Hillcrest lookout, or take a speedboat out from Marina Bay.
+
+### Missions — 18 chained jobs
+
+Work through 18 missions, from **First Wheels** ($100) to the finale
+**Sunset Heist** ($1,500): package runs, street races, getaways, a bank job,
+a midnight courier run, and a boat escape at sunset. Finish fast and you
+earn a **+50% fast bonus**. Between jobs, pick up taxi fares ($40–$120),
+find 6 hidden stash packs (+$100 each), and drift for cash (+$50 per drift).
+
+### Wanted level
+
+Causing trouble raises your heat. At 5 stars the police helicopter AIR-1
+joins the chase. You are only busted if a cop gets within 5 units while you
+are moving slower than a walk for 4.5 seconds — so keep running. Lose the
+heat with a respray at the Sunset Garage.
+
+### Money, REP and upgrades
+
+Earn cash from missions, taxis, stashes and drifts. Spend it at the
+**Sunset Garage** (engine upgrades, respray), the **Shop** (ammo and armor),
+and rest up at the **Safehouse**. Your REP climbs from ROOKIE to HUSTLER to
+KINGPIN as you complete jobs.
+
+### Radio — 5 stations
+
+BAY FM, SUNSET DRIVE, NEON NIGHTS, PALM COURT and TIDE FM. All music is
+synthesized live in your browser with WebAudio — no audio files, no
+streaming.
+
+### Saving
+
+Progress saves automatically to your browser (localStorage) — money,
+missions, stash, upgrades, REP, position and time of day. Use **CONTINUE**
+on the title screen to pick up where you left off.
+
+### Day–night cycle
+
+The game clock starts at 18:00, dusk. Light shifts from golden sunset to
+purple night as street lamps and neon switch on.
+
+## Run locally
 
 ```sh
-node serve.ts
+# Node 22, no dependencies
+node serve.ts            # http://localhost:8080/
+node serve.ts 9000       # or any port you like
 ```
 
-Then open http://localhost:8080 in a desktop browser. No build step and no network — the game is plain static files (a raw-WebGL renderer written for this game, no library), played with keyboard and mouse: WASD to move and drive, mouse drag to orbit the camera, E to enter or exit a car, Shift to run, Space for the handbrake, R to restart, P to pause, M to cycle the radio, N to mute, Tab for the city map. Progress (best cash, jobs done, cars stolen, garage upgrades, ammo, armour, stash packs found) saves in your browser — Continue on the title screen resumes your last run.
+URL tricks for testing and screenshots:
 
-## What's new in v4
+- `?seed=7` — deterministic world (same traffic, peds and layout)
+- `?shot=play&seed=7` — jump straight into a staged scene
+  (scenes: `start`, `play`, `foot`, `end`)
 
-- **3 new missions (15 total)** — Pier Pressure (pier drop, mall delivery), Beach Run (beach checkpoint, stash, safehouse) and Midnight Courier (mall pickup, far drop, shake the heat, vanish). All multi-stage, all with crew briefings.
-- **Steering is progressive now** — the wheel turns less the faster you go, so holding a turn at medium speed arcs down the road instead of spinning you into a wall.
-- **Walls slide and bounce** — a glancing hit slides the car along the wall and keeps most of its speed; a nose-first hit pivots the car along the wall, so holding full throttle for a second or two walks you out instead of leaving you wedged.
-- **Crosshair** — a crisp centre crosshair appears whenever a gun is in hand on foot, so you can see where a click will land.
-- **Drifts pay with a stock car** — the drift bar is 0.5 s (was 0.8 s) and the handbrake drags less, so a standard ride can hold a slide long enough to cash in.
-- **Fair escapes on foot** — sprint is 12 u/s (was 10) against a cop's 9, and a cop must sit closer (5 units) and longer (4.5 s) to bust you, so running away actually works.
+## Build / package
 
-## What's in the Bay
+```sh
+MAKEFUN_OUTPUT_DIR=/output node main.ts
+```
 
-- **15 named missions in stages** — First Wheels, Package Run, Cool Down, Street Race, Stash Grab, Getaway, The Big Heist, Bay King, Dockside Deal, Neon Nights, Payback Run, Sunset Showdown, Pier Pressure, Beach Run and Midnight Courier — with a mission card (timer, stage bar, next objective) and briefings from the crew: MARA the dispatcher, RICO the mechanic and DEX the wheelman.
-- **Stash packs** — 6 hidden golden briefcases around town ($100 each, plus Respect): three on random roads, three at learnable spots — the pier end, Bay Park and the far beach. A STASH counter sits in the HUD pill and on the full-screen map; a found pack never respawns in that run.
-- **Radio** — four synth stations (BAY FM, SUNSET DRIVE, NEON NIGHTS, PALM COURT) with named tracks, all generated live with WebAudio. M or the widget button changes station.
-- **Combat on foot** — F to punch, click to fire, with a crosshair when a gun is in hand. Four weapon slots (fists, pistol, shotgun, SMG); guns unlock by picking up ammo, and ammo + armour are sold at the shop. Cops can be knocked down — but it adds heat.
-- **Police response** — a live panel names every responding unit with its distance, tactic (PURSUIT / RAMMING / ROADBLOCK / BOXING IN) and IN SIGHT / SEARCHING status. At 4 stars a unit runs a roadblock ahead of you; at 3 stars the AIR-1 helicopter circles overhead, its spotlight slowing how fast your heat fades. The stuck-cop fix: a unit that makes no progress for 1.2 s reroutes to the nearest intersection instead of pushing at the same wall.
-- **Garage, shop, safehouse** — spend cash at Sunset Garage on engine / armour / handling upgrades (or a $200 respray that wipes your wanted level), buy ammo and armour at the shop, and heal + cool off + save at the safehouse. The respray only jumps the queue at 2+ stars — at 1 star, G buys the upgrade you came for.
-- **The city** — 8 named districts (Old Town, Downtown, Marina, West End, The Strip, Southside, Midtown, Harbor South), each with its own building palette and heights; neon facade trim, rooftop AC units and water towers, a few landmark towers above the district height range, wave bands on the ocean and beach umbrellas on the sand, plus warmer dusk lighting. Tab opens the full-screen map: districts, POI legend, mission list (DONE / ACTIVE / LOCKED) and run stats.
-- **Rep & scores** — a Respect level (ROOKIE to BAY KING), health + armour bars, a TRACE heat bar under the wanted stars, and drift / near-miss score popups that pay cash (+$50 near miss, DRIFT ×multiplier).
+This copies `game/` and `screenshots/` into the output directory and
+writes `dossier.json` there.
 
----
+## Tech
 
-<sub>Entered on [make.fun](https://make.fun/?ref=sygna1z3&utm_source=github&utm_medium=readme&utm_campaign=gta6-01) · AI agents build software for cash rewards</sub>
+- Raw WebGL + DOM + WebAudio. No external libraries, no network requests.
+- Pure ES modules, no build step.
+- Procedural city, cars, pedestrians and music — everything is generated
+  in code from a seed.
+
+## Credits
+
+Sunset Bay is a fictional city and an original game made for the make.fun
+bounty. No real brands, places or people are depicted. Built with plain
+JavaScript, WebGL and WebAudio.

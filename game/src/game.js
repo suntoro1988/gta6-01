@@ -1,1197 +1,1266 @@
-// Sunset Bay — the game simulation: missions, money, wanted level,
-// on-foot combat, the police helicopter, garage / shop / safehouse,
-// pedestrians, pickups and the six hidden stash packs.
+// game.js — otak game Sunset Bay v5 (bounty make.fun).
+// Ditulis SEPENUHNYA BARU dari design-spec round4 di dalam sesi recording v5.
+// Tidak ada kode yang disalin dari round sebelumnya, dari file lain, atau dari laporan lama.
 //
-// This file only advances the world. Drawing lives in main.js, the HUD in
-// hud.js, driving in vehicles.js and the player on foot in player.js.
-// Everything random comes from the seeded rng, so a seed replays the same
-// city, the same stash spots and the same mission order every time.
-import { LINES, WORLD, PLACES, districtAt, generateCity, buildingColliders } from './city.js';
+// KONTRAK INPUT (dibuat main.js tiap frame, dipakai stepGame/stepPlayer/stepCar/stepBoat):
+//   { up, down, left, right,      // WASD / panah, boolean
+//     sprint,                     // Shift
+//     handbrake,                  // Spasi
+//     interact,                   // E ditekan frame ini (edge)
+//     punch,                      // F ditekan frame ini (edge)
+//     shoot,                      // tombol mouse kiri ditahan
+//     shootPressed,               // klik mouse frame ini (edge)
+//     slot,                       // 1..4 bila tombol senjata ditekan frame ini, else 0
+//     camYaw }                    // radian — arah kamera (gerak jalan kaki relatif ke kamera)
+//
+// KONTRAK KELUARAN ke main.js / hud.js (dibaca langsung dari state S, tanpa impor balik):
+//   S.events   — array nama efek suara ('shoot','punch','pickup','cash','siren','splash','click');
+//                main.js menguras (drain) array ini tiap frame lalu memanggil audio.sfx.
+//   S.message / S.popup — teks + timer (S.messageT / S.popupT, detik); hud.js menampilkannya.
+//   S.mission  — { index, stage, stageDef, target:{x,z,label}, checkpoints, cpIndex, elapsed, stageT, def }
+//   S.heli     — { active, x, z, dist } — HUD menampilkan jarak heli bila active.
+//   S.car.engineLevel (0..3) — stepCar harus memakai ini untuk menaikkan top speed.
+//   S.cops    — [{ x, z, heading, speed, hp, kind:'foot'|'car', car }] — car = objek mobil polisi.
+//   S.parkedCars / S.water.boats — kendaraan yang bisa dicuri / dinaiki (render + E untuk ambil).
 import { createRng } from './rng.js';
-import {
-  CAR_RADIUS,
-  CAR_MODELS,
-  createHeli,
-  createPoliceCar,
-  createTrafficCar,
-  resolveCarPair,
-  stepHeli,
-  stepPlayerCar,
-  stepPolice,
-  stepTraffic,
-} from './vehicles.js';
+import { dist2d, clamp, wrapAngle } from './math3.js';
+import { buildCity, districtAt, isWater } from './city.js';
+import { createTraffic, stepTraffic, createCar, stepCar, stepBoat } from './vehicles.js';
 import { createPlayer, stepPlayer } from './player.js';
-import { clamp, dist2 } from './math3.js';
-// v4: paint & clothing palettes live in meshes.js (Builder 1) — merging
-// them here activates the extra variety for every spawned car and
-// pedestrian, since all spawn code below picks from these lists.
-import { CAR_PAINTS, PED_SHIRTS, PED_SKINS } from './meshes.js';
+import { createTaxi, stepTaxi } from './jobs.js';
+import { createWater, stepWater } from './water.js';
 
-// Traffic paint jobs, picked at random for every car that spawns: the v3
-// set plus the v4 set from meshes.js, 24 colours in all.
-export const CAR_COLORS = [
-  [0.85, 0.2, 0.2], [0.2, 0.4, 0.85], [0.95, 0.8, 0.2], [0.9, 0.9, 0.88],
-  [0.2, 0.7, 0.7], [0.55, 0.35, 0.8], [0.95, 0.5, 0.15], [0.3, 0.65, 0.3],
-  [0.95, 0.3, 0.6], [0.2, 0.85, 0.45], [1.0, 0.6, 0.1], [0.4, 0.85, 0.95],
-  ...CAR_PAINTS,
-];
-// The player's ride is always this red, so it reads instantly in traffic.
-export const PLAYER_CAR_COLOR = [0.95, 0.25, 0.15];
+export const SAVE_KEY = 'sunset-bay-save-v1';
 
-// Pedestrian shirts and skins, shuffled per spawn: the v3 set plus the
-// v4 set from meshes.js (22 shirts, 9 skins — the v3 skins are inside the
-// v4 set, so they appear once).
-const SHIRTS = [
-  [0.9, 0.3, 0.3], [0.3, 0.5, 0.9], [0.95, 0.85, 0.3], [0.4, 0.8, 0.4],
-  [0.9, 0.6, 0.9], [0.95, 0.95, 0.95], [0.3, 0.7, 0.75], [1.0, 0.45, 0.1],
-  [0.55, 0.3, 0.9], [0.2, 0.9, 0.6],
-  ...PED_SHIRTS,
-];
-const SKINS = [...PED_SKINS];
-
-// The crew who hand out the jobs. MARA dispatches, RICO runs the garage,
-// DEX sets up the races — their lines brief every mission on the dialog card.
-export const CREW = [
-  { name: 'MARA', role: 'Dispatcher', color: '#ff5e7a', initial: 'M' },
-  { name: 'RICO', role: 'Mechanic', color: '#ff9a3c', initial: 'R' },
-  { name: 'DEX', role: 'Wheelman', color: '#2dd4bf', initial: 'D' },
-];
-
-// The four weapon slots (keys 1-4, Q cycles). Fists are always available;
-// a gun only unlocks once its ammo has been picked up or bought.
+// ---------------------------------------------------------------------------
+// Senjata (slot 0 = tinju, 1..3 = pistol / SMG / shotgun)
+// ---------------------------------------------------------------------------
 export const WEAPONS = [
-  { name: 'FISTS', key: null, range: 2.4, rate: 0.45, dmg: 1, pellets: 1, spread: 0, auto: false },
-  { name: 'PISTOL', key: 'pistol', range: 45, rate: 0.35, dmg: 1, pellets: 1, spread: 0, auto: false },
-  { name: 'SHOTGUN', key: 'shotgun', range: 18, rate: 0.85, dmg: 1, pellets: 3, spread: 0.12, auto: false },
-  { name: 'SMG', key: 'smg', range: 30, rate: 0.13, dmg: 1, pellets: 1, spread: 0.03, auto: true },
-];
-const AMMO_PRICE = {
-  pistol: { price: 50, amount: 12 },
-  shotgun: { price: 60, amount: 6 },
-  smg: { price: 80, amount: 24 },
-};
-
-// Garage upgrades, levels 0-3 each. Bought with G at the garage.
-export const UPGRADE_DEFS = [
-  { key: 'speed', name: 'Engine', base: 300 },
-  { key: 'armor', name: 'Armor', base: 250 },
-  { key: 'handling', name: 'Handling', base: 200 },
+  { name: 'Fists', range: 0, rate: 0.4, damage: 1, cone: 0, ammoKey: null },
+  { name: 'Pistol', range: 42, rate: 0.28, damage: 1, cone: 0.12, ammoKey: 'pistol' },
+  { name: 'SMG', range: 36, rate: 0.09, damage: 1, cone: 0.22, ammoKey: 'smg' },
+  { name: 'Shotgun', range: 20, rate: 0.75, damage: 2, cone: 0.45, ammoKey: 'shotgun' },
 ];
 
-// Missions: 15 named jobs, each in 1-4 stages. A stage is one objective:
-// steal (get in any car), goto (reach a beacon), safehouse (reach the
-// safehouse), collect (grab a stash drop), hide (get the heat under 50).
-// Missions 13-15 are the v4 additions, built from the same stage kinds so
-// every job stays completable with the existing mechanics.
-const MISSIONS = [
+export const ENGINE_COSTS = [300, 600, 1000]; // Lv1..Lv3
+
+// ---------------------------------------------------------------------------
+// 18 misi berantai. Stage: goto / collect / deliver / race / escape / boat /
+// steal / stealSport. `place` diselesaikan ke koordinat saat misi jalan
+// (placePos), jadi tidak ada koordinat kota yang di-hardcode di sini.
+// fastTime = detik; selesai di bawah itu = bonus +50%.
+// ---------------------------------------------------------------------------
+export const MISSIONS = [
   {
-    name: 'First Wheels', reward: 100, time: 75, from: 'MARA',
-    brief: 'First job, rookie. Steal a car — any car — and you are in.',
-    stages: [{ kind: 'steal', text: 'Steal a car' }],
-  },
-  {
-    name: 'Package Run', reward: 250, time: 150, from: 'MARA',
-    brief: 'A package is waiting uptown. Pick it up, drop it off, no questions.',
+    name: 'First Wheels', reward: 100, fastTime: 90,
+    desc: 'Steal your first car and drive it to Sunset Mall.',
     stages: [
-      { kind: 'goto', text: 'Pick up the package' },
-      { kind: 'goto', text: 'Deliver it to the drop' },
+      { type: 'steal', desc: 'Steal a car — press E near one' },
+      { type: 'goto', place: 'mall', desc: 'Drive to Sunset Mall' },
     ],
   },
   {
-    name: 'Cool Down', reward: 400, time: 120, from: 'MARA',
-    brief: 'Heat is on you. Lose the cops and lay low at the safehouse.',
-    stages: [{ kind: 'safehouse', text: 'Lose the heat, reach the safehouse' }],
-  },
-  {
-    name: 'Street Race', reward: 500, time: 150, from: 'RICO',
-    brief: 'Dex set up a street race. Three checkpoints — beat the clock, not the cars.',
+    name: 'Package Run', reward: 250, fastTime: 150,
+    desc: 'Pick up a package Downtown, deliver it to Sunset Mall.',
     stages: [
-      { kind: 'goto', checkpoint: true, text: 'Reach checkpoint 1/3' },
-      { kind: 'goto', checkpoint: true, text: 'Reach checkpoint 2/3' },
-      { kind: 'goto', checkpoint: true, text: 'Reach checkpoint 3/3' },
+      { type: 'collect', place: 'downtown', desc: 'Pick up the package in Downtown' },
+      { type: 'deliver', place: 'mall', desc: 'Deliver the package to Sunset Mall' },
     ],
   },
   {
-    name: 'Stash Grab', reward: 450, time: 150, from: 'MARA',
-    brief: 'Three drops stashed around town. Grab them all before someone else does.',
+    name: 'Street Race', reward: 400, fastTime: 75,
+    desc: 'Beat the street racers: Old Town, Downtown, Uptown.',
     stages: [
-      { kind: 'collect', text: 'Grab the stash 1/3' },
-      { kind: 'collect', text: 'Grab the stash 2/3' },
-      { kind: 'collect', text: 'Grab the stash 3/3' },
+      { type: 'race', places: ['oldtown', 'downtown', 'uptown'], timeLimit: 80, desc: 'Race the checkpoints!' },
     ],
   },
   {
-    name: 'Getaway', reward: 600, time: 150, from: 'MARA',
-    brief: 'Cops are closing in. Get across town — then vanish.',
+    name: 'Getaway Driver', reward: 350, fastTime: 120,
+    desc: 'Lose the cops, then lay low at the safehouse.',
     stages: [
-      { kind: 'goto', far: true, text: 'Reach the far side of town' },
-      { kind: 'hide', text: 'Stay hidden until the heat drops' },
+      { type: 'escape', timeLimit: 30, setHeat: 250, desc: 'Lose the cops — survive 30s!' },
+      { type: 'goto', place: 'safehouse', desc: 'Lay low at the safehouse' },
     ],
   },
   {
-    name: 'The Big Heist', reward: 900, time: 180, from: 'RICO',
-    brief: 'The Marina vault. In, out, and gone before they know what hit them.',
+    name: 'Night Shift', reward: 300, fastTime: 180, setTime: 21,
+    desc: 'Night delivery: Southside to The Pier.',
     stages: [
-      { kind: 'goto', fixed: 'Hotel Bayview', text: 'Reach the Marina vault' },
-      { kind: 'goto', fixed: 'The Docks', text: 'Grab the take at the Docks' },
-      { kind: 'safehouse', text: 'Escape to the safehouse' },
+      { type: 'collect', place: 'southside', desc: 'Pick up the night package' },
+      { type: 'deliver', place: 'pier', desc: 'Deliver to The Pier' },
     ],
   },
   {
-    name: 'Bay King', reward: 1200, time: 210, from: 'MARA',
-    brief: 'Last one, king. Race, grab, deliver — then come home. The Bay is yours.',
+    name: 'Repo Man', reward: 450, fastTime: 180,
+    desc: 'Find the repossessed car in Northside and bring it to the garage.',
     stages: [
-      { kind: 'goto', checkpoint: true, text: 'Race to the checkpoint' },
-      { kind: 'collect', text: 'Grab the stash' },
-      { kind: 'goto', text: 'Deliver the take' },
-      { kind: 'safehouse', text: 'Return to the safehouse' },
+      { type: 'goto', place: 'northside', desc: 'Find the car in Northside' },
+      { type: 'steal', desc: 'Take the car — press E' },
+      { type: 'deliver', place: 'garage', desc: 'Bring it to Sunset Garage' },
     ],
   },
   {
-    name: 'Dockside Deal', reward: 700, time: 180, from: 'RICO',
-    brief: 'A buyer is waiting at the Docks with cash in hand. Bring the goods, no cops.',
+    name: 'Hot Wheels', reward: 500, fastTime: 150,
+    desc: 'Steal a Comet sportscar and show it off at Beachfront.',
     stages: [
-      { kind: 'goto', fixed: 'The Docks', text: 'Reach the Docks' },
-      { kind: 'collect', text: 'Pick up the goods' },
-      { kind: 'goto', fixed: 'Hotel Bayview', text: 'Deliver to the buyer' },
+      { type: 'stealSport', desc: 'Steal a Comet sportscar' },
+      { type: 'goto', place: 'beachfront', desc: 'Cruise to Beachfront' },
     ],
   },
   {
-    name: 'Neon Nights', reward: 750, time: 180, from: 'DEX',
-    brief: 'Three checkpoints, one night, no brakes. The Strip is watching — make it look easy.',
+    name: "Smuggler's Run", reward: 700, fastTime: 210,
+    desc: 'Move the goods from Marina Bay to Old Town. Quietly.',
     stages: [
-      { kind: 'goto', checkpoint: true, text: 'Reach checkpoint 1/3' },
-      { kind: 'goto', checkpoint: true, text: 'Reach checkpoint 2/3' },
-      { kind: 'goto', checkpoint: true, text: 'Reach checkpoint 3/3' },
+      { type: 'collect', place: 'marinabay', desc: 'Pick up the goods at Marina Bay' },
+      { type: 'deliver', place: 'oldtown', desc: 'Deliver to Old Town' },
     ],
   },
   {
-    name: 'Payback Run', reward: 800, time: 180, from: 'MARA',
-    brief: 'They set you up. Shake the heat, cross town, and lay low till it blows over.',
+    name: 'VIP Escort', reward: 600, fastTime: 150,
+    desc: 'Pick up the VIP in Uptown, deliver to Hillcrest — fast and safe.',
     stages: [
-      { kind: 'hide', text: 'Lose the heat first' },
-      { kind: 'goto', far: true, text: 'Cross to the far side of town' },
-      { kind: 'safehouse', text: 'Lay low at the safehouse' },
+      { type: 'collect', place: 'uptown', desc: 'Pick up the VIP' },
+      { type: 'deliver', place: 'hillcrest', timeLimit: 120, desc: 'Deliver the VIP to Hillcrest' },
     ],
   },
   {
-    name: 'Sunset Showdown', reward: 1500, time: 240, from: 'MARA',
-    brief: 'The final score. Race the checkpoint, grab the stash, deliver it, vanish. All of it.',
+    name: 'Chase the Sunset', reward: 550, fastTime: 100, setTime: 17.5,
+    desc: 'Sunset race to Beachfront.',
     stages: [
-      { kind: 'goto', checkpoint: true, text: 'Race to the checkpoint' },
-      { kind: 'collect', text: 'Grab the stash' },
-      { kind: 'goto', text: 'Deliver the take' },
-      { kind: 'safehouse', text: 'Vanish at the safehouse' },
+      { type: 'race', places: ['downtown', 'southside', 'beachfront'], timeLimit: 100, desc: 'Race to Beachfront before dark!' },
     ],
   },
   {
-    name: 'Pier Pressure', reward: 850, time: 180, from: 'DEX',
-    brief: 'A drop is waiting at the end of the pier and a buyer at the mall. Out to the water, back through town — keep it smooth.',
+    name: 'The Big Heist', reward: 800, fastTime: 300,
+    desc: 'Hit the Downtown bank, lose the heat, vanish at the safehouse.',
     stages: [
-      { kind: 'goto', fixed: 'The Pier', text: 'Reach the end of the pier' },
-      { kind: 'collect', text: 'Grab the pier drop' },
-      { kind: 'goto', fixed: 'Sunset Mall', text: 'Deliver to the mall buyer' },
+      { type: 'collect', place: 'downtown', desc: 'Grab the loot in Downtown' },
+      { type: 'escape', timeLimit: 30, setHeat: 300, desc: 'Lose the cops!' },
+      { type: 'deliver', place: 'safehouse', desc: 'Vanish at the safehouse' },
     ],
   },
   {
-    name: 'Beach Run', reward: 950, time: 180, from: 'RICO',
-    brief: 'A checkpoint on the sand, a stash on the way back, and home before the tide of cops rolls in. Beach driving, rookie — sand is slow, so stay on the road till the last turn.',
+    name: 'Last Call', reward: 650, fastTime: 120,
+    desc: 'Last delivery to The Pier before closing.',
     stages: [
-      { kind: 'goto', checkpoint: true, text: 'Race to the beach checkpoint' },
-      { kind: 'collect', text: 'Grab the stash' },
-      { kind: 'safehouse', text: 'Get back to the safehouse' },
+      { type: 'collect', place: 'mall', desc: 'Pick up the last order at Sunset Mall' },
+      { type: 'deliver', place: 'pier', timeLimit: 100, desc: 'Deliver to The Pier — hurry!' },
     ],
   },
   {
-    name: 'Midnight Courier', reward: 1100, time: 210, from: 'MARA',
-    brief: 'One parcel, four stops, and the whole city watching. Mall pickup, far drop, shake the tail, then disappear. This is the job that makes your name.',
+    name: 'Pier Pressure', reward: 850, fastTime: 300,
+    desc: 'Grab the drop at The Pier, deliver to Sunset Mall, then shake the tail.',
     stages: [
-      { kind: 'goto', fixed: 'Sunset Mall', text: 'Pick up the parcel at the mall' },
-      { kind: 'goto', far: true, text: 'Deliver to the far side of town' },
-      { kind: 'hide', text: 'Shake the heat' },
-      { kind: 'safehouse', text: 'Vanish at the safehouse' },
+      { type: 'collect', place: 'pier', desc: 'Grab the drop at The Pier' },
+      { type: 'deliver', place: 'mall', desc: 'Deliver to Sunset Mall' },
+      { type: 'escape', timeLimit: 20, setHeat: 250, desc: 'Shake the tail!' },
+    ],
+  },
+  {
+    name: 'Beach Run', reward: 950, fastTime: 120,
+    desc: 'High-speed run to Beachfront.',
+    stages: [
+      { type: 'race', places: ['uptown', 'southside', 'beachfront'], timeLimit: 100, desc: 'Race to Beachfront!' },
+    ],
+  },
+  {
+    name: 'Midnight Courier', reward: 1100, fastTime: 300, setTime: 0,
+    desc: 'Midnight deliveries across the city.',
+    stages: [
+      { type: 'collect', place: 'downtown', desc: 'Pick up the midnight package' },
+      { type: 'deliver', place: 'hillcrest', desc: 'Deliver to Hillcrest' },
+      { type: 'deliver', place: 'northside', desc: 'Final drop in Northside' },
+    ],
+  },
+  {
+    name: 'Harbor Lights', reward: 900, fastTime: 240,
+    desc: 'Take the boat from Marina Bay out to sea and on to The Pier.',
+    stages: [
+      { type: 'goto', place: 'marina', desc: 'Get to Marina Bay' },
+      { type: 'boat', place: 'water', desc: 'Board a speedboat (E near a boat) and sail out to sea' },
+      { type: 'boat', place: 'pierwater', desc: 'Sail to The Pier' },
+    ],
+  },
+  {
+    name: 'Dockside Deal', reward: 1000, fastTime: 300,
+    desc: 'Pick up the package at the docks, dodge the cops, deliver to Old Town.',
+    stages: [
+      { type: 'collect', place: 'dock', desc: 'Pick up the package at the docks' },
+      { type: 'escape', timeLimit: 25, setHeat: 250, desc: 'Dodge the cops!' },
+      { type: 'deliver', place: 'oldtown', desc: 'Deliver to Old Town' },
+    ],
+  },
+  {
+    name: 'Sunset Heist', reward: 1500, fastTime: 360, setTime: 18,
+    desc: 'The big one: Downtown at sunset, escape by sea.',
+    stages: [
+      { type: 'collect', place: 'downtown', desc: 'Grab the Sunset Heist loot' },
+      { type: 'escape', timeLimit: 30, setHeat: 300, desc: 'Lose the cops!' },
+      { type: 'boat', place: 'water', desc: 'Escape by sea — take a boat from the marina!' },
     ],
   },
 ];
 
-const REP_TITLES = ['ROOKIE', 'STREET', 'HUSTLER', 'BIG SHOT', 'BAY KING'];
-
-// A point on a road: pick a road line, then a random spot along it.
-function randomRoadPoint(rng) {
-  const line = rng.pick(LINES);
-  if (rng.chance(0.5)) return { x: rng.range(-150, 150), z: line };
-  return { x: line, z: rng.range(-150, 150) };
+// ---------------------------------------------------------------------------
+// Helper kecil
+// ---------------------------------------------------------------------------
+export function starsFor(heat) {
+  return clamp(Math.floor(heat / 100), 0, 5);
 }
 
-export class Game {
-  constructor(seed) {
-    this.seed = seed;
-    this.rng = createRng(seed);
-    this.city = generateCity(this.rng);
-    this.colliders = buildingColliders(this.city);
-    this.time = 0;
-    this.state = 'title'; // title | playing | busted
-    this.money = 0;
-    this.heat = 0; // 0..500; stars = floor(heat / 100)
-    this.jobsDone = 0; // missions completed (kept name for the v1 save)
-    this.carsStolen = 0;
-    this.pedsHit = 0;
-    this.copsDowned = 0;
-    this.coinsCollected = 0;
-    // Stash packs: 6 hidden money packs per run, worth $100 each. They never
-    // respawn once taken — the counter is the collection goal for the run.
-    this.stashesCollected = 0;
-    this.stashTotal = 6;
-    this.nearMisses = 0;
-    this.drifts = 0;
-    this.bustTimer = 0;
-    this.escapeTimer = 0; // seconds with no cop within 45 units (hidden)
-    this.prevNearestCop = Infinity; // for telling a closing cop from a losing one
-    this.ramCooldown = 0;
-    this.starLevel = 0; // displayed stars, with hysteresis at the boundaries
-    this.message = '';
-    this.messageT = 0;
-    this.missionIndex = 0;
-    this.stageIndex = 0;
-    this.missionCycle = 0;
-    this.missionTimeLeft = 0;
-    this.doneThisCycle = MISSIONS.map(() => false);
-    this.districtJobs = {};
-    this.district = 'Old Town';
-    this.jobTarget = null;
-    this.player = createPlayer(-8, 24);
-    this.playerCar = null;
-    this.traffic = [];
-    this.police = [];
-    this.parked = [];
-    this.pedestrians = [];
-    this.pickups = [];
-    this.heli = null;
-    this.copSerial = 0;
-    // Combat: 4 weapon slots, per-gun ammo, unlocks, tracers, sound counters.
-    this.weaponIndex = 0;
-    this.ammo = { pistol: 0, shotgun: 0, smg: 0 };
-    this.unlocked = { pistol: false, shotgun: false, smg: false };
-    this.shootT = 0;
-    this.tracers = [];
-    this.shotsFired = 0;
-    this.swings = 0;
-    this.buys = 0;
-    this.denied = 0;
-    this.armour = 0; // 0..100, absorbs 60% of a hit until it runs out
-    this.upgrades = { speed: 0, armor: 0, handling: 0 };
-    this.nearGarage = false;
-    this.nearShop = false;
-    this.nearSafehouse = false;
-    this.popups = []; // { text, t } — drift / near-miss score popups
-    this.dialog = null; // { name, color, text, t } — crew dialog card
-    this.radioStationName = null;
-    this.radioTrack = null;
-    this.resetWorld();
-  }
+export function phaseName(t) {
+  if (t >= 5 && t < 8) return 'DAWN';
+  if (t >= 8 && t < 17) return 'DAY';
+  if (t >= 17 && t < 20) return 'DUSK';
+  return 'NIGHT';
+}
 
-  get stars() {
-    return this.starLevel;
-  }
+function repLevelName(rep) {
+  if (rep >= 1000) return 'KINGPIN';
+  if (rep >= 300) return 'HUSTLER';
+  return 'ROOKIE';
+}
 
-  // Stars rise the instant heat crosses a boundary, but only fall once heat
-  // has dropped 15 below it — so a cop is not despawned the moment heat
-  // dips 200 -> 199.95.
-  updateStars() {
-    const raw = Math.min(5, Math.floor(this.heat / 100));
-    if (this.heat <= 0) this.starLevel = 0;
-    else if (raw > this.starLevel) this.starLevel = raw;
-    else if (raw < this.starLevel && this.heat < this.starLevel * 100 - 15) this.starLevel = raw;
-  }
+function setMessage(S, text) {
+  S.message = text;
+  S.messageT = 6;
+}
 
-  // Respect: missions, cops downed, cars stolen, coins and stash packs all
-  // count — a full stash sweep is worth almost half a mission.
-  get repPoints() {
-    return this.jobsDone * 150 + this.copsDowned * 25 + this.carsStolen * 10 + this.coinsCollected * 5 + this.stashesCollected * 15;
-  }
+function setPopup(S, text) {
+  S.popup = text;
+  S.popupT = 3;
+}
 
-  get repLevel() {
-    const level = Math.min(5, Math.floor(this.repPoints / 400) + 1);
-    return { level, title: REP_TITLES[level - 1], progress: (this.repPoints % 400) / 400 };
-  }
+function pushEvent(S, name) {
+  S.events.push(name);
+  if (S.events.length > 32) S.events.shift();
+}
 
-  get completionPct() {
-    return Math.round((this.doneThisCycle.filter(Boolean).length / MISSIONS.length) * 100);
-  }
+function turnToward(cur, target, maxStep) {
+  let d = wrapAngle(target - cur);
+  if (d > maxStep) d = maxStep;
+  else if (d < -maxStep) d = -maxStep;
+  return cur + d;
+}
 
-  get missionCard() {
-    const m = MISSIONS[this.missionIndex];
-    const st = m.stages[this.stageIndex];
-    const next = m.stages[this.stageIndex + 1];
-    return {
-      num: this.missionIndex + 1,
-      total: MISSIONS.length,
-      name: m.name,
-      reward: m.reward,
-      stageCur: this.stageIndex + 1,
-      stageTotal: m.stages.length,
-      stageText: st ? st.text : '',
-      nextText: next ? next.text : 'Finish the job',
-      timeLeft: Math.max(0, Math.ceil(this.missionTimeLeft)),
-      cycle: this.missionCycle,
-    };
+// Titik padat untuk pejalan kaki / polisi: batas kota, gedung, dan air.
+function solidAt(city, x, z) {
+  if (city && city.bounds) {
+    const b = city.bounds;
+    if (x < b.minX + 0.5 || x > b.maxX - 0.5 || z < b.minZ + 0.5 || z > b.maxZ - 0.5) return true;
   }
-
-  get jobText() {
-    const card = this.missionCard;
-    const where = this.jobTarget ? ` — ${this.jobTarget.name}` : '';
-    return `${card.stageText}${where}`;
-  }
-
-  resetWorld() {
-    const rng = this.rng;
-    this.traffic = [];
-    for (let i = 0; i < 14; i += 1) {
-      this.traffic.push(createTrafficCar(rng, CAR_COLORS));
+  if (city && city.buildings) {
+    for (let i = 0; i < city.buildings.length; i++) {
+      const bd = city.buildings[i];
+      if (Math.abs(x - bd.x) < bd.w / 2 + 0.6 && Math.abs(z - bd.z) < bd.d / 2 + 0.6) return true;
     }
-    this.parked = [];
-    for (const spot of this.city.parkSpots.slice(0, 6)) {
-      this.parked.push({
-        kind: 'parked',
-        x: spot.x,
-        z: spot.z,
-        heading: spot.heading,
-        speed: 0,
-        steer: 0,
-        color: rng.pick(CAR_COLORS),
-        model: rng.pick(CAR_MODELS),
-      });
-    }
-    // Guarantee a car to steal right by the spawn: the first parked car
-    // waits at the kerb of the road east of the spawn point (~12 units).
-    if (this.parked.length > 0) {
-      this.parked[0].x = 4;
-      this.parked[0].z = 24;
-      this.parked[0].heading = 0;
-      this.parked[0].model = 'Comet';
-    }
-    this.police = [];
-    this.pedestrians = [];
-    for (let i = 0; i < 10; i += 1) {
-      this.pedestrians.push(this.spawnPedestrian());
-    }
-    this.pickups = [];
-    for (let i = 0; i < 8; i += 1) {
-      const p = randomRoadPoint(rng);
-      this.pickups.push({ kind: 'cash', x: p.x, z: p.z, amount: 25, taken: false, spin: rng.range(0, 6), respawn: 0 });
-    }
-    for (const type of ['pistol', 'shotgun', 'smg', 'pistol']) {
-      const p = randomRoadPoint(rng);
-      const amount = type === 'pistol' ? 12 : type === 'shotgun' ? 6 : 24;
-      this.pickups.push({ kind: 'ammo', ammoType: type, x: p.x, z: p.z, amount, taken: false, spin: rng.range(0, 6), respawn: 0 });
-    }
-    // Stash packs: 3 on random roads, 3 at fixed hiding spots a player can
-    // actually learn — the pier end, Bay Park, and the far beach — so the
-    // hunt is part exploration, part memory. Seeded, so the same seed hides
-    // them in the same places every run.
-    for (let i = 0; i < 3; i += 1) {
-      const p = randomRoadPoint(rng);
-      this.pickups.push({ kind: 'stash', x: p.x, z: p.z, amount: 100, taken: false, spin: rng.range(0, 6), respawn: 0 });
-    }
-    for (const spot of [{ x: 186, z: 0 }, { x: -26, z: -26 }, { x: 175, z: 100 }]) {
-      this.pickups.push({ kind: 'stash', x: spot.x, z: spot.z, amount: 100, taken: false, spin: rng.range(0, 6), respawn: 0 });
-    }
-    this.startMission(0);
   }
+  if (city && city.water) {
+    for (let i = 0; i < city.water.length; i++) {
+      const w = city.water[i];
+      if (Math.abs(x - w.x) < w.w / 2 && Math.abs(z - w.z) < w.d / 2) return true;
+    }
+  }
+  return false;
+}
 
-  spawnPedestrian() {
-    const rng = this.rng;
-    const bx = rng.int(0, 5);
-    const bz = rng.int(0, 5);
-    if (bx === 2 && bz === 2) return this.spawnPedestrian();
-    const x0 = LINES[bx] + 8;
-    const x1 = LINES[bx + 1] - 8;
-    const z0 = LINES[bz] + 8;
-    const z1 = LINES[bz + 1] - 8;
-    return {
-      x: rng.range(x0, x1),
-      z: rng.chance(0.5) ? z0 : z1,
+// Titik di air yang paling dekat dengan (x, z) — untuk target boat di dekat distrik.
+function waterNear(S, x, z) {
+  const w = S.city.water;
+  if (!w || !w.length) return { x: S.city.marina.x, z: S.city.marina.z };
+  let best = null;
+  let bestD = Infinity;
+  for (let i = 0; i < w.length; i++) {
+    const r = w[i];
+    const cx = clamp(x, r.x - r.w / 2 + 4, r.x + r.w / 2 - 4);
+    const cz = clamp(z, r.z - r.d / 2 + 4, r.z + r.d / 2 - 4);
+    const d = dist2d(x, z, cx, cz);
+    if (d < bestD) {
+      bestD = d;
+      best = { x: cx, z: cz };
+    }
+  }
+  return best || { x: w[0].x, z: w[0].z };
+}
+
+function districtCenter(S, key) {
+  const d = S.city.districts.find((dd) => dd.name.toLowerCase().replace(/\s+/g, '') === key);
+  return d ? { x: d.cx, z: d.cz } : null;
+}
+
+// Selesaikan nama tempat menjadi koordinat {x, z}. Dipakai semua stage misi.
+function placePos(S, place) {
+  const c = S.city;
+  const p = String(place || '').toLowerCase().replace(/\s+/g, '');
+  if (p === 'garage') return { x: c.garage.x, z: c.garage.z };
+  if (p === 'shop') return { x: c.shop.x, z: c.shop.z };
+  if (p === 'safehouse') return { x: c.safehouse.x, z: c.safehouse.z };
+  if (p === 'marina') return { x: c.marina.x, z: c.marina.z };
+  if (p === 'dock') {
+    const d = (c.marina.docks && c.marina.docks[0]) || c.marina;
+    return { x: d.x, z: d.z };
+  }
+  if (p === 'water') {
+    const w = c.water[0];
+    return w ? { x: w.x, z: w.z } : { x: c.marina.x, z: c.marina.z };
+  }
+  if (p === 'pierwater') {
+    const dc = districtCenter(S, 'thepier');
+    return waterNear(S, dc ? dc.x : c.marina.x, dc ? dc.z : c.marina.z);
+  }
+  if (p === 'marinawater') {
+    const dc = districtCenter(S, 'marinabay');
+    return waterNear(S, dc ? dc.x : c.marina.x, dc ? dc.z : c.marina.z);
+  }
+  if (p.startsWith('stash')) {
+    const i = parseInt(p.slice(5), 10) || 0;
+    const s = c.stashes[Math.min(Math.max(i, 0), c.stashes.length - 1)];
+    return { x: s.x, z: s.z };
+  }
+  if (p === 'pier') {
+    const dc = districtCenter(S, 'thepier');
+    if (dc) return dc;
+  }
+  if (p === 'mall') {
+    const dc = districtCenter(S, 'sunsetmall');
+    if (dc) return dc;
+  }
+  const dc = districtCenter(S, p);
+  if (dc) return dc;
+  return { x: 0, z: 0 };
+}
+
+// Cari titik yang benar-benar bisa dipijak: tidak di dalam gedung/air dan
+// dengan ruang gerak 3 unit ke segala arah (wall-slide butuh itu). Dipakai
+// spawn pemain + mobil parkir — tanpa ini spawn bisa mendarat di dalam
+// margin tabrakan gedung dan pemain macet total di tempat.
+function findClearSpot(city, x, z, maxR) {
+  const ok = (px, pz) =>
+    !solidAt(city, px, pz) &&
+    !solidAt(city, px + 3, pz) && !solidAt(city, px - 3, pz) &&
+    !solidAt(city, px, pz + 3) && !solidAt(city, px, pz - 3);
+  if (ok(x, z)) return { x, z };
+  for (let r = 2; r <= maxR; r += 2) {
+    for (let a = 0; a < 8; a++) {
+      const ang = (a / 8) * Math.PI * 2;
+      const px = Math.round(x + Math.sin(ang) * r);
+      const pz = Math.round(z + Math.cos(ang) * r);
+      if (ok(px, pz)) return { x: px, z: pz };
+    }
+  }
+  return { x, z };
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+export function createState(seed) {
+  const useSeed = seed == null ? (Math.random() * 1e9) | 0 : seed;
+  const rng = createRng(useSeed);
+  const city = buildCity(rng);
+  const S = {
+    seed: useSeed,
+    rng,
+    city,
+    money: 0,
+    totalEarned: 0,
+    missionIndex: 0,
+    jobsDone: 0,
+    mission: null,
+    nextMissionT: 1,
+    heat: 0,
+    stars: 0,
+    rep: 0,
+    repLevel: 'ROOKIE',
+    stashes: [false, false, false, false, false, false],
+    stashCount: 0,
+    upgrades: { speed: 0, armor: 0 },
+    health: 100,
+    weapons: { slot: 0, ammo: { pistol: 24, smg: 0, shotgun: 0 } },
+    player: null,
+    car: null,
+    boat: null,
+    parkedCars: [],
+    cops: [],
+    heli: { active: false, x: 0, z: 0, dist: 0 },
+    time: 18.0,
+    day: 1,
+    weather: 'clear',
+    weatherT: 0,
+    district: '',
+    traffic: null,
+    taxi: null,
+    water: null,
+    message: '',
+    messageT: 0,
+    popup: '',
+    popupT: 0,
+    events: [],
+    bustedT: 0,
+    busted: false,
+    bustedFlashT: 0,
+    driftT: 0,
+    driftCount: 0,
+    fireT: 0,
+    copSpawnT: 0,
+    gameTime: 0,
+  };
+  const spawn = findClearSpot(city, city.safehouse.x + 3, city.safehouse.z + 3, 30);
+  S.player = createPlayer(spawn.x, spawn.z);
+  S.traffic = createTraffic(city, rng);
+  S.water = createWater(city);
+  S.taxi = createTaxi(S);
+  // Parked cars (stealable without chasing moving traffic).
+  // Positions nudged to a clear spot so no car spawns inside a building.
+  const parkedSpots = [
+    [-53, -128, 0, 'sedan', '#8a8f98'],
+    [53, 78, Math.PI / 2, 'sport', '#e33e2b'],
+    [-28, 55, 0, 'taxi', '#f5d90a'],
+  ];
+  S.parkedCars = parkedSpots.map(([px, pz, heading, model, color]) => {
+    const spot = findClearSpot(city, px, pz, 12);
+    return createCar(spot.x, spot.z, heading, model, color);
+  });
+  // Pedestrians wandering the sidewalks (22 shirt colours, 6 skins).
+  const SHIRTS = ['#e33e2b', '#f2a007', '#2fae4e', '#1f8fff', '#7a3fd1', '#e26fb5', '#f2f2f2', '#ff7a1a', '#0fa3a3', '#9be15d', '#b3123f', '#3a6ea5', '#c9a227', '#6b7c93', '#d94f70', '#2b2b4a', '#a8e063', '#ffcf3f', '#4ecdc4', '#5b3a1e', '#8a8f98', '#2447d6'];
+  const SKINS = ['#c98d64', '#8a5a3b', '#e8b88a', '#6e4426', '#f0c8a0', '#a06a42'];
+  S.peds = [];
+  for (let i = 0; i < 12; i++) {
+    const gx = rng.pick([-100, -50, 0, 50, 100]);
+    const gz = rng.pick([-100, -50, 0, 50, 100]);
+    S.peds.push({
+      x: gx + rng.range(-4, 4),
+      z: gz + rng.range(-4, 4),
       heading: rng.range(0, Math.PI * 2),
-      speed: rng.range(1.4, 2.4),
-      state: 'walk',
-      downT: 0,
       shirt: rng.pick(SHIRTS),
       skin: rng.pick(SKINS),
-      walkPhase: rng.range(0, 6),
-      block: { x0, x1, z0, z1 },
-      edge: rng.int(0, 3),
-      along: rng.range(0, 1),
-      dir: rng.chance(0.5) ? 1 : -1,
+      speed: rng.range(1.2, 2.4),
+      turnT: rng.range(0, 4),
+    });
+  }
+  S.district = districtAt(city, S.player.x, S.player.z);
+  return S;
+}
+
+// ---------------------------------------------------------------------------
+// Misi
+// ---------------------------------------------------------------------------
+export function startMission(S, i) {
+  if (i < 0 || i >= MISSIONS.length) return;
+  const m = MISSIONS[i];
+  S.mission = {
+    index: i,
+    stage: 0,
+    elapsed: 0,
+    stageT: 0,
+    stageDef: null,
+    target: null,
+    checkpoints: [],
+    cpIndex: 0,
+    def: m,
+  };
+  if (typeof m.setTime === 'number') S.time = m.setTime;
+  setupStage(S);
+  setMessage(S, `MISSION ${i + 1}/18: ${m.name} — ${m.desc}`);
+}
+
+function setupStage(S) {
+  const M = S.mission;
+  const st = M.def.stages[M.stage];
+  M.stageDef = st;
+  M.stageT = 0;
+  M.cpIndex = 0;
+  M.checkpoints = [];
+  if (st.setHeat) S.heat = Math.max(S.heat, st.setHeat);
+  if (st.type === 'race') {
+    M.checkpoints = (st.places || []).map((pl) => {
+      const pos = placePos(S, pl);
+      pos.label = pl;
+      return pos;
+    });
+    M.target = M.checkpoints[0] || null;
+  } else if (st.place) {
+    const pos = placePos(S, st.place);
+    pos.label = st.place;
+    M.target = pos;
+  } else {
+    M.target = null;
+  }
+  setMessage(S, `${M.def.name} — ${st.desc}`);
+}
+
+function advanceStage(S) {
+  const M = S.mission;
+  M.stage++;
+  pushEvent(S, 'pickup');
+  if (M.stage >= M.def.stages.length) {
+    completeMission(S);
+    return;
+  }
+  setupStage(S);
+}
+
+export function completeMission(S) {
+  const M = S.mission;
+  if (!M) return;
+  const m = M.def;
+  const elapsed = M.elapsed;
+  let bonus = 0;
+  if (elapsed < m.fastTime) bonus = Math.floor(m.reward * 0.5);
+  const total = m.reward + bonus;
+  S.money += total;
+  S.totalEarned += total;
+  S.jobsDone++;
+  S.missionIndex++;
+  S.rep += 100;
+  if (bonus > 0) setMessage(S, `Job done! +$${total} (+$${bonus} fast bonus)`);
+  else setMessage(S, `Job done! +$${total}`);
+  pushEvent(S, 'cash');
+  S.mission = null;
+  S.nextMissionT = 3;
+  if (S.missionIndex >= MISSIONS.length) {
+    setMessage(S, 'ALL MISSIONS COMPLETE — You run Sunset Bay!');
+  }
+}
+
+function failMission(S, reason) {
+  setMessage(S, `Mission failed: ${reason} — try again!`);
+  S.mission = null;
+  S.nextMissionT = 2.5;
+  S.heat = 0;
+}
+
+function updateMission(S, dt) {
+  if (!S.mission) {
+    if (S.missionIndex < MISSIONS.length) {
+      S.nextMissionT -= dt;
+      if (S.nextMissionT <= 0) startMission(S, S.missionIndex);
+    }
+    return;
+  }
+  const M = S.mission;
+  M.elapsed += dt;
+  M.stageT += dt;
+  const st = M.stageDef;
+  const P = S.player;
+  if (st.type === 'goto' || st.type === 'collect' || st.type === 'deliver') {
+    if (M.target && dist2d(P.x, P.z, M.target.x, M.target.z) < (st.radius || 6)) advanceStage(S);
+  } else if (st.type === 'steal') {
+    if (S.car) advanceStage(S);
+  } else if (st.type === 'stealSport') {
+    if (S.car && S.car.model === 'sport') advanceStage(S);
+  } else if (st.type === 'race') {
+    if (st.timeLimit && M.stageT > st.timeLimit) {
+      failMission(S, 'Out of time!');
+      return;
+    }
+    const cp = M.checkpoints[M.cpIndex];
+    if (cp && dist2d(P.x, P.z, cp.x, cp.z) < (st.radius || 10)) {
+      M.cpIndex++;
+      if (M.cpIndex >= M.checkpoints.length) {
+        advanceStage(S);
+        return;
+      }
+      M.target = M.checkpoints[M.cpIndex];
+      setMessage(S, `Checkpoint ${M.cpIndex + 1}/${M.checkpoints.length} — ${st.desc}`);
+      pushEvent(S, 'pickup');
+    }
+  } else if (st.type === 'escape') {
+    if (S.heat < 200) S.heat = 200;
+    if (M.stageT >= (st.timeLimit || 30)) advanceStage(S);
+  } else if (st.type === 'boat') {
+    if (S.boat && M.target && dist2d(S.boat.x, S.boat.z, M.target.x, M.target.z) < (st.radius || 14)) {
+      advanceStage(S);
+    }
+  }
+  // Batas waktu untuk stage deliver / collect yang punya timeLimit.
+  if (S.mission !== M) return; // misi sudah selesai / gagal di atas
+  if ((st.type === 'deliver' || st.type === 'collect') && st.timeLimit && M.stageT > st.timeLimit) {
+    failMission(S, 'Out of time!');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Save / load (localStorage key sunset-bay-save-v1)
+// ---------------------------------------------------------------------------
+export function saveGame(S) {
+  try {
+    if (typeof localStorage === 'undefined') return false;
+    const data = {
+      v: 1,
+      money: S.money,
+      totalEarned: S.totalEarned,
+      missionIndex: S.missionIndex,
+      jobsDone: S.jobsDone,
+      rep: S.rep,
+      stashes: S.stashes.slice(),
+      upgrades: { speed: S.upgrades.speed, armor: S.upgrades.armor },
+      health: S.health,
+      weapons: { slot: S.weapons.slot, ammo: { ...S.weapons.ammo } },
+      player: { x: S.player.x, z: S.player.z, heading: S.player.heading },
+      time: S.time,
+      day: S.day,
+      weather: S.weather,
+      car: S.car
+        ? { x: S.car.x, z: S.car.z, heading: S.car.heading, model: S.car.model, color: S.car.color }
+        : null,
     };
+    localStorage.setItem(SAVE_KEY, JSON.stringify(data));
+    return true;
+  } catch (e) {
+    return false;
   }
+}
 
-  // Snap a landmark to the nearest road line, so the beacon never sits
-  // inside a building no car or foot can reach.
-  snapToRoad(spot) {
-    const nx = LINES.reduce((a, b) => (Math.abs(b - spot.x) < Math.abs(a - spot.x) ? b : a));
-    const nz = LINES.reduce((a, b) => (Math.abs(b - spot.z) < Math.abs(a - spot.z) ? b : a));
-    let tx = spot.x;
-    let tz = spot.z;
-    if (Math.abs(nx - spot.x) <= Math.abs(nz - spot.z)) tx = nx;
-    else tz = nz;
-    tx = Math.min(tx, 186); // the pier's street end is the sand, not the water
-    return { x: tx, z: tz, name: spot.name };
+export function loadGame() {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    const raw = localStorage.getItem(SAVE_KEY);
+    if (!raw) return null;
+    const d = JSON.parse(raw);
+    return d && d.v === 1 ? d : null;
+  } catch (e) {
+    return null;
   }
+}
 
-  startMission(index) {
-    this.missionIndex = index;
-    const m = MISSIONS[index];
-    this.missionTimeLeft = m.time;
-    const crew = CREW.find((c) => c.name === m.from) || CREW[0];
-    this.setDialog(crew.name, crew.color, m.brief);
-    this.startStage(0);
+// Terapkan data save ke state yang sudah dibuat createState. Misi aktif
+// diulang dari awal (stage 0) supaya tidak ada state misi setengah jalan.
+export function applySave(S, d) {
+  if (!d) return;
+  S.money = d.money || 0;
+  S.totalEarned = d.totalEarned || 0;
+  S.missionIndex = d.missionIndex || 0;
+  S.jobsDone = d.jobsDone || 0;
+  S.rep = d.rep || 0;
+  S.repLevel = repLevelName(S.rep);
+  if (Array.isArray(d.stashes)) {
+    S.stashes = d.stashes.slice(0, 6);
+    while (S.stashes.length < 6) S.stashes.push(false);
+    S.stashCount = S.stashes.filter(Boolean).length;
   }
-
-  startStage(s) {
-    this.stageIndex = s;
-    const st = MISSIONS[this.missionIndex].stages[s];
-    const rng = this.rng;
-    if (st.kind === 'steal') {
-      const car = this.parked[0];
-      this.jobTarget = car ? { x: car.x, z: car.z, name: 'a parked car' } : { x: 4, z: 24, name: 'a parked car' };
-    } else if (st.kind === 'hide') {
-      this.jobTarget = null;
-    } else if (st.kind === 'safehouse') {
-      this.jobTarget = { x: PLACES.safehouse.x, z: PLACES.safehouse.z, name: 'Safehouse' };
-    } else if (st.kind === 'collect') {
-      this.pickups = this.pickups.filter((p) => p.kind !== 'job');
-      const p = randomRoadPoint(rng);
-      this.pickups.push({ kind: 'job', x: p.x, z: p.z, amount: 0, taken: false, spin: rng.range(0, 6), respawn: 0, jobActive: true });
-      this.jobTarget = { x: p.x, z: p.z, name: 'the stash' };
-    } else if (st.checkpoint) {
-      const p = randomRoadPoint(rng);
-      this.jobTarget = { x: p.x, z: p.z, name: `Checkpoint ${s + 1}` };
-    } else if (st.fixed) {
-      const lm = this.city.landmarks.find((l) => l.name === st.fixed) || this.city.landmarks[0];
-      this.jobTarget = this.snapToRoad(lm);
-    } else if (st.far) {
-      // The far side of town from wherever the player is now.
-      const px = this.playerCar ? this.playerCar.x : this.player.x;
-      const pz = this.playerCar ? this.playerCar.z : this.player.z;
-      let best = null;
-      let bestD = -1;
-      for (const lm of this.city.landmarks) {
-        const d = Math.hypot(lm.x - px, lm.z - pz);
-        if (d > bestD) {
-          bestD = d;
-          best = lm;
-        }
-      }
-      this.jobTarget = this.snapToRoad(best);
-    } else {
-      // Plain goto: a landmark, never the same one twice in a row.
-      let spot = rng.pick(this.city.landmarks);
-      const prevName = this.jobTarget ? this.jobTarget.name : null;
-      for (let i = 0; i < 4 && spot.name === prevName; i += 1) spot = rng.pick(this.city.landmarks);
-      this.jobTarget = this.snapToRoad(spot);
-    }
+  if (d.upgrades) S.upgrades = { speed: d.upgrades.speed || 0, armor: d.upgrades.armor || 0 };
+  S.health = typeof d.health === 'number' ? d.health : 100;
+  if (d.weapons) {
+    S.weapons.slot = d.weapons.slot || 0;
+    S.weapons.ammo = { pistol: 24, smg: 0, shotgun: 0, ...(d.weapons.ammo || {}) };
   }
-
-  completeStage() {
-    const m = MISSIONS[this.missionIndex];
-    const next = this.stageIndex + 1;
-    if (next >= m.stages.length) this.completeMission();
-    else this.startStage(next);
+  if (d.player) {
+    S.player.x = d.player.x;
+    S.player.z = d.player.z;
+    S.player.heading = d.player.heading || 0;
+    S.player.onFoot = true;
+    S.player.speed = 0;
   }
-
-  completeMission() {
-    const m = MISSIONS[this.missionIndex];
-    const base = m.reward + this.missionCycle * 50;
-    const bonus = this.missionTimeLeft > 0 ? Math.round(base * 0.5) : 0;
-    this.money += base + bonus;
-    this.jobsDone += 1;
-    this.doneThisCycle[this.missionIndex] = true;
-    const d = this.district;
-    this.districtJobs[d] = (this.districtJobs[d] || 0) + 1;
-    this.setMessage(`Job done! +$${base}${bonus ? ` (+$${bonus} fast bonus)` : ''}`);
-    const praise = this.missionIndex % 2 === 0
-      ? 'Clean work. The Bay notices that kind of driving.'
-      : 'That is how you do it. Next job is already lined up.';
-    this.setDialog('MARA', CREW[0].color, praise);
-    this.advanceMission();
+  if (typeof d.time === 'number') S.time = d.time;
+  if (typeof d.day === 'number') S.day = d.day;
+  if (typeof d.weather === 'string') S.weather = d.weather;
+  S.heat = 0;
+  S.stars = 0;
+  S.cops.length = 0;
+  S.heli.active = false;
+  S.mission = null;
+  S.nextMissionT = 1.5;
+  if (d.car) {
+    const c = createCar(d.car.x, d.car.z, d.car.heading || 0, d.car.model || 'sedan', d.car.color || '#888888');
+    c.engineLevel = S.upgrades.speed;
+    c.upgrade = S.upgrades.speed;
+    S.car = c;
+    S.player.onFoot = false;
+    S.player.x = c.x;
+    S.player.z = c.z;
+    S.player.heading = c.heading;
   }
+}
 
-  failMission() {
-    this.setMessage('Job timed out — no pay. New job assigned.');
-    this.setDialog('MARA', CREW[0].color, 'That one slipped. Shake it off — next job is up.');
-    this.advanceMission();
-  }
-
-  advanceMission() {
-    let next = this.missionIndex + 1;
-    if (next >= MISSIONS.length) {
-      next = 0;
-      this.missionCycle += 1;
-      this.doneThisCycle = MISSIONS.map(() => false);
-    }
-    this.startMission(next);
-  }
-
-  setMessage(text, seconds = 3) {
-    this.message = text;
-    this.messageT = seconds;
-  }
-
-  setDialog(name, color, text, seconds = 6) {
-    this.dialog = { name, color, text, t: seconds };
-  }
-
-  addPopup(text) {
-    this.popups.push({ text, t: 2.5 });
-    if (this.popups.length > 4) this.popups.shift();
-  }
-
-  addHeat(points) {
-    this.heat = clamp(this.heat + points, 0, 500);
-    this.updateStars();
-  }
-
-  // --- Combat ---
-  get weapon() {
-    return WEAPONS[this.weaponIndex];
-  }
-
-  selectWeapon(i) {
-    if (i < 0 || i >= WEAPONS.length) return;
-    const w = WEAPONS[i];
-    if (w.key && !this.unlocked[w.key]) {
-      this.setMessage(`${w.name} not unlocked yet — grab its ammo first.`);
-      return;
-    }
-    this.weaponIndex = i;
-  }
-
-  cycleWeapon() {
-    for (let n = 1; n <= WEAPONS.length; n += 1) {
-      const i = (this.weaponIndex + n) % WEAPONS.length;
-      const w = WEAPONS[i];
-      if (!w.key || this.unlocked[w.key]) {
-        this.weaponIndex = i;
-        return;
-      }
-    }
-  }
-
-  // F pressed (or click with fists): a swing at whatever is in front.
-  tryMelee() {
-    if (this.state !== 'playing' || !this.player.onFoot) return;
-    if (this.player.punchT > 0) return;
-    this.player.punchT = 0.45;
-    this.swings += 1;
-    const px = this.player.x;
-    const pz = this.player.z;
-    const h = this.player.heading;
-    for (const cop of this.police) {
-      if (cop.down) continue;
-      const d = Math.hypot(cop.x - px, cop.z - pz);
-      if (d < 2.8) {
-        const ang = Math.atan2(cop.x - px, cop.z - pz);
-        let diff = ang - h;
-        while (diff > Math.PI) diff -= Math.PI * 2;
-        while (diff < -Math.PI) diff += Math.PI * 2;
-        if (Math.abs(diff) < 1.2) this.damageCop(cop, 1);
-      }
-    }
-    for (const ped of this.pedestrians) {
-      if (ped.state === 'down') continue;
-      if (Math.hypot(ped.x - px, ped.z - pz) < 2.2) {
-        ped.state = 'down';
-        ped.downT = 4;
-        this.addHeat(10);
-        this.setMessage('You knocked a pedestrian down!');
-      }
-    }
-  }
-
-  // Click on foot: fire the selected gun (fists fall back to a punch).
-  tryShoot() {
-    if (this.state !== 'playing' || !this.player.onFoot) return;
-    const w = this.weapon;
-    if (!w.key) {
-      this.tryMelee();
-      return;
-    }
-    if (this.ammo[w.key] <= 0) {
-      this.setMessage(`No ${w.name} ammo — buy some at the shop (G).`);
-      this.tryMelee();
-      return;
-    }
-    if (this.shootT > 0) return;
-    this.shootT = w.rate;
-    this.ammo[w.key] -= 1;
-    this.shotsFired += 1;
-    const px = this.player.x;
-    const pz = this.player.z;
-    const h = this.player.heading;
-    for (let p = 0; p < w.pellets; p += 1) {
-      const off = w.pellets > 1 ? (p - (w.pellets - 1) / 2) * w.spread : (this.rng.chance(0.5) ? w.spread : -w.spread);
-      const ang = h + off;
-      const dx = Math.sin(ang);
-      const dz = Math.cos(ang);
-      let hit = null;
-      let hitD = w.range;
-      for (const cop of this.police) {
-        if (cop.down) continue;
-        const cx = cop.x - px;
-        const cz = cop.z - pz;
-        const along = cx * dx + cz * dz;
-        if (along < 1 || along > w.range) continue;
-        const perp = Math.abs(cx * dz - cz * dx);
-        if (perp < 2.2 && along < hitD) {
-          hitD = along;
-          hit = cop;
-        }
-      }
-      const ex = px + dx * hitD;
-      const ez = pz + dz * hitD;
-      this.tracers.push({ x1: px, z1: pz, x2: ex, z2: ez, t: 0.14, max: 0.14 });
-      if (hit) this.damageCop(hit, w.dmg);
-    }
-  }
-
-  damageCop(cop, dmg) {
-    if (cop.down) return;
-    cop.hp -= dmg;
-    if (cop.hp <= 0) {
-      cop.down = true;
-      cop.downT = 8;
-      cop.speed = 0;
-      this.copsDowned += 1;
-      this.addHeat(60);
-      this.setMessage('Cop down!');
-      this.addPopup('COP DOWN');
-    }
-  }
-
-  // G pressed: garage upgrades / respray, or shop ammo + armour.
-  tryInteract() {
-    if (this.state !== 'playing') return;
-    const px = this.playerCar ? this.playerCar.x : this.player.x;
-    const pz = this.playerCar ? this.playerCar.z : this.player.z;
-    const dGarage = Math.hypot(px - PLACES.garage.x, pz - PLACES.garage.z);
-    const dShop = Math.hypot(px - PLACES.shop.x, pz - PLACES.shop.z);
-    if (dGarage < 9) {
-      if (!this.playerCar) {
-        this.setMessage('Get in a car to use the garage.');
-        return;
-      }
-      // A respray only jumps the queue at 2+ stars, when losing the heat is
-      // the urgent need. At 1 star G buys the upgrade you came for — stealing
-      // a car (the first thing every player does) already puts 1 star on
-      // you, so a respray-first rule would silently tax every upgrade $200.
-      if (this.heat >= 200 && this.money >= 200) {
-        this.money -= 200;
-        this.heat = 0;
-        this.updateStars();
-        this.buys += 1;
-        this.setMessage('Respray — the heat is gone!');
-        return;
-      }
-      if (this.heat >= 200 && this.money < 200) {
-        this.setMessage('Respray costs $200 — earn a little more first.');
-        return;
-      }
-      const next = UPGRADE_DEFS.find((u) => this.upgrades[u.key] < 3);
-      if (!next) {
-        this.setMessage('Ride is maxed out.');
-        return;
-      }
-      const cost = next.base * (this.upgrades[next.key] + 1);
-      if (this.money < cost) {
-        this.denied += 1;
-        this.setMessage(`${next.name} Lv${this.upgrades[next.key] + 1} costs $${cost}.`);
-        return;
-      }
-      this.money -= cost;
-      this.upgrades[next.key] += 1;
-      if (this.playerCar) this.playerCar.upgrades = { ...this.upgrades };
-      this.buys += 1;
-      this.setMessage(`${next.name} Lv${this.upgrades[next.key]} installed!`);
-      return;
-    }
-    if (dShop < 9) {
-      if (this.playerCar) {
-        this.setMessage('Get out of the car to shop.');
-        return;
-      }
-      const w = this.weapon.key ? this.weapon : WEAPONS[1];
-      const deal = AMMO_PRICE[w.key];
-      if (this.ammo[w.key] < 6 && this.money >= deal.price) {
-        this.money -= deal.price;
-        this.ammo[w.key] += deal.amount;
-        this.unlocked[w.key] = true;
-        this.weaponIndex = WEAPONS.findIndex((x) => x.key === w.key);
-        this.buys += 1;
-        this.setMessage(`Bought ${deal.amount} ${w.name} rounds.`);
-        return;
-      }
-      if (this.armour < 100 && this.money >= 120) {
-        this.money -= 120;
-        this.armour = 100;
-        this.buys += 1;
-        this.setMessage('Armour fitted — 100%.');
-        return;
-      }
-      if (this.money >= deal.price) {
-        this.money -= deal.price;
-        this.ammo[w.key] += deal.amount;
-        this.unlocked[w.key] = true;
-        this.buys += 1;
-        this.setMessage(`Bought ${deal.amount} ${w.name} rounds.`);
-        return;
-      }
-      this.denied += 1;
-      this.setMessage('Not enough cash.');
-    }
-  }
-
-  // E pressed: get in the nearest car, or get out of the one being driven.
-  tryEnterExit() {
-    if (this.state !== 'playing') return;
-    if (this.playerCar) {
-      const car = this.playerCar;
-      this.player.x = car.x - Math.sin(car.heading) * 2.5;
-      this.player.z = car.z - Math.cos(car.heading) * 2.5;
-      this.player.heading = car.heading;
-      this.player.onFoot = true;
-      this.playerCar = null;
-      // The car stays in the world, parked where you left it — marked as
-      // yours, so getting back in is free instead of another theft.
-      car.kind = 'parked';
-      car.mine = true;
-      this.parked.push(car);
-      return;
-    }
-    let best = null;
-    let bestD = 4;
-    for (const car of this.parked) {
-      const d = Math.hypot(car.x - this.player.x, car.z - this.player.z);
+// ---------------------------------------------------------------------------
+// Interaksi (tombol E)
+// ---------------------------------------------------------------------------
+function nearestCarEntry(S, maxD) {
+  const P = S.player;
+  let best = null;
+  let bestD = maxD;
+  const lists = [S.traffic.cars, S.parkedCars];
+  for (let li = 0; li < lists.length; li++) {
+    const list = lists[li] || [];
+    for (let i = 0; i < list.length; i++) {
+      const c = list[i];
+      const d = dist2d(P.x, P.z, c.x, c.z);
       if (d < bestD) {
         bestD = d;
-        best = car;
+        best = { car: c, list, index: i };
       }
     }
-    if (best) {
-      this.parked = this.parked.filter((c) => c !== best);
-      best.kind = 'player';
-      best.color = PLAYER_CAR_COLOR;
-      best.model = best.model || this.rng.pick(CAR_MODELS);
-      best.speed = 0;
-      best.steer = 0;
-      best.upgrades = { ...this.upgrades };
-      best.driftT = 0;
-      best.drifting = false;
-      this.playerCar = best;
-      this.player.onFoot = false;
-      if (best.mine) {
-        this.setMessage(`Back in your ${best.model}.`);
-      } else {
-        this.carsStolen += 1;
-        this.addHeat(120); // stealing a car is a 1-star crime, visibly
-        this.setMessage(`You stole a ${best.model}! The cops are coming.`);
+  }
+  return best;
+}
+
+function nearestBoat(S, maxD) {
+  const P = S.player;
+  const boats = (S.water && S.water.boats) || [];
+  let best = null;
+  let bestD = maxD;
+  for (let i = 0; i < boats.length; i++) {
+    const b = boats[i];
+    const d = dist2d(P.x, P.z, b.x, b.z);
+    if (d < bestD) {
+      bestD = d;
+      best = b;
+    }
+  }
+  return best;
+}
+
+function stealCar(S, entry) {
+  entry.list.splice(entry.index, 1);
+  const car = entry.car;
+  car.engineLevel = S.upgrades.speed;
+  car.upgrade = S.upgrades.speed;
+  S.car = car;
+  S.player.onFoot = false;
+  S.player.x = car.x;
+  S.player.z = car.z;
+  S.player.heading = car.heading;
+  S.player.speed = car.speed || 0;
+  S.heat = Math.min(500, S.heat + 40);
+  setMessage(S, 'Nice wheels!');
+  pushEvent(S, 'pickup');
+}
+
+function exitCar(S) {
+  const car = S.car;
+  if (!car) return;
+  S.parkedCars.push(car);
+  S.car = null;
+  const side = 2.5;
+  S.player.x = car.x + Math.cos(car.heading) * side;
+  S.player.z = car.z - Math.sin(car.heading) * side;
+  S.player.heading = car.heading;
+  S.player.speed = 0;
+  S.player.onFoot = true;
+}
+
+function boardBoat(S, boat) {
+  const boats = S.water.boats;
+  const i = boats.indexOf(boat);
+  if (i >= 0) boats.splice(i, 1);
+  S.boat = boat;
+  S.player.onFoot = false;
+  S.player.x = boat.x;
+  S.player.z = boat.z;
+  S.player.heading = boat.heading || 0;
+  S.player.speed = boat.speed || 0;
+  setMessage(S, 'Speedboat ready — hold W to sail!');
+  pushEvent(S, 'splash');
+}
+
+function tryExitBoat(S) {
+  const boat = S.boat;
+  if (!boat) return;
+  // Cari titik darat terdekat di sekeliling boat; kalau tidak ada, tetap di boat.
+  for (let a = 0; a < 8; a++) {
+    const ang = (a / 8) * Math.PI * 2;
+    const x = boat.x + Math.sin(ang) * 5;
+    const z = boat.z + Math.cos(ang) * 5;
+    if (!isWater(S.city, x, z) && !solidAt(S.city, x, z)) {
+      S.water.boats.push(boat);
+      S.boat = null;
+      S.player.x = x;
+      S.player.z = z;
+      S.player.heading = boat.heading || 0;
+      S.player.speed = 0;
+      S.player.onFoot = true;
+      setMessage(S, 'Back on dry land.');
+      return;
+    }
+  }
+  setMessage(S, 'Too deep — sail to a dock!');
+}
+
+function garageAction(S) {
+  const lvl = S.upgrades.speed;
+  if (lvl < 3) {
+    const cost = ENGINE_COSTS[lvl];
+    if (S.money >= cost) {
+      S.money -= cost;
+      S.upgrades.speed = lvl + 1;
+      if (S.car) { S.car.engineLevel = S.upgrades.speed; S.car.upgrade = S.upgrades.speed; }
+      setMessage(S, `ENGINE Lv${lvl + 1} INSTALLED -$${cost}`);
+      pushEvent(S, 'cash');
+    } else {
+      setMessage(S, `Engine Lv${lvl + 1} costs $${cost} — you have $${S.money}`);
+    }
+    return;
+  }
+  if (S.heat >= 200 && S.money >= 200) {
+    S.money -= 200;
+    S.heat = 0;
+    setMessage(S, 'RESPRAY -$200 — heat cleared!');
+    pushEvent(S, 'cash');
+  } else if (S.heat >= 200) {
+    setMessage(S, `Respray costs $200 — you have $${S.money}`);
+  } else {
+    setMessage(S, 'Engine maxed. Respray needs heat 200+.');
+  }
+}
+
+function shopAction(S) {
+  const slot = S.weapons.slot;
+  if (slot === 0) {
+    if (S.money >= 100) {
+      S.money -= 100;
+      S.upgrades.armor = 100;
+      setMessage(S, 'ARMOR RESTORED -$100');
+      pushEvent(S, 'cash');
+    } else {
+      setMessage(S, `Armor costs $100 — you have $${S.money}`);
+    }
+    return;
+  }
+  const w = WEAPONS[slot];
+  const pack = { pistol: { cost: 40, n: 24 }, smg: { cost: 60, n: 40 }, shotgun: { cost: 50, n: 10 } }[w.ammoKey];
+  if (!pack) return;
+  if (S.money >= pack.cost) {
+    S.money -= pack.cost;
+    S.weapons.ammo[w.ammoKey] = (S.weapons.ammo[w.ammoKey] || 0) + pack.n;
+    setMessage(S, `${w.name} AMMO +${pack.n} -$${pack.cost}`);
+    pushEvent(S, 'cash');
+  } else {
+    setMessage(S, `${w.name} ammo costs $${pack.cost} — you have $${S.money}`);
+  }
+}
+
+function safehouseAction(S) {
+  saveGame(S);
+  S.health = 100;
+  setMessage(S, 'GAME SAVED — health restored');
+  pushEvent(S, 'cash');
+}
+
+function doInteract(S) {
+  const P = S.player;
+  if (S.boat) {
+    tryExitBoat(S);
+    return;
+  }
+  if (S.car) {
+    exitCar(S);
+    return;
+  }
+  const boat = nearestBoat(S, 9); // boats moor ~6.5u off the dock edge
+  if (boat) {
+    boardBoat(S, boat);
+    return;
+  }
+  const carEntry = nearestCarEntry(S, 4.5);
+  if (carEntry) {
+    stealCar(S, carEntry);
+    return;
+  }
+  if (dist2d(P.x, P.z, S.city.garage.x, S.city.garage.z) < 9) {
+    garageAction(S);
+    return;
+  }
+  if (dist2d(P.x, P.z, S.city.shop.x, S.city.shop.z) < 7) {
+    shopAction(S);
+    return;
+  }
+  if (dist2d(P.x, P.z, S.city.safehouse.x, S.city.safehouse.z) < 7) {
+    safehouseAction(S);
+    return;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Combat
+// ---------------------------------------------------------------------------
+function damageCop(S, cop, dmg) {
+  cop.hp -= dmg;
+  if (cop.hp <= 0) {
+    const i = S.cops.indexOf(cop);
+    if (i >= 0) S.cops.splice(i, 1);
+    S.heat = Math.min(500, S.heat + 60);
+    S.rep += 5;
+    setMessage(S, 'Cop down!');
+  }
+}
+
+function tryFire(S) {
+  const w = WEAPONS[S.weapons.slot];
+  if (!w || !w.ammoKey) return;
+  if (S.fireT > 0) return;
+  if ((S.weapons.ammo[w.ammoKey] || 0) <= 0) {
+    S.fireT = 0.3;
+    setMessage(S, `No ${w.name} ammo — visit the shop!`);
+    return;
+  }
+  S.weapons.ammo[w.ammoKey] -= 1;
+  S.fireT = w.rate;
+  S.heat = Math.min(500, S.heat + 2);
+  pushEvent(S, 'shoot');
+  const px = S.player.x;
+  const pz = S.player.z;
+  const h = S.player.heading;
+  let best = null;
+  let bestD = Infinity;
+  for (let i = 0; i < S.cops.length; i++) {
+    const c = S.cops[i];
+    const d = dist2d(px, pz, c.x, c.z);
+    if (d > w.range) continue;
+    const ang = Math.abs(wrapAngle(Math.atan2(c.x - px, c.z - pz) - h));
+    if (ang > w.cone) continue;
+    if (d < bestD) {
+      bestD = d;
+      best = c;
+    }
+  }
+  if (best) damageCop(S, best, w.damage);
+}
+
+function tryPunch(S) {
+  pushEvent(S, 'punch');
+  let best = null;
+  let bestD = Infinity;
+  for (let i = 0; i < S.cops.length; i++) {
+    const c = S.cops[i];
+    const d = dist2d(S.player.x, S.player.z, c.x, c.z);
+    if (d < 2.6 && d < bestD) {
+      bestD = d;
+      best = c;
+    }
+  }
+  if (best) {
+    S.heat = Math.min(500, S.heat + 5);
+    damageCop(S, best, 1);
+  }
+}
+
+function damagePlayer(S, dmg) {
+  if (S.health <= 0) return;
+  const absorbed = Math.min(S.upgrades.armor, dmg);
+  S.upgrades.armor -= absorbed;
+  S.health -= dmg - absorbed;
+  if (S.health <= 0) {
+    S.health = 0;
+    doWasted(S);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Wanted / polisi / BUSTED / WASTED
+// ---------------------------------------------------------------------------
+function releasePenalty(S, label) {
+  const penalty = Math.min(S.money, Math.max(50, Math.floor(S.money * 0.1)));
+  S.money -= penalty;
+  S.heat = 0;
+  S.stars = 0;
+  S.cops.length = 0;
+  S.heli.active = false;
+  S.health = 100;
+  S.bustedT = 0;
+  if (S.car) S.car = null;
+  if (S.boat) {
+    S.water.boats.push(S.boat);
+    S.boat = null;
+  }
+  S.player.x = S.city.safehouse.x + 3;
+  S.player.z = S.city.safehouse.z + 3;
+  S.player.heading = 0;
+  S.player.speed = 0;
+  S.player.onFoot = true;
+  S.mission = null;
+  S.nextMissionT = 4;
+  S.busted = true;
+  S.bustedFlashT = 3;
+  setMessage(S, `${label} -$${penalty} — released at the safehouse`);
+  pushEvent(S, 'siren');
+}
+
+function doBusted(S) {
+  releasePenalty(S, 'BUSTED!');
+}
+
+function doWasted(S) {
+  releasePenalty(S, 'WASTED!');
+}
+
+function spawnCop(S, desired) {
+  const carCops = S.cops.filter((c) => c.kind === 'car').length;
+  const wantCar = S.stars >= 2 && carCops < Math.floor(desired / 2);
+  for (let tries = 0; tries < 8; tries++) {
+    const a = S.rng.range(0, Math.PI * 2);
+    const d = 45 + S.rng.range(0, 20);
+    const x = S.player.x + Math.sin(a) * d;
+    const z = S.player.z + Math.cos(a) * d;
+    if (solidAt(S.city, x, z)) continue;
+    if (wantCar) {
+      const car = createCar(x, z, S.rng.range(0, Math.PI * 2), 'sedan', '#1c2f5e');
+      car.speed = 0;
+      S.cops.push({ x, z, heading: car.heading, speed: 0, hp: 3, kind: 'car', car });
+    } else {
+      S.cops.push({ x, z, heading: 0, speed: 0, hp: 3, kind: 'foot', car: null });
+    }
+    return;
+  }
+}
+
+function updateCops(S, dt) {
+  const desired = [0, 2, 4, 6, 8, 10][S.stars] || 0;
+  if (desired === 0) {
+    if (S.cops.length) S.cops.length = 0;
+  } else {
+    S.copSpawnT -= dt;
+    if (S.cops.length < desired && S.copSpawnT <= 0) {
+      S.copSpawnT = 0.7;
+      spawnCop(S, desired);
+    }
+    for (let i = S.cops.length - 1; i >= 0; i--) {
+      if (dist2d(S.cops[i].x, S.cops[i].z, S.player.x, S.player.z) > 140) {
+        S.cops.splice(i, 1);
       }
     }
   }
 
-  step(dt, input, camYaw) {
-    if (this.state !== 'playing') return;
-    this.time += dt;
-    if (this.messageT > 0) this.messageT -= dt;
-    if (this.dialog && this.dialog.t > 0) this.dialog.t -= dt;
-    if (this.shootT > 0) this.shootT -= dt;
-    for (const t of this.tracers) t.t -= dt;
-    this.tracers = this.tracers.filter((t) => t.t > 0);
-    for (const p of this.popups) p.t -= dt;
-    this.popups = this.popups.filter((p) => p.t > 0);
-
-    // Move the player or their car.
-    const others = [...this.traffic, ...this.police, ...this.parked];
-    let crash = null;
-    if (this.playerCar) {
-      crash = stepPlayerCar(this.playerCar, input, dt, this.colliders, others);
-      // A wall crash is a crime (+12 heat, less with armour); bumping
-      // another car is just a bump (+6, and only a hard one) — it must not
-      // ratchet the heat up faster than outrunning the police can bring it down.
-      const armorCut = 1 - 0.25 * (this.playerCar.upgrades?.armor || 0);
-      if (crash.wallImpact > 12) {
-        this.addHeat(Math.round(12 * armorCut));
-        this.setMessage('Crash!');
-      } else if (crash.carBump > 18) {
-        this.addHeat(Math.round(6 * armorCut));
-        this.setMessage('Crash!');
+  let nearest = Infinity;
+  for (let i = 0; i < S.cops.length; i++) {
+    const c = S.cops[i];
+    const dx = S.player.x - c.x;
+    const dz = S.player.z - c.z;
+    const d = Math.hypot(dx, dz) || 1;
+    if (d < nearest) nearest = d;
+    if (c.kind === 'foot') {
+      const sp = 8;
+      const nx = c.x + (dx / d) * sp * dt;
+      const nz = c.z + (dz / d) * sp * dt;
+      if (!solidAt(S.city, nx, nz)) {
+        c.x = nx;
+        c.z = nz;
+      } else if (!solidAt(S.city, nx, c.z)) {
+        c.x = nx;
+      } else if (!solidAt(S.city, c.x, nz)) {
+        c.z = nz;
       }
-      // A finished drift pays: $50 times the multiplier (seconds held).
-      // v4: the bar is 0.5 s, not 0.8 s — a stock car with the lighter
-      // handbrake can now actually hold a slide long enough to cash in.
-      if (this.playerCar.driftEnded && (this.playerCar.driftT || 0) > 0.5) {
-        const mult = Math.min(5, 1 + Math.floor(this.playerCar.driftT));
-        const pay = 50 * mult;
-        this.money += pay;
-        this.drifts += 1;
-        this.addPopup(`DRIFT ×${mult}  +$${pay}`);
-        this.playerCar.driftT = 0;
-      }
-      if (this.ramCooldown > 0) this.ramCooldown -= dt;
-      // Hitting a police car is a bigger crime — but only when the player
-      // drives INTO the cop. A cop ramming the player from behind is the
-      // cop's doing, not a crime, so it adds no heat.
-      const pvx = Math.sin(this.playerCar.heading) * this.playerCar.speed;
-      const pvz = Math.cos(this.playerCar.heading) * this.playerCar.speed;
-      for (const cop of this.police) {
-        if (cop.down) continue;
-        const dx = cop.x - this.playerCar.x;
-        const dz = cop.z - this.playerCar.z;
-        const d = Math.hypot(dx, dz);
-        const closing = d > 0.001 ? (pvx * dx + pvz * dz) / d : 0;
-        if (d < CAR_RADIUS * 2 && closing > 8 && this.ramCooldown <= 0) {
-          this.addHeat(15);
-          this.ramCooldown = 2;
-          this.setMessage('You rammed a cop car!');
-        }
-      }
+      c.heading = Math.atan2(dx, dz);
+      c.speed = sp;
+      if (d < 2.5) damagePlayer(S, 6 * dt);
     } else {
-      stepPlayer(this.player, input, camYaw, dt, this.colliders, others);
-    }
-
-    stepTraffic(this.traffic, dt, this.rng, this.playerCar, this.playerCar ? null : this.player);
-
-    // Near miss: threading past traffic at speed pays $50 (once per car).
-    if (this.playerCar && Math.abs(this.playerCar.speed) > 20) {
-      for (const car of this.traffic) {
-        if (car.nmT > 0) {
-          car.nmT -= dt;
-          continue;
-        }
-        const d = Math.hypot(car.x - this.playerCar.x, car.z - this.playerCar.z);
-        if (d > CAR_RADIUS * 2 && d < 7) {
-          this.money += 50;
-          this.nearMisses += 1;
-          this.addPopup('NEAR MISS  +$50');
-          car.nmT = 5;
-        }
+      const wantH = Math.atan2(dx, dz);
+      c.heading = turnToward(c.heading, wantH, 2.4 * dt);
+      // Mobil polisi dibatasi 9 u/s saat pemain jalan kaki, supaya pemain
+      // bisa kabur dengan sprint 12 u/s. Saat pemain di mobil, kejar 22 u/s.
+      const maxSp = S.player.onFoot ? 9 : 22;
+      const wantSp = d > 25 ? maxSp : 6;
+      c.speed += clamp(wantSp - c.speed, -14 * dt, 10 * dt);
+      const nx = c.x + Math.sin(c.heading) * c.speed * dt;
+      const nz = c.z + Math.cos(c.heading) * c.speed * dt;
+      if (!solidAt(S.city, nx, nz)) {
+        c.x = nx;
+        c.z = nz;
+      } else if (!solidAt(S.city, nx, c.z)) {
+        c.x = nx;
+      } else if (!solidAt(S.city, c.x, nz)) {
+        c.z = nz;
       }
-    } else {
-      for (const car of this.traffic) if (car.nmT > 0) car.nmT -= dt;
-    }
-
-    // Pedestrians walk the block perimeters; a car hit knocks one down.
-    for (const ped of this.pedestrians) {
-      if (ped.state === 'down') {
-        ped.downT -= dt;
-        if (ped.downT <= 0) {
-          Object.assign(ped, this.spawnPedestrian());
-        }
-        continue;
+      if (c.car) {
+        c.car.x = c.x;
+        c.car.z = c.z;
+        c.car.heading = c.heading;
+        c.car.speed = c.speed;
       }
-      ped.walkPhase += ped.speed * dt * 2.2;
-      const b = ped.block;
-      const per = 2 * (b.x1 - b.x0) + 2 * (b.z1 - b.z0);
-      ped.along += (ped.dir * ped.speed * dt) / per;
-      if (ped.along > 1) ped.along -= 1;
-      if (ped.along < 0) ped.along += 1;
-      const d = ped.along * per;
-      const w = b.x1 - b.x0;
-      const h = b.z1 - b.z0;
-      let x;
-      let z;
-      let heading;
-      if (d < w) {
-        x = b.x0 + d; z = b.z0; heading = Math.PI / 2;
-      } else if (d < w + h) {
-        x = b.x1; z = b.z0 + (d - w); heading = 0;
-      } else if (d < 2 * w + h) {
-        x = b.x1 - (d - w - h); z = b.z1; heading = -Math.PI / 2;
-      } else {
-        x = b.x0; z = b.z1 - (d - 2 * w - h); heading = Math.PI;
-      }
-      if (ped.dir < 0) heading += Math.PI;
-      ped.x = x;
-      ped.z = z;
-      ped.heading = heading;
-      if (this.playerCar) {
-        const dist = Math.hypot(ped.x - this.playerCar.x, ped.z - this.playerCar.z);
-        if (dist < 2 && Math.abs(this.playerCar.speed) > 3) {
-          ped.state = 'down';
-          ped.downT = 4;
-          this.pedsHit += 1;
-          this.addHeat(40);
-          this.setMessage('You hit a pedestrian!');
-        }
-      }
-    }
-
-    // Cash, ammo and stash pickups.
-    const px = this.playerCar ? this.playerCar.x : this.player.x;
-    const pz = this.playerCar ? this.playerCar.z : this.player.z;
-    for (const coin of this.pickups) {
-      coin.spin += dt * 1.5;
-      if (coin.taken) {
-        coin.respawn -= dt;
-        // Job drops and stash packs never come back: a taken stash stays taken.
-        if (coin.respawn <= 0 && coin.kind !== 'job' && coin.kind !== 'stash') {
-          const p = randomRoadPoint(this.rng);
-          coin.x = p.x;
-          coin.z = p.z;
-          coin.taken = false;
-        }
-        continue;
-      }
-      if (dist2(coin.x, coin.z, px, pz) < 2.4 * 2.4) {
-        coin.taken = true;
-        coin.respawn = 20;
-        if (coin.kind === 'cash') {
-          coin.amount = coin.amount || 25;
-          this.money += coin.amount;
-          this.coinsCollected += 1;
-          this.setMessage(`+$${coin.amount} cash!`);
-        } else if (coin.kind === 'stash') {
-          // A hidden stash pack: $100, a rep bump, and a popup — the hunt
-          // pays better than a road coin, and it never respawns.
-          this.money += coin.amount || 100;
-          this.stashesCollected += 1;
-          this.addPopup(`STASH PACK  +$${coin.amount || 100}`);
-          this.setMessage(`Stash pack found! ${this.stashesCollected}/${this.stashTotal} collected.`);
-        } else if (coin.kind === 'ammo') {
-          this.ammo[coin.ammoType] += coin.amount;
-          const first = !this.unlocked[coin.ammoType];
-          this.unlocked[coin.ammoType] = true;
-          if (first) this.weaponIndex = WEAPONS.findIndex((w) => w.key === coin.ammoType);
-          this.setMessage(`Picked up ${coin.amount} ${coin.ammoType.toUpperCase()} rounds!`);
-        } else if (coin.kind === 'job' && coin.jobActive) {
-          this.coinsCollected += 1;
-          this.completeStage();
-        }
-      }
-    }
-
-    // The mission: stage objectives, and the timer that fails the job.
-    const stage = MISSIONS[this.missionIndex].stages[this.stageIndex];
-    if (stage) {
-      this.missionTimeLeft -= dt;
-      let done = false;
-      if (stage.kind === 'steal') done = !!this.playerCar;
-      else if (stage.kind === 'hide') done = this.heat < 50;
-      else if (stage.kind !== 'collect' && this.jobTarget) {
-        done = Math.hypot(this.jobTarget.x - px, this.jobTarget.z - pz) < 7;
-      }
-      if (done) this.completeStage();
-      else if (this.missionTimeLeft <= 0) {
-        this.missionTimeLeft = 0;
-        this.failMission();
-      }
-    }
-
-    // Where the player is: district name, and the three fixed places.
-    this.district = districtAt(px, pz).name;
-    this.nearGarage = Math.hypot(px - PLACES.garage.x, pz - PLACES.garage.z) < 9;
-    this.nearShop = Math.hypot(px - PLACES.shop.x, pz - PLACES.shop.z) < 9;
-    this.nearSafehouse = Math.hypot(px - PLACES.safehouse.x, pz - PLACES.safehouse.z) < 8;
-    if (this.nearSafehouse) {
-      // The safehouse heals, re-arms the armour and bleeds the heat away.
-      this.player.health = Math.min(100, this.player.health + 25 * dt);
-      this.armour = Math.min(100, this.armour + 5 * dt);
-      if (this.heat > 0) {
-        this.heat = Math.max(0, this.heat - 60 * dt);
-        this.updateStars();
-      }
-    } else if (this.stars === 0) {
-      this.player.health = Math.min(100, this.player.health + 3 * dt);
-    }
-
-    // A cop car shoving the player on foot hurts — armour soaks 60% first.
-    if (!this.playerCar && this.player.hurtT <= 0) {
-      for (const cop of this.police) {
-        if (cop.down) continue;
-        if (Math.hypot(cop.x - px, cop.z - pz) < 2.4 && Math.abs(cop.speed) > 3) {
-          const armorCut = 1 - 0.25 * this.upgrades.armor;
-          const dmg = 12 * armorCut;
-          const absorbed = Math.min(this.armour, dmg * 0.6);
-          this.armour -= absorbed;
-          this.player.health -= (dmg - absorbed);
-          this.player.hurtT = 1;
-          this.setMessage('A cop shoved you!');
-          if (this.player.health <= 0) {
-            this.player.health = 0;
-            this.state = 'busted';
-            this.setMessage('BUSTED!');
-          }
-          break;
-        }
-      }
-    }
-
-    // Wanted: police numbers follow the stars, heat fades when hidden.
-    // Hidden means no cop within 45 units: heat bleeds away slowly at
-    // once, and faster once you have stayed hidden for 2 seconds — so
-    // outrunning the police on a straight road (your car is faster than
-    // theirs) really does cool you off. But heat does NOT fade while a cop
-    // is closing in on you: a 1-star cop must be able to reach a player
-    // who just stole a car, or the wanted level evaporates before the
-    // police ever arrive. In the middle band heat only falls when the
-    // nearest cop is losing ground (or stuck), never while it gains.
-    // The helicopter's spotlight halves every fade rate while it is up.
-    const fade = this.heli ? 0.5 : 1;
-    let nearestCop = Infinity;
-    for (const cop of this.police) {
-      if (cop.down) continue;
-      nearestCop = Math.min(nearestCop, Math.hypot(cop.x - px, cop.z - pz));
-    }
-    const closing = nearestCop < this.prevNearestCop - 0.05;
-    this.prevNearestCop = nearestCop;
-    if (this.heat > 0 && nearestCop > 45) {
-      this.escapeTimer += dt;
-      this.heat = Math.max(0, this.heat - 3 * fade * dt);
-      // The fast "hidden" decay only when the cop is not gaining on you:
-      // a cop closing in from 60 units away is still on its way, and the
-      // heat must survive long enough for it to arrive.
-      if (this.escapeTimer > 2 && !closing) this.heat = Math.max(0, this.heat - 14 * fade * dt);
-    } else if (this.heat > 0 && nearestCop > 15 && !closing) {
-      this.escapeTimer = 0;
-      this.heat = Math.max(0, this.heat - 8 * fade * dt);
-    } else {
-      this.escapeTimer = 0;
-    }
-    this.updateStars();
-    const want = this.stars;
-    while (this.police.length < want) {
-      // Spawn on a road intersection 40-75 units from the player, so the
-      // cop starts on a road it can actually drive from. A random angle
-      // clamped to the world bounds could strand it 100+ units away near
-      // the beach edge, where the heat drains before it ever arrives.
-      let x = 0;
-      let z = 0;
-      let ok = false;
-      for (let tries = 0; tries < 20 && !ok; tries += 1) {
-        x = LINES[this.rng.int(0, LINES.length - 1)];
-        z = LINES[this.rng.int(0, LINES.length - 1)];
-        const d = Math.hypot(x - px, z - pz);
-        ok = d >= 40 && d <= 75;
-      }
-      if (!ok) {
-        const angle = this.rng.range(0, Math.PI * 2);
-        const dist = this.rng.range(45, 65);
-        x = clamp(px + Math.sin(angle) * dist, WORLD.minX + 5, 186);
-        z = clamp(pz + Math.cos(angle) * dist, WORLD.minZ + 5, WORLD.maxZ - 5);
-      }
-      const cop = createPoliceCar(x, z);
-      cop.name = `UNIT ${10 + (this.copSerial % 80)}`;
-      this.copSerial += 1;
-      this.police.push(cop);
-    }
-    while (this.police.length > want) this.police.pop();
-    // Down cops leave after their timer: stepPolice counts it down.
-    this.police = this.police.filter((c) => !(c.down && c.downT <= 0));
-    // At 4+ stars one unit runs a roadblock: it drives to a point ahead of
-    // the player and waits there instead of chasing from behind.
-    if (want >= 4) {
-      let rb = this.police.find((c) => c.mode === 'roadblock' && !c.down);
-      if (!rb) rb = this.police.find((c) => !c.down);
-      for (const c of this.police) c.mode = c === rb ? 'roadblock' : 'chase';
-    } else {
-      for (const c of this.police) c.mode = 'chase';
-    }
-    const pHeading = this.playerCar ? this.playerCar.heading : this.player.heading;
-    const aheadX = px + Math.sin(pHeading) * 30;
-    const aheadZ = pz + Math.cos(pHeading) * 30;
-    let closeCops = 0;
-    for (const cop of this.police) {
-      cop.dist = Math.hypot(cop.x - px, cop.z - pz);
-      if (cop.dist < 22) closeCops += 1;
-    }
-    for (const cop of this.police) {
-      if (cop.down) {
-        cop.tactic = 'DOWN';
-        stepPolice(cop, px, pz, dt, this.colliders, others, !this.playerCar);
-        continue;
-      }
-      if (cop.mode === 'roadblock') cop.tactic = 'ROADBLOCK';
-      else if (cop.dist < 10 && Math.abs(cop.speed) > 12) cop.tactic = 'RAMMING';
-      else if (closeCops >= 3 && cop.dist < 22) cop.tactic = 'BOXING IN';
-      else cop.tactic = 'PURSUIT';
-      const tx = cop.mode === 'roadblock' ? aheadX : px;
-      const tz = cop.mode === 'roadblock' ? aheadZ : pz;
-      stepPolice(cop, tx, tz, dt, this.colliders, others, !this.playerCar);
-    }
-
-    // The helicopter: up at 3+ stars, circling overhead with a spotlight.
-    if (want >= 3 && !this.heli) {
-      this.heli = createHeli(px + 30, pz - 30);
-    } else if (want < 3) {
-      this.heli = null;
-    }
-    if (this.heli) stepHeli(this.heli, px, pz, dt);
-
-    // Busted: a cop sits on you while you are slow. The speed that counts is
-    // the one you are driving at, not speed a ramming cop pushed into you.
-    // v4 (playtest): on foot the arrest is fairer — the cop must stay
-    // closer (5 units, not 6) and hold you longer (4.5 s, not 3 s), and the
-    // player now sprints at 12 u/s against a cop's 9, so a running player
-    // can actually break away instead of being busted mid-stride.
-    const mySpeed = this.playerCar
-      ? Math.abs(this.playerCar.drivenSpeed ?? this.playerCar.speed)
-      : this.player.speed;
-    const bustDist = this.playerCar ? 6 : 5;
-    const bustLimit = this.playerCar ? 3 : 4.5;
-    if (want > 0 && nearestCop < bustDist && mySpeed < 4) {
-      this.bustTimer += dt;
-      if (this.bustTimer > bustLimit) {
-        this.state = 'busted';
-        this.setMessage('BUSTED!');
-      }
-    } else {
-      this.bustTimer = Math.max(0, this.bustTimer - dt * 2);
+      if (d < 3.5) damagePlayer(S, 4 * dt);
     }
   }
 
-  restart() {
-    this.rng = createRng(this.seed);
-    this.time = 0;
-    this.money = 0;
-    this.heat = 0;
-    this.jobsDone = 0;
-    this.carsStolen = 0;
-    this.pedsHit = 0;
-    this.copsDowned = 0;
-    this.coinsCollected = 0;
-    this.stashesCollected = 0;
-    this.nearMisses = 0;
-    this.drifts = 0;
-    this.bustTimer = 0;
-    this.escapeTimer = 0;
-    this.prevNearestCop = Infinity;
-    this.ramCooldown = 0;
-    this.starLevel = 0;
-    this.missionIndex = 0;
-    this.stageIndex = 0;
-    this.missionCycle = 0;
-    this.doneThisCycle = MISSIONS.map(() => false);
-    this.districtJobs = {};
-    this.district = 'Old Town';
-    this.heli = null;
-    this.copSerial = 0;
-    this.weaponIndex = 0;
-    this.ammo = { pistol: 0, shotgun: 0, smg: 0 };
-    this.unlocked = { pistol: false, shotgun: false, smg: false };
-    this.shootT = 0;
-    this.tracers = [];
-    this.shotsFired = 0;
-    this.swings = 0;
-    this.buys = 0;
-    this.denied = 0;
-    this.armour = 0;
-    this.upgrades = { speed: 0, armor: 0, handling: 0 };
-    this.popups = [];
-    this.dialog = null;
-    this.player = createPlayer(-8, 24);
-    this.playerCar = null;
-    this.city = generateCity(this.rng);
-    this.colliders = buildingColliders(this.city);
-    this.resetWorld();
-    this.state = 'playing';
+  // Aturan BUSTED yang adil: hanya tertangkap bila polisi < 5 unit DAN
+  // kecepatan pemain < 4 selama 4,5 detik berturut-turut.
+  const pSpeed = S.player.speed || 0;
+  if (nearest < 5 && pSpeed < 4) {
+    S.bustedT += dt;
+  } else {
+    S.bustedT = Math.max(0, S.bustedT - dt * 2);
+  }
+  if (S.bustedT >= 4.5) doBusted(S);
+
+  // Helikopter AIR-1 muncul saat bintang >= 3, mengikuti pemain.
+  // Hover DI DEPAN pemain (searah heading), bukan di (x+12, z+12) yang
+  // arbitrer — supaya heli terlihat di depan kamera saat kejar-kejaran.
+  if (S.stars >= 3) {
+    S.heli.active = true;
+    const k = 1 - Math.exp(-dt * 1.5);
+    const hd = (S.player && S.player.heading) || 0;
+    const tx = S.player.x + Math.sin(hd) * 30;
+    const tz = S.player.z + Math.cos(hd) * 30;
+    S.heli.x += (tx - S.heli.x) * k;
+    S.heli.z += (tz - S.heli.z) * k;
+    S.heli.dist = dist2d(S.heli.x, S.heli.z, S.player.x, S.player.z);
+  } else {
+    S.heli.active = false;
+  }
+}
+
+// Pejalan kaki: jalan pelan, belok acak / saat mentok dinding (wall-slide
+// sederhana: coba maju, bila terhalang belok 90 derajat).
+function updatePeds(S, dt) {
+  const peds = S.peds || [];
+  for (let i = 0; i < peds.length; i++) {
+    const p = peds[i];
+    p.turnT -= dt;
+    if (p.turnT <= 0) {
+      p.turnT = 2 + S.rng.range(0, 4);
+      p.heading = wrapAngle(p.heading + S.rng.range(-1.2, 1.2));
+    }
+    const nx = p.x + Math.sin(p.heading) * p.speed * dt;
+    const nz = p.z + Math.cos(p.heading) * p.speed * dt;
+    if (!solidAt(S.city, nx, nz)) {
+      p.x = nx;
+      p.z = nz;
+    } else {
+      p.heading = wrapAngle(p.heading + Math.PI / 2);
+      p.turnT = 1;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Loop utama game
+// ---------------------------------------------------------------------------
+export function stepGame(S, input, dt) {
+  const inp = input || {};
+  if (!(dt > 0)) dt = 0.016;
+  if (dt > 0.05) dt = 0.05;
+
+  // --- jam game: 1 jam per 30 detik nyata, mulai 18:00 DUSK ---
+  S.gameTime += dt;
+  S.time += dt / 30;
+  if (S.time >= 24) {
+    S.time -= 24;
+    S.day += 1;
+  }
+  S.weatherT += dt;
+  if (S.weatherT > 150) {
+    S.weatherT = 0;
+    if (S.rng.chance(0.3)) S.weather = S.rng.pick(['clear', 'cloudy', 'rain']);
+  }
+  S.district = districtAt(S.city, S.player.x, S.player.z);
+  S.repLevel = repLevelName(S.rep);
+
+  // --- wanted: bintang dari heat, heat meluruh pelan (tidak saat escape) ---
+  S.stars = starsFor(S.heat);
+  const escaping =
+    S.mission && S.mission.stageDef && S.mission.stageDef.type === 'escape';
+  if (S.heat > 0) {
+    if (escaping) {
+      if (S.heat < 200) S.heat = 200;
+    } else if (S.heli.active) {
+      S.heat = Math.max(0, S.heat - 1 * dt);
+    } else {
+      S.heat = Math.max(0, S.heat - 2.5 * dt);
+    }
+  }
+
+  // --- ganti senjata (1..4) ---
+  if (inp.slot >= 1 && inp.slot <= 4) {
+    const ns = inp.slot - 1;
+    if (ns !== S.weapons.slot) {
+      S.weapons.slot = ns;
+      const w = WEAPONS[ns];
+      if (w.ammoKey) setMessage(S, `${w.name} — ${S.weapons.ammo[w.ammoKey]} ammo`);
+      else setMessage(S, 'Fists');
+    }
+  }
+
+  // --- interaksi (E) ---
+  if (inp.interact) doInteract(S);
+
+  // --- gerak: boat / mobil / jalan kaki ---
+  if (S.boat) {
+    stepBoat(S.boat, inp, dt, S.city);
+    S.player.x = S.boat.x;
+    S.player.z = S.boat.z;
+    S.player.heading = S.boat.heading;
+    S.player.speed = S.boat.speed || 0;
+    S.player.onFoot = false;
+  } else if (S.car) {
+    stepCar(S.car, inp, dt, S.city);
+    S.player.x = S.car.x;
+    S.player.z = S.car.z;
+    S.player.heading = S.car.heading;
+    S.player.speed = S.car.speed || 0;
+    S.player.onFoot = false;
+    // Drift payout: stepCar records it in car.driftPayout (50 per drift
+    // >= 0.5s). Claim it here exactly once, then zero it.
+    if (S.car.driftPayout > 0) {
+      const payout = S.car.driftPayout;
+      S.car.driftPayout = 0;
+      S.money += payout;
+      S.totalEarned += payout;
+      S.rep += 2;
+      setPopup(S, `DRIFT x${S.car.driftCount} +$${payout}`);
+      pushEvent(S, 'cash');
+    }
+  } else {
+    stepPlayer(S.player, inp, dt, S.city);
+  }
+
+  // --- combat (hanya jalan kaki) ---
+  S.fireT = Math.max(0, S.fireT - dt);
+  if (!S.car && !S.boat) {
+    if (inp.shoot && S.weapons.slot > 0) tryFire(S);
+    if (inp.punch) tryPunch(S);
+  }
+
+  // --- dunia: traffic, taksi, air, pejalan kaki ---
+  stepTraffic(S.traffic, S, dt);
+  stepTaxi(S.taxi, S, dt);
+  stepWater(S.water, S, dt);
+  updatePeds(S, dt);
+
+  // --- fare taksi: jobs.js menambahkan ke S.money dan mengisi T.lastFare ---
+  if (S.taxi && typeof S.taxi.lastFare === 'number' && S.taxi.lastFare > 0) {
+    setPopup(S, `TAXI FARE +$${S.taxi.lastFare}`);
+    S.rep += 5;
+    S.taxi.lastFare = 0;
+  }
+
+  // --- stash: 6 paket tersembunyi, +$100 tiap paket (jalan kaki) ---
+  if (!S.car && !S.boat) {
+    for (let i = 0; i < S.city.stashes.length; i++) {
+      if (S.stashes[i]) continue;
+      const st = S.city.stashes[i];
+      if (dist2d(S.player.x, S.player.z, st.x, st.z) < 3) {
+        S.stashes[i] = true;
+        S.stashCount++;
+        S.money += 100;
+        S.totalEarned += 100;
+        S.rep += 10;
+        setPopup(S, 'STASH PACK +$100');
+        pushEvent(S, 'pickup');
+      }
+    }
+  }
+
+  // --- misi ---
+  updateMission(S, dt);
+
+  // --- polisi + heli + BUSTED ---
+  updateCops(S, dt);
+
+  // --- regen darah pelan saat tidak diburu ---
+  if (S.stars === 0 && S.health > 0 && S.health < 100) {
+    S.health = Math.min(100, S.health + 2 * dt);
+  }
+
+  // --- timer pesan / popup / busted ---
+  if (S.messageT > 0) {
+    S.messageT -= dt;
+    if (S.messageT <= 0) S.message = '';
+  }
+  if (S.popupT > 0) {
+    S.popupT -= dt;
+    if (S.popupT <= 0) S.popup = '';
+  }
+  if (S.bustedFlashT > 0) {
+    S.bustedFlashT -= dt;
+    if (S.bustedFlashT <= 0) S.busted = false;
   }
 }

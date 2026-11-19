@@ -1,168 +1,127 @@
-// Tiny 3D math kit for Sunset Bay: column-major 4x4 matrices in the WebGL
-// layout, plain [x, y, z] vectors, and a few angle helpers the driving and
-// camera code leans on. No dependencies, no allocations beyond the matrix
-// each call returns.
+// Sunset Bay v5 — 3D vector and matrix math.
+// Written fresh for v5 from the design spec. Vectors are plain [x, y, z] arrays.
+// Matrices are flat 16-element arrays in COLUMN-MAJOR order (WebGL convention):
+// element (row r, column c) lives at index c * 4 + r, so a translation sits at
+// indices 12, 13, 14. matMul(a, b) returns a * b (apply b first, then a).
 
-/** A fresh 4x4 identity matrix. */
-export function matIdentity() {
-  const out = new Float32Array(16);
-  out[0] = 1;
-  out[5] = 1;
-  out[10] = 1;
-  out[15] = 1;
-  return out;
+export function vec(x, y, z) {
+  return [x, y, z];
 }
 
-/** Perspective projection: fovY in radians, near/far clip planes. */
-export function matPerspective(fovY, aspect, near, far) {
-  const f = 1 / Math.tan(fovY / 2);
-  const depth = near - far;
-  const out = new Float32Array(16);
-  out[0] = f / aspect;
-  out[5] = f;
-  out[10] = (far + near) / depth;
-  out[11] = -1;
-  out[14] = (2 * far * near) / depth;
-  return out;
+export function vadd(a, b) {
+  return [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
 }
 
-/** Camera matrix looking from `eye` at `target`, with `up` as the up hint. */
-export function matLookAt(eye, target, up) {
-  // Forward axis: eye minus target, normalised.
-  let fx = eye[0] - target[0];
-  let fy = eye[1] - target[1];
-  let fz = eye[2] - target[2];
-  let inv = 1 / (Math.hypot(fx, fy, fz) || 1);
-  fx *= inv; fy *= inv; fz *= inv;
-  // Right axis: up cross forward.
-  let rx = up[1] * fz - up[2] * fy;
-  let ry = up[2] * fx - up[0] * fz;
-  let rz = up[0] * fy - up[1] * fx;
-  inv = 1 / (Math.hypot(rx, ry, rz) || 1);
-  rx *= inv; ry *= inv; rz *= inv;
-  // True up: forward cross right.
-  const ux = fy * rz - fz * ry;
-  const uy = fz * rx - fx * rz;
-  const uz = fx * ry - fy * rx;
-  const out = new Float32Array(16);
-  out[0] = rx; out[1] = ux; out[2] = fx; out[3] = 0;
-  out[4] = ry; out[5] = uy; out[6] = fy; out[7] = 0;
-  out[8] = rz; out[9] = uz; out[10] = fz; out[11] = 0;
-  out[12] = -(rx * eye[0] + ry * eye[1] + rz * eye[2]);
-  out[13] = -(ux * eye[0] + uy * eye[1] + uz * eye[2]);
-  out[14] = -(fx * eye[0] + fy * eye[1] + fz * eye[2]);
-  out[15] = 1;
-  return out;
+export function vsub(a, b) {
+  return [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 }
 
-/** Model matrix: move to (x, y, z), spin around Y by `yaw`, scale evenly. */
-export function matModel(yaw, x, y, z, scale = 1) {
-  const c = Math.cos(yaw);
-  const s = Math.sin(yaw);
-  const out = new Float32Array(16);
-  out[0] = c * scale; out[1] = 0; out[2] = -s * scale; out[3] = 0;
-  out[4] = 0; out[5] = scale; out[6] = 0; out[7] = 0;
-  out[8] = s * scale; out[9] = 0; out[10] = c * scale; out[11] = 0;
-  out[12] = x; out[13] = y; out[14] = z; out[15] = 1;
-  return out;
+export function vscale(a, s) {
+  return [a[0] * s, a[1] * s, a[2] * s];
 }
 
-/** Model matrix with a pitch as well: yaw around Y, then pitch around X. */
-export function matModelTilt(yaw, pitch, x, y, z, scale = 1) {
-  const cy = Math.cos(yaw);
-  const sy = Math.sin(yaw);
-  const cp = Math.cos(pitch);
-  const sp = Math.sin(pitch);
-  const out = new Float32Array(16);
-  out[0] = cy * scale; out[1] = 0; out[2] = -sy * scale; out[3] = 0;
-  out[4] = sy * sp * scale; out[5] = cp * scale; out[6] = cy * sp * scale; out[7] = 0;
-  out[8] = sy * cp * scale; out[9] = -sp * scale; out[10] = cy * cp * scale; out[11] = 0;
-  out[12] = x; out[13] = y; out[14] = z; out[15] = 1;
-  return out;
+export function vdot(a, b) {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
-/** Model matrix with a separate scale per axis — stretching a unit mesh,
- * such as a tracer, to its real length. */
-export function matModelScale(yaw, x, y, z, sx, sy, sz) {
-  const c = Math.cos(yaw);
-  const s = Math.sin(yaw);
-  const out = new Float32Array(16);
-  out[0] = c * sx; out[1] = 0; out[2] = -s * sx; out[3] = 0;
-  out[4] = 0; out[5] = sy; out[6] = 0; out[7] = 0;
-  out[8] = s * sz; out[9] = 0; out[10] = c * sz; out[11] = 0;
-  out[12] = x; out[13] = y; out[14] = z; out[15] = 1;
-  return out;
+export function vcross(a, b) {
+  return [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
 }
 
-/** The upper-left 3x3 of a model matrix, for rotating surface normals. */
-export function matNormalOf(model) {
-  return new Float32Array([
-    model[0], model[1], model[2],
-    model[4], model[5], model[6],
-    model[8], model[9], model[10],
-  ]);
+export function vlen(a) {
+  return Math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
 }
 
-/** Clamp a number into [lo, hi]. */
+export function vnorm(a) {
+  const len = vlen(a);
+  if (len === 0) return [0, 0, 0];
+  return [a[0] / len, a[1] / len, a[2] / len];
+}
+
 export function clamp(v, lo, hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
   return v;
 }
 
-/** Clamp a number into [0, 1] — bar widths, fades, progress fills. */
-export function clamp01(v) {
-  if (v < 0) return 0;
-  if (v > 1) return 1;
-  return v;
-}
-
-/** Shortest signed turn from angle `from` to angle `to`, in (-PI, PI]. */
-export function angleDelta(from, to) {
-  let d = (to - from) % (Math.PI * 2);
-  if (d > Math.PI) d -= Math.PI * 2;
-  if (d <= -Math.PI) d += Math.PI * 2;
-  return d;
-}
-
-/** Move angle `from` toward `to` by no more than `maxStep` radians. */
-export function turnToward(from, to, maxStep) {
-  const d = angleDelta(from, to);
-  if (Math.abs(d) <= maxStep) return to;
-  return from + Math.sign(d) * maxStep;
-}
-
-/** Linear interpolation with t clamped to [0, 1]. */
 export function lerp(a, b, t) {
-  const k = clamp01(t);
-  return a + (b - a) * k;
+  return a + (b - a) * t;
 }
 
-/** Smoothstep edge: 0 below `lo`, 1 above `hi`, eased between. */
-export function smoothstep(lo, hi, v) {
-  const k = clamp01((v - lo) / (hi - lo));
-  return k * k * (3 - 2 * k);
+// Wrap an angle in radians to the range [-PI, PI].
+export function wrapAngle(a) {
+  const twoPi = Math.PI * 2;
+  let r = (a + Math.PI) % twoPi;
+  if (r < 0) r += twoPi;
+  return r - Math.PI;
 }
 
-/** Squared distance on the ground plane, for cheap range checks. */
-export function dist2(ax, az, bx, bz) {
-  const dx = ax - bx;
-  const dz = az - bz;
-  return dx * dx + dz * dz;
+// Horizontal (XZ-plane) distance between two points.
+export function dist2d(ax, az, bx, bz) {
+  const dx = bx - ax;
+  const dz = bz - az;
+  return Math.sqrt(dx * dx + dz * dz);
 }
 
-/** Component-wise lerp between two [r, g, b] colours. */
-export function lerpColor(a, b, t) {
-  const k = clamp01(t);
+export function matIdentity() {
   return [
-    a[0] + (b[0] - a[0]) * k,
-    a[1] + (b[1] - a[1]) * k,
-    a[2] + (b[2] - a[2]) * k,
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    0, 0, 0, 1,
   ];
 }
 
-/** Normalise a [x, y, z] vector; [0, 1, 0] when the input is near zero. */
-export function vecNormalize(v) {
-  const len = Math.hypot(v[0], v[1], v[2]) || 1;
-  return [v[0] / len, v[1] / len, v[2] / len];
+// Column-major multiply: out = a * b.
+export function matMul(a, b) {
+  const out = new Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      let sum = 0;
+      for (let k = 0; k < 4; k++) {
+        sum += a[k * 4 + r] * b[c * 4 + k];
+      }
+      out[c * 4 + r] = sum;
+    }
+  }
+  return out;
+}
+
+// Rotation about the Y axis (right-handed, positive angle turns +Z toward +X).
+export function matRotY(a) {
+  const c = Math.cos(a);
+  const s = Math.sin(a);
+  return [
+    c, 0, -s, 0,
+    0, 1, 0, 0,
+    s, 0, c, 0,
+    0, 0, 0, 1,
+  ];
+}
+
+export function matTrans(x, y, z) {
+  return [
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    x, y, z, 1,
+  ];
+}
+
+// Apply a 4x4 matrix to a 3D point (w = 1), with perspective divide when needed.
+export function matApply(m, v) {
+  const x = v[0];
+  const y = v[1];
+  const z = v[2];
+  const w =
+    m[3] * x + m[7] * y + m[11] * z + m[15];
+  const ox = m[0] * x + m[4] * y + m[8] * z + m[12];
+  const oy = m[1] * x + m[5] * y + m[9] * z + m[13];
+  const oz = m[2] * x + m[6] * y + m[10] * z + m[14];
+  if (w !== 0 && w !== 1) return [ox / w, oy / w, oz / w];
+  return [ox, oy, oz];
 }

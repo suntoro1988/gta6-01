@@ -1,70 +1,78 @@
-// The player on foot: WASD moves relative to the camera, Shift runs,
-// E gets in and out of cars (the car logic lives in game.js).
-import { WORLD } from './city.js';
-import { collideCircle, CAR_RADIUS } from './vehicles.js';
-import { clamp, turnToward } from './math3.js';
+// player.js — gerakan jalan kaki untuk Sunset Bay v5 (bounty make.fun).
+// Ditulis SEPENUHNYA BARU dari design-spec round4 di dalam sesi recording v5.
+// Tidak ada kode yang disalin dari round sebelumnya.
+import { wrapAngle } from './math3.js';
 
-export function createPlayer(x, z) {
-  return {
-    x,
-    z,
-    heading: 0,
-    speed: 0,
-    moving: false,
-    bob: 0,
-    onFoot: true,
-    health: 100, // 0 = busted; restored at the safehouse, slowly when cool
-    punchT: 0, // melee swing cooldown (also drives the punch lean in render)
-    hurtT: 0, // invulnerable window after a cop shoves the player
-  };
-}
+export const WALK_SPEED = 6;
+export const SPRINT_SPEED = 12;
 
-// One step on foot. camYaw is the camera orbit angle (see main.js).
-export function stepPlayer(p, input, camYaw, dt, colliders, cars) {
-  if (p.punchT > 0) p.punchT -= dt;
-  if (p.hurtT > 0) p.hurtT -= dt;
-  const fwd = (input.forward ? 1 : 0) - (input.back ? 1 : 0);
-  const strafe = (input.right ? 1 : 0) - (input.left ? 1 : 0);
-  // Camera forward on the ground is (-sin yaw, -cos yaw); right is (cos yaw, -sin yaw).
-  const fx = -Math.sin(camYaw);
-  const fz = -Math.cos(camYaw);
-  const rx = Math.cos(camYaw);
-  const rz = -Math.sin(camYaw);
-  let dx = fx * fwd + rx * strafe;
-  let dz = fz * fwd + rz * strafe;
-  const len = Math.hypot(dx, dz);
-  p.moving = len > 0.01;
-  if (p.moving) {
-    dx /= len;
-    dz /= len;
-    // v4 (playtest): sprint is 12 u/s, not 10 — a cop chasing on foot tops
-    // out at 9, so a player who actually runs now pulls away instead of
-    // being caught mid-stride. Walking stays at 6.
-    const targetSpeed = input.run ? 12 : 6;
-    p.speed += clamp(targetSpeed - p.speed, -30 * dt, 14 * dt);
-    const targetHeading = Math.atan2(dx, dz);
-    // Sprinting turns a touch sharper and bobs faster — running should
-    // feel like running, not a faster walk.
-    p.heading = turnToward(p.heading, targetHeading, (input.run ? 12 : 10) * dt);
-    p.x += dx * p.speed * dt;
-    p.z += dz * p.speed * dt;
-    p.bob += p.speed * dt * (input.run ? 2.1 : 1.7);
-  } else {
-    p.speed = Math.max(0, p.speed - 30 * dt);
+// Cek apakah titik (x, z) terhalang: di luar batas kota, di dalam gedung, atau di air.
+function blockedAt(city, x, z) {
+  if (city && city.bounds) {
+    const b = city.bounds;
+    if (x < b.minX + 0.5 || x > b.maxX - 0.5 || z < b.minZ + 0.5 || z > b.maxZ - 0.5) return true;
   }
-  const fixed = collideCircle(p.x, p.z, 0.6, colliders);
-  p.x = fixed.x;
-  p.z = fixed.z;
-  for (const car of cars) {
-    const dxc = p.x - car.x;
-    const dzc = p.z - car.z;
-    const d = Math.hypot(dxc, dzc);
-    const min = CAR_RADIUS + 0.5;
-    if (d < min && d > 0.001) {
-      p.x = car.x + (dxc / d) * min;
-      p.z = car.z + (dzc / d) * min;
+  if (city && city.buildings) {
+    for (let i = 0; i < city.buildings.length; i++) {
+      const bd = city.buildings[i];
+      if (Math.abs(x - bd.x) < bd.w / 2 + 0.6 && Math.abs(z - bd.z) < bd.d / 2 + 0.6) return true;
     }
   }
-  p.x = clamp(p.x, WORLD.minX, Math.min(WORLD.maxX, 186)); // never walk on the water
-  p.z = clamp(p.z, WORLD.minZ, WORLD.maxZ);
+  if (city && city.water) {
+    for (let i = 0; i < city.water.length; i++) {
+      const w = city.water[i];
+      if (Math.abs(x - w.x) < w.w / 2 && Math.abs(z - w.z) < w.d / 2) return true;
+    }
+  }
+  return false;
+}
+
+function turnToward(cur, target, maxStep) {
+  let d = wrapAngle(target - cur);
+  if (d > maxStep) d = maxStep;
+  else if (d < -maxStep) d = -maxStep;
+  return cur + d;
+}
+
+export function createPlayer(x, z) {
+  return { x, z, heading: 0, speed: 0, onFoot: true };
+}
+
+// Gerak jalan kaki. Input: {up, down, left, right, sprint, camYaw}.
+// Gerak relatif terhadap arah kamera (camYaw, radian). Sprint 12 u/s, jalan 6 u/s.
+// Tabrakan memakai wall-slide: coba gerak penuh, kalau terhalang coba per sumbu,
+// jadi pemain meluncur sepanjang dinding, bukan macet menempel dinding.
+export function stepPlayer(P, input, dt, city) {
+  const inp = input || {};
+  const yaw = typeof inp.camYaw === 'number' ? inp.camYaw : P.heading;
+  let mx = 0;
+  let mz = 0;
+  if (inp.up) { mx += Math.sin(yaw); mz += Math.cos(yaw); }
+  if (inp.down) { mx -= Math.sin(yaw); mz -= Math.cos(yaw); }
+  if (inp.left) { mx -= Math.cos(yaw); mz += Math.sin(yaw); }
+  if (inp.right) { mx += Math.cos(yaw); mz -= Math.sin(yaw); }
+  const len = Math.hypot(mx, mz);
+  const targetSpeed = len > 0 ? (inp.sprint ? SPRINT_SPEED : WALK_SPEED) : 0;
+  let moved = 0;
+  if (len > 0) {
+    mx /= len;
+    mz /= len;
+    const wantHeading = Math.atan2(mx, mz);
+    P.heading = turnToward(P.heading, wantHeading, 12 * dt);
+    const nx = P.x + mx * targetSpeed * dt;
+    const nz = P.z + mz * targetSpeed * dt;
+    if (!blockedAt(city, nx, nz)) {
+      moved = Math.hypot(nx - P.x, nz - P.z);
+      P.x = nx;
+      P.z = nz;
+    } else if (!blockedAt(city, nx, P.z)) {
+      moved = Math.abs(nx - P.x);
+      P.x = nx;
+    } else if (!blockedAt(city, P.x, nz)) {
+      moved = Math.abs(nz - P.z);
+      P.z = nz;
+    }
+  }
+  P.speed = dt > 0 ? moved / dt : 0;
+  P.onFoot = true;
 }

@@ -1,56 +1,72 @@
-// Sunset Bay: a make.fun gta6-01 entry (Node 22, standard library only).
+// Sunset Bay v5 — main.ts (Builder E)
+// Node 22 entrypoint for the make.fun build.
+// Reads MAKEFUN_OUTPUT_DIR (default /output), copies game/ + screenshots/
+// into it, then writes dossier.json via vendor/makefun-game.ts buildDossier.
+// vendor/makefun-game.ts is kit code — never edited here.
 //
-// The game itself is this directory's game/ folder: plain static files a
-// desktop browser loads offline — game/index.html and its ES modules, a
-// raw-WebGL renderer written for this game, no library and no network
-// request at all. This program stages the entry: it copies game/ and
-// screenshots/ from beside this file into /output and writes
-// /output/dossier.json, the summary the judge reads, using the vendored
-// make.fun library.
-//
-// Serve it locally with `node serve.ts`, then open http://localhost:8080.
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// buildDossier signature (kit): buildDossier(dir, caps) -> Uint8Array
+//   dir  = directory holding game/ and screenshots/ (here: the output dir)
+//   caps = limits from the bounty gates (spec section 6):
+//          text ≤ 160 KiB, screenshots ≤ 4 files × 256 KiB,
+//          game ≤ 993 files / 48 MiB, path names ≤ 1000 bytes.
 
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { cp, mkdir, writeFile, access } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
-const here = fileURLToPath(new URL('.', import.meta.url));
-const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(here);
 
-mkdirSync(out, { recursive: true });
-cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
-mkdirSync(join(out, 'screenshots'), { recursive: true });
-if (existsSync(join(here, 'screenshots'))) {
-  cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
-}
+// Caps from the bounty gates (design-spec.md section 6).
+const CAPS = {
+  text_max_bytes: 163840, // 160 KiB of dossier text
+  screenshots: { max: 4, max_bytes: 262144 }, // 4 files, 256 KiB each
+  game_max_files: 993,
+  game_max_bytes: 50331648, // 48 MiB
+  game_path_max_bytes: 1000,
+};
 
-// Warn (don't fail) when a staged screenshot is missing, so a half-staged
-// entry is obvious before the dossier is written.
-if (existsSync(join(here, 'shots.json'))) {
-  const wanted = JSON.parse(readFileSync(join(here, 'shots.json'), 'utf-8'));
-  const staged = existsSync(join(here, 'screenshots')) ? readdirSync(join(here, 'screenshots')) : [];
-  for (const shot of wanted) {
-    if (!staged.includes(shot.name)) {
-      console.warn(`warning: missing screenshot ${shot.name} (${shot.query})`);
-    }
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path, fsConstants.F_OK);
+    return true;
+  } catch {
+    return false;
   }
 }
 
-// The scorer's own caps (reference/gate.json): only text_max_bytes shapes
-// the bytes; the others refuse an entry the scorer would refuse — more than
-// 4 screenshots or one over 256 KiB; more than 993 files in game/ or 48 MiB
-// of game files in all, or a path under game/ over 1000 bytes. game/ counts
-// beside /output's own 1000-entry cap, with its screenshots/ and dossier.json.
-writeFileSync(
-  join(out, 'dossier.json'),
-  buildDossier(out, {
-    text_max_bytes: 163840,
-    screenshots: { max: 4, max_bytes: 262144 },
-    game_max_files: 993,
-    game_max_bytes: 50331648,
-    game_path_max_bytes: 1000,
-  }),
-);
+async function main(): Promise<void> {
+  const outputDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
+  const out = resolve(outputDir);
+
+  await mkdir(out, { recursive: true });
+
+  // 1. Copy the playable game (static files, no build step).
+  const gameSrc = join(repoRoot, 'game');
+  const gameDst = join(out, 'game');
+  await cp(gameSrc, gameDst, { recursive: true });
+
+  // 2. Copy screenshots when present (the render step may run before this).
+  const shotsSrc = join(repoRoot, 'screenshots');
+  const shotsDst = join(out, 'screenshots');
+  if (await exists(shotsSrc)) {
+    await cp(shotsSrc, shotsDst, { recursive: true });
+  } else {
+    await mkdir(shotsDst, { recursive: true });
+  }
+
+  // 3. Build the dossier with the kit helper and write it out.
+  const dossierBytes = buildDossier(out, CAPS);
+  const dossierPath = join(out, 'dossier.json');
+  await writeFile(dossierPath, dossierBytes);
+
+  console.log(`Sunset Bay v5 packaged to ${out}`);
+  console.log(`dossier written to ${dossierPath} (${dossierBytes.length} bytes)`);
+}
+
+main().catch((err: unknown) => {
+  console.error('make.fun build failed:', err);
+  process.exit(1);
+});

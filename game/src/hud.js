@@ -1,476 +1,565 @@
-// The HUD: cash, wanted stars + TRACE heat bar, rep, the mission card,
-// the police response panel, radio widget, weapon slots, health/armour,
-// speedometer, a minimap, the crew dialog card, score popups, the steal /
-// interact prompts, the crosshair, and the full-screen city map (Tab).
-// All DOM except the two map canvases; the 3D view stays a plain canvas
-// underneath. The crosshair element is created here (not in index.html),
-// so this file owns it end to end.
-import { CITY_MAX, BEACH_X, PLACES, LINES, districtAt } from './city.js';
-import { clamp01 } from './math3.js';
+// hud.js — Sunset Bay v5 (Builder D)
+// HUD DOM + minimap + peta layar penuh (Tab) + crosshair + pesan/popup.
+// Modul mandiri, tanpa impor. Semua akses DOM defensif: elemen yang tidak
+// ada diabaikan, supaya HUD tidak pernah melempar error saat integrasi.
+// Ditulis fresh dari design-spec, sesi recording 01a1f13f-5466-77cb-9088-12e78d473c06.
 
-const MAP_SIZE = 150;
-const WORLD_SPAN = 400;
+'use strict';
 
-function worldToMap(x, z, size = MAP_SIZE) {
-  return [
-    ((x + WORLD_SPAN / 2) / WORLD_SPAN) * size,
-    ((z + WORLD_SPAN / 2) / WORLD_SPAN) * size,
-  ];
+// ---------- daftar misi (dari spec bagian 4, 18 misi berantai) ----------
+export const MISSION_LIST = [
+  { name: 'First Wheels', reward: 100 },
+  { name: 'Package Run', reward: 250 },
+  { name: 'Street Race', reward: 400 },
+  { name: 'Getaway Driver', reward: 350 },
+  { name: 'Night Shift', reward: 300 },
+  { name: 'Repo Man', reward: 450 },
+  { name: 'Hot Wheels', reward: 500 },
+  { name: "Smuggler's Run", reward: 700 },
+  { name: 'VIP Escort', reward: 600 },
+  { name: 'Chase the Sunset', reward: 550 },
+  { name: 'The Big Heist', reward: 800 },
+  { name: 'Last Call', reward: 650 },
+  { name: 'Pier Pressure', reward: 850 },
+  { name: 'Beach Run', reward: 950 },
+  { name: 'Midnight Courier', reward: 1100 },
+  { name: 'Harbor Lights', reward: 900 },
+  { name: 'Dockside Deal', reward: 1000 },
+  { name: 'Sunset Heist', reward: 1500 },
+];
+
+// Nama distrik fallback bila S.city belum tersedia (posisi grid kasar,
+// hanya dipakai bila city tidak ada — posisi asli selalu dari S.city).
+const FALLBACK_DISTRICTS = [
+  { name: 'Downtown', cx: 0, cz: -10, r: 26, color: '#7fb3ff' },
+  { name: 'Old Town', cx: -45, cz: 5, r: 22, color: '#d9a066' },
+  { name: 'Southside', cx: -40, cz: 55, r: 24, color: '#9a9a9a' },
+  { name: 'Hillcrest', cx: 45, cz: -55, r: 24, color: '#c98a4b' },
+  { name: 'Beachfront', cx: -70, cz: -45, r: 22, color: '#f2d38a' },
+  { name: 'The Pier', cx: -85, cz: 0, r: 16, color: '#8ecae6' },
+  { name: 'Sunset Mall', cx: 40, cz: 15, r: 24, color: '#e26fb5' },
+  { name: 'Marina Bay', cx: 70, cz: -20, r: 24, color: '#4ecdc4' },
+  { name: 'Northside', cx: 30, cz: -70, r: 24, color: '#9be15d' },
+  { name: 'Uptown', cx: 55, cz: 45, r: 24, color: '#b8a7ff' },
+];
+
+const WEAPON_NAMES = ['Fists', 'Pistol', 'SMG', 'Shotgun'];
+
+// ---------- util ----------
+function $(id) {
+  if (typeof document === 'undefined') return null;
+  return document.getElementById(id);
+}
+function setText(el, text) {
+  if (el && el.textContent !== String(text)) el.textContent = String(text);
+}
+function moneyFmt(n) {
+  const v = Math.floor(Number(n) || 0);
+  return '$' + v.toLocaleString('en-US');
+}
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+function phaseFor(hour) {
+  const h = ((Number(hour) || 0) % 24 + 24) % 24;
+  if (h >= 5 && h < 7) return 'DAWN';
+  if (h >= 7 && h < 17) return 'DAY';
+  if (h >= 17 && h < 19) return 'DUSK';
+  return 'NIGHT';
+}
+function clockText(hour) {
+  const h = ((Number(hour) || 0) % 24 + 24) % 24;
+  const hh = Math.floor(h);
+  const mm = Math.floor((h - hh) * 60);
+  const pad = (n) => (n < 10 ? '0' + n : '' + n);
+  return pad(hh) + ':' + pad(mm);
+}
+function repName(rep) {
+  // Must match game.js repLevelName: KINGPIN >= 1000, HUSTLER >= 300.
+  // (rep here is the numeric REP score, +100 per mission.)
+  const r = Number(rep) || 0;
+  if (r >= 1000) return 'KINGPIN';
+  if (r >= 300) return 'HUSTLER';
+  return 'ROOKIE';
+}
+function getTime(S) {
+  if (S == null) return 18;
+  if (typeof S.time === 'number') return S.time;
+  if (typeof S.hour === 'number') return S.hour;
+  if (typeof S.tod === 'number') return S.tod;
+  return 18;
+}
+function getMoney(S) { return (S && typeof S.money === 'number') ? S.money : ((S && typeof S.cash === 'number') ? S.cash : 0); }
+function getStars(S) {
+  if (!S) return 0;
+  if (typeof S.stars === 'number') return S.stars;
+  if (typeof S.wanted === 'number') return S.wanted;
+  if (typeof S.heat === 'number') return clamp(Math.floor(S.heat / 100), 0, 5);
+  return 0;
+}
+function getMissionIndex(S) {
+  if (!S) return 0;
+  if (typeof S.missionIndex === 'number') return S.missionIndex;
+  if (typeof S.mission === 'number') return S.mission;
+  if (typeof S.missionsDone === 'number') return S.missionsDone;
+  if (typeof S.missionsCompleted === 'number') return S.missionsCompleted;
+  return 0;
+}
+function getDistrict(S) {
+  if (!S) return '';
+  if (typeof S.district === 'string' && S.district) return S.district;
+  if (S.player && typeof S.player.district === 'string') return S.player.district;
+  return '';
+}
+function getPlayerPos(S) {
+  if (S && S.player) return { x: S.player.x || 0, z: S.player.z || 0, heading: S.player.heading || 0 };
+  return { x: 0, z: 0, heading: 0 };
+}
+function isOnFoot(S) {
+  if (!S) return true;
+  if (S.player && typeof S.player.onFoot === 'boolean') return S.player.onFoot;
+  if (typeof S.onFoot === 'boolean') return S.onFoot;
+  if (typeof S.inCar === 'boolean') return !S.inCar;
+  return !S.car;
+}
+function getWeaponIndex(S) {
+  if (!S) return 0;
+  // Canonical shape (game.js): S.weapons = { slot, ammo: {pistol, smg, shotgun} }
+  if (S.weapons && typeof S.weapons.slot === 'number') return S.weapons.slot;
+  if (typeof S.weaponIndex === 'number') return S.weaponIndex;
+  if (typeof S.weapon === 'number') return S.weapon;
+  if (S.player && typeof S.player.weapon === 'number') return S.player.weapon;
+  return 0;
+}
+function getAmmo(S, i) {
+  if (!S) return null;
+  // Canonical: S.weapons.ammo keyed lowercase ('pistol','smg','shotgun').
+  if (S.weapons && S.weapons.ammo && typeof S.weapons.ammo === 'object') {
+    if (i === 0) return Infinity;
+    const key = ['fists', 'pistol', 'smg', 'shotgun'][i];
+    const v = S.weapons.ammo[key];
+    return typeof v === 'number' ? v : null;
+  }
+  const list = S.ammo || S.ammos || (S.player && S.player.ammo);
+  if (Array.isArray(list)) return list[i];
+  if (list && typeof list === 'object') return list[i] ?? list[WEAPON_NAMES[i].toLowerCase()];
+  return null;
+}
+function isPlaying(S) {
+  if (!S) return false;
+  // Canonical phase field (main.js sets S.phase = 'title'|'playing'|'paused').
+  if (typeof S.phase === 'string') return S.phase === 'playing';
+  const st = S.state || S.mode || S.screen;
+  if (typeof st === 'string') return st === 'playing' || st === 'play';
+  return true;
 }
 
-// Shared map painter: the 150px minimap and the 520px full-screen map.
-// big adds district colours + names and the POI markers.
-function drawMap(ctx, game, size, big) {
-  const s = size / WORLD_SPAN;
-  ctx.fillStyle = '#101018';
-  ctx.fillRect(0, 0, size, size);
-  // Ocean and sand on the east edge.
-  const [bx] = worldToMap(CITY_MAX, 0, size);
-  ctx.fillStyle = '#2a6ea8';
-  ctx.fillRect(worldToMap(BEACH_X, 0, size)[0], 0, size, size);
-  ctx.fillStyle = '#c9b078';
-  ctx.fillRect(bx, 0, worldToMap(BEACH_X, 0, size)[0] - bx, size);
-  // Ground: light, so roads and buildings read at a glance.
-  ctx.fillStyle = '#7d7d88';
-  ctx.fillRect(0, 0, bx, size);
-  if (big) {
-    // District washes, one per block, from the real district lookup.
-    ctx.font = `bold ${Math.round(size / 34)}px Trebuchet MS, sans-serif`;
-    ctx.textAlign = 'center';
-    for (let ix = 0; ix < 6; ix += 1) {
-      for (let iz = 0; iz < 6; iz += 1) {
-        const [mx, my] = worldToMap(LINES[ix] + 6, LINES[iz] + 6, size);
-        const d = districtAt(LINES[ix] + 26, LINES[iz] + 26);
-        ctx.fillStyle = `rgba(${(d.colors[0][0] * 255) | 0},${(d.colors[0][1] * 255) | 0},${(d.colors[0][2] * 255) | 0},0.28)`;
-        ctx.fillRect(mx, my, 40 * s, 40 * s);
-      }
+// ---------- elemen DOM (di-cache bindHud) ----------
+let els = null;
+let messageTimer = null;
+let popupTimer = null;
+
+const CANDIDATES = {
+  money: ['money', 'cash', 'hud-money'],
+  stars: ['stars', 'wanted', 'hud-stars'],
+  rep: ['rep', 'hud-rep', 'rep-level'],
+  mission: ['mission', 'hud-mission', 'mission-label'],
+  district: ['district', 'hud-district'],
+  clock: ['clock', 'hud-clock', 'time'],
+  heat: ['heat', 'hud-heat'],
+  stash: ['stash', 'hud-stash'],
+  weapons: ['weapons', 'weapon-slots', 'hud-weapons'],
+  radio: ['radio', 'radio-widget', 'hud-radio'],
+  crosshair: ['crosshair'],
+  message: ['message', 'hud-message', 'mission-message'],
+  popup: ['popup', 'hud-popup'],
+  minimap: ['minimap', 'hud-minimap'],
+  fullmap: ['fullmap', 'map-canvas', 'full-map'],
+  mapOverlay: ['map-overlay', 'fullmap-overlay', 'map'],
+  mapMissions: ['map-mission-list', 'map-missions', 'fullmap-missions'],
+  mapStats: ['map-stats', 'fullmap-stats'],
+};
+
+function pickFirst(ids) {
+  for (let i = 0; i < ids.length; i++) {
+    const el = $(ids[i]);
+    if (el) return el;
+  }
+  return null;
+}
+
+export function bindHud(S) {
+  els = {};
+  for (const key in CANDIDATES) els[key] = pickFirst(CANDIDATES[key]);
+  // Widget radio JANGAN menutupi klik tembak: pointer-events none.
+  // (Aturan ini juga ada di CSS Builder E; di sini dipastikan via JS.)
+  if (els.radio) {
+    els.radio.style.pointerEvents = 'none';
+    const kids = els.radio.querySelectorAll ? els.radio.querySelectorAll('*') : [];
+    for (let i = 0; i < kids.length; i++) kids[i].style.pointerEvents = 'none';
+  }
+  if (els.crosshair) els.crosshair.style.pointerEvents = 'none';
+  if (S) S._hudBound = true;
+  return els;
+}
+
+function ensureEls() {
+  if (!els) els = {};
+  for (const key in CANDIDATES) {
+    if (!els[key]) els[key] = pickFirst(CANDIDATES[key]);
+  }
+  return els;
+}
+
+// ---------- update HUD ----------
+export function updateHud(S) {
+  if (!S) return;
+  ensureEls();
+
+  setText(els.money, moneyFmt(getMoney(S)));
+
+  const stars = getStars(S);
+  if (els.stars) {
+    let s = '';
+    for (let i = 0; i < 5; i++) s += i < stars ? '★' : '☆';
+    setText(els.stars, s);
+    els.stars.style.color = stars >= 3 ? '#ff4444' : (stars > 0 ? '#ffcc00' : '#ffffff');
+  }
+
+  const rep = (S.rep != null ? S.rep : (S.repLevel != null ? S.repLevel : 0));
+  setText(els.rep, repName(rep) + ' · REP ' + Math.floor(Number(rep) || 0));
+
+  const mi = clamp(getMissionIndex(S), 0, 18);
+  const missionName = (S.missionName && typeof S.missionName === 'string')
+    ? S.missionName
+    : (mi < 18 ? MISSION_LIST[mi].name : 'All missions done');
+  setText(els.mission, (mi >= 18 ? '18/18 · DONE' : (mi + 1) + '/18 · ' + missionName));
+
+  setText(els.district, getDistrict(S) || 'Sunset Bay');
+
+  // Heat + stash pills (index.html has #hud-heat / #hud-stash; without
+  // this they stay stuck at their static initial text).
+  setText(els.heat, 'HEAT ' + Math.floor(Number((S && S.heat) || 0)));
+  const stashGot = (S && Array.isArray(S.stashes)) ? S.stashes.filter(Boolean).length
+    : ((S && typeof S.stashCount === 'number') ? S.stashCount : 0);
+  setText(els.stash, 'STASH ' + stashGot + '/6');
+
+  const hour = getTime(S);
+  setText(els.clock, clockText(hour) + ' ' + phaseFor(hour));
+
+  // Slot senjata + ammo.
+  if (els.weapons) {
+    const wi = getWeaponIndex(S);
+    let html = '';
+    for (let i = 0; i < 4; i++) {
+      const ammo = getAmmo(S, i);
+      const ammoTxt = i === 0 ? '∞' : (ammo == null ? '—' : String(ammo));
+      const active = i === wi ? ' active' : '';
+      html += '<span class="weapon-slot' + active + '" data-slot="' + i + '">'
+        + (i + 1) + ' ' + WEAPON_NAMES[i] + ' ' + ammoTxt + '</span>';
     }
-    // Name each district once, near its middle block.
-    const spots = [
-      ['Old Town', -130, -130], ['Downtown', -26, -130], ['Marina', 130, -130],
-      ['West End', -130, -26], ['The Strip', 130, -26], ['Southside', -130, 26],
-      ['Midtown', -26, 78], ['Harbor South', 104, 104],
-      ['Hillcrest', -130, 130],
-    ];
-    ctx.fillStyle = 'rgba(255,255,255,0.85)';
-    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-    ctx.lineWidth = 3;
-    for (const [name, x, z] of spots) {
-      const [mx, my] = worldToMap(x, z, size);
-      ctx.strokeText(name, mx, my);
-      ctx.fillText(name, mx, my);
+    if (els.weapons.innerHTML !== html) els.weapons.innerHTML = html;
+  }
+
+  // Widget radio: nama stasiun (+ lagu bila tersedia).
+  if (els.radio) {
+    let station = 'BAY FM';
+    if (S.audio && typeof S.audio.stationName === 'function') {
+      try { station = S.audio.stationName(S.audio) || station; } catch (e) { /* abaikan */ }
+    } else if (typeof S.stationName === 'string') station = S.stationName;
+    else if (S.audio && typeof S.audio.station === 'number') {
+      station = ['BAY FM', 'SUNSET DRIVE', 'NEON NIGHTS', 'PALM COURT', 'TIDE FM'][S.audio.station] || station;
+    }
+    const song = (S.audio && S.audio.currentSong) || S.radioSong || '';
+    const label = song ? station + ' — ' + song : station;
+    const muted = S.audio && S.audio.muted;
+    setText(els.radio, (muted ? '🔇 ' : '♪ ') + label);
+  }
+
+  // Crosshair: tampil HANYA saat jalan kaki + bersenjata (bukan tinju),
+  // sembunyi di mobil / title / pause / tinju.
+  if (els.crosshair) {
+    const armed = getWeaponIndex(S) > 0;
+    const show = isPlaying(S) && isOnFoot(S) && armed;
+    els.crosshair.style.display = show ? 'block' : 'none';
+  }
+
+  // NOTE: main.js owns the Tab map overlay (class 'show'). Do NOT set
+  // inline display here — updateHud runs every frame and would override
+  // the class, making the map impossible to open.
+}
+
+// ---------- minimap ----------
+function worldToMap(x, z, bounds, w, h, margin) {
+  const minX = bounds.minX, maxX = bounds.maxX;
+  const minZ = bounds.minZ, maxZ = bounds.maxZ;
+  const sx = (w - margin * 2) / Math.max(1, maxX - minX);
+  const sy = (h - margin * 2) / Math.max(1, maxZ - minZ);
+  const s = Math.min(sx, sy);
+  const ox = margin + ((w - margin * 2) - (maxX - minX) * s) / 2;
+  const oy = margin + ((h - margin * 2) - (maxZ - minZ) * s) / 2;
+  return { x: ox + (x - minX) * s, y: oy + (z - minZ) * s, s: s };
+}
+
+export function drawMinimap(S, canvas) {
+  const cv = canvas || (els && els.minimap) || $('minimap');
+  // Individual stat cells in index.html (#map-money, #map-missions, ...).
+  const mi2 = clamp(getMissionIndex(S), 0, 18);
+  const stashGot2 = (S && Array.isArray(S.stashes)) ? S.stashes.filter(Boolean).length
+    : ((S && typeof S.stashFound === 'number') ? S.stashFound : 0);
+  setText($('map-money'), moneyFmt(getMoney(S)));
+  setText($('map-missions'), mi2 + ' / 18');
+  setText($('map-rep'), repName(S && S.rep));
+  setText($('map-stash'), stashGot2 + ' / 6');
+  setText($('map-wanted'), getStars(S) + ' ★');
+  if (!cv || typeof cv.getContext !== 'function') return;
+  const ctx = cv.getContext('2d');
+  if (!ctx) return;
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const city = (S && S.city) || null;
+  const bounds = (city && city.bounds) || { minX: -110, maxX: 110, minZ: -110, maxZ: 110 };
+  const m = 6;
+  const toMap = (x, z) => worldToMap(x, z, bounds, W, H, m);
+
+  // Latar: darat gelap, air biru.
+  ctx.fillStyle = '#12241c';
+  ctx.fillRect(0, 0, W, H);
+  if (city && city.water) {
+    ctx.fillStyle = '#1d5f8a';
+    for (let i = 0; i < city.water.length; i++) {
+      const w = city.water[i];
+      const a = toMap(w.x - (w.w || 0) / 2, w.z - (w.d || 0) / 2);
+      const b = toMap(w.x + (w.w || 0) / 2, w.z + (w.d || 0) / 2);
+      ctx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y);
     }
   }
-  // Buildings: darker than the ground.
-  ctx.fillStyle = '#3f3f4c';
-  for (const b of game.city.buildings) {
-    const [mx, my] = worldToMap(b.x - b.w / 2, b.z - b.d / 2, size);
-    ctx.fillRect(mx, my, Math.max(1, b.w * s), Math.max(1, b.d * s));
-  }
-  // Roads: pale strips.
-  ctx.strokeStyle = '#e8e8ec';
-  ctx.lineWidth = big ? 8 : 6;
-  for (let k = -156; k <= 156; k += 52) {
-    const [mx] = worldToMap(k, 0, size);
-    ctx.beginPath();
-    ctx.moveTo(mx, 0);
-    ctx.lineTo(mx, size);
-    ctx.stroke();
-    const [, my] = worldToMap(0, k, size);
-    ctx.beginPath();
-    ctx.moveTo(0, my);
-    ctx.lineTo(size, my);
-    ctx.stroke();
-  }
-  // Places: garage / shop / safehouse.
-  if (big) {
-    const marks = [
-      [PLACES.garage, '#ff9a3c', 'GARAGE'],
-      [PLACES.shop, '#2dd44f', 'SHOP'],
-      [PLACES.safehouse, '#5a8cff', 'SAFEHOUSE'],
-    ];
-    ctx.font = `bold ${Math.round(size / 44)}px Trebuchet MS, sans-serif`;
-    for (const [p, color, label] of marks) {
-      const [mx, my] = worldToMap(p.x, p.z, size);
-      ctx.fillStyle = color;
-      ctx.fillRect(mx - 6, my - 6, 12, 12);
-      ctx.strokeStyle = '#000';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(mx - 6, my - 6, 12, 12);
-      ctx.fillStyle = '#fff';
-      ctx.strokeStyle = 'rgba(0,0,0,0.7)';
-      ctx.lineWidth = 3;
-      ctx.strokeText(label, mx, my - 12);
-      ctx.fillText(label, mx, my - 12);
+  // Jalan.
+  if (city && city.roads) {
+    ctx.strokeStyle = 'rgba(200,200,200,0.55)';
+    ctx.lineWidth = 2;
+    for (let i = 0; i < city.roads.length; i++) {
+      const r = city.roads[i];
+      const a = toMap(r.x1, r.z1), b = toMap(r.x2, r.z2);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
-  } else {
-    ctx.fillStyle = '#ff9a3c';
-    const [gx, gy] = worldToMap(PLACES.garage.x, PLACES.garage.z, size);
-    ctx.fillRect(gx - 2, gy - 2, 4, 4);
-    ctx.fillStyle = '#5a8cff';
-    const [hx, hy] = worldToMap(PLACES.safehouse.x, PLACES.safehouse.z, size);
-    ctx.fillRect(hx - 2, hy - 2, 4, 4);
   }
-  // Waypoint: bigger, pulsing.
-  if (game.jobTarget) {
-    const [wx, wy] = worldToMap(game.jobTarget.x, game.jobTarget.z, size);
-    const pulse = (big ? 8 : 5) + Math.sin(game.time * 5) * 2;
-    ctx.fillStyle = '#ffd23e';
-    ctx.beginPath();
-    ctx.arc(wx, wy, pulse + 2, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = '#7a5c00';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
+  // Target misi (kuning, berdenyut). Live mission target wins.
+  const target = (S && ((S.mission && S.mission.target) || S.missionTarget || S.target)) || null;
+  if (target && typeof target.x === 'number') {
+    const p = toMap(target.x, target.z);
+    const pulse = 4 + Math.sin(Date.now() / 250) * 1.5;
+    ctx.fillStyle = '#ffd23f';
+    ctx.beginPath(); ctx.arc(p.x, p.y, pulse, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
   }
-  // Parked cars: teal dots, so the first car is findable.
-  ctx.fillStyle = '#2dd4bf';
-  for (const car of game.parked) {
-    const [mx, my] = worldToMap(car.x, car.z, size);
-    ctx.fillRect(mx - 2, my - 2, 4, 4);
+  // Stash yang belum diambil.
+  if (S && Array.isArray(S.stashesLeft)) {
+    ctx.fillStyle = '#7CFC00';
+    for (let i = 0; i < S.stashesLeft.length; i++) {
+      const p = toMap(S.stashesLeft[i].x, S.stashesLeft[i].z);
+      ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+    }
   }
-  // Traffic.
-  ctx.fillStyle = '#20202a';
-  for (const car of game.traffic) {
-    const [mx, my] = worldToMap(car.x, car.z, size);
-    ctx.fillRect(mx - 1.5, my - 1.5, 3, 3);
+  // Penumpang taksi.
+  if (S && S.taxi && S.taxi.passenger && S.taxi.state === 'waiting') {
+    const p = toMap(S.taxi.passenger.x, S.taxi.passenger.z);
+    ctx.fillStyle = '#ff9f1c';
+    ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fill();
   }
-  // Police.
-  ctx.fillStyle = '#ff4030';
-  for (const cop of game.police) {
-    const [mx, my] = worldToMap(cop.x, cop.z, size);
-    ctx.beginPath();
-    ctx.arc(mx, my, big ? 5 : 3, 0, Math.PI * 2);
-    ctx.fill();
+  // Polisi (merah).
+  const cops = (S && (S.cops || S.police)) || [];
+  ctx.fillStyle = '#ff3b30';
+  for (let i = 0; i < cops.length; i++) {
+    if (typeof cops[i].x !== 'number') continue;
+    const p = toMap(cops[i].x, cops[i].z);
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, Math.PI * 2); ctx.fill();
   }
-  // Helicopter.
-  if (game.heli) {
-    const [mx, my] = worldToMap(game.heli.x, game.heli.z, size);
-    ctx.fillStyle = '#ff9a3c';
-    ctx.beginPath();
-    ctx.arc(mx, my, big ? 7 : 4, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = '#fff';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
+  // Heli (merah, lebih besar, dengan lingkaran) — hanya bila aktif.
+  if (S && S.heli && S.heli.active && typeof S.heli.x === 'number') {
+    const p = toMap(S.heli.x, S.heli.z);
+    ctx.strokeStyle = '#ff3b30'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = '#ff3b30';
+    ctx.beginPath(); ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2); ctx.fill();
   }
-  // Player arrow: bigger.
-  const inCar = game.playerCar !== null;
-  const px = inCar ? game.playerCar.x : game.player.x;
-  const pz = inCar ? game.playerCar.z : game.player.z;
-  const heading = inCar ? game.playerCar.heading : game.player.heading;
-  const [mx, my] = worldToMap(px, pz, size);
+  // Pemain: panah putih searah heading.
+  const pp = getPlayerPos(S);
+  const p = toMap(pp.x, pp.z);
   ctx.save();
-  ctx.translate(mx, my);
-  ctx.rotate(Math.PI - heading); // map x = world x, map y = world z (down)
+  ctx.translate(p.x, p.y);
+  ctx.rotate(-pp.heading);
   ctx.fillStyle = '#ffffff';
-  ctx.strokeStyle = '#20202a';
-  ctx.lineWidth = 1.5;
   ctx.beginPath();
-  ctx.moveTo(0, big ? -13 : -9);
-  ctx.lineTo(big ? 9 : 6.5, big ? 10 : 7);
-  ctx.lineTo(big ? -9 : -6.5, big ? 10 : 7);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
+  ctx.moveTo(0, -6); ctx.lineTo(4, 5); ctx.lineTo(0, 2.5); ctx.lineTo(-4, 5);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
   ctx.restore();
+  // Bingkai.
+  ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, W - 1, H - 1);
 }
 
-// The crosshair: a small plus with a dot, built once and toggled by
-// updateHud. It lives in the DOM (not the canvas) so it stays crisp and
-// centred whatever the 3D camera does.
-function buildCrosshair() {
-  const el = document.createElement('div');
-  el.id = 'crosshair';
-  el.style.cssText = [
-    'position:fixed', 'left:50%', 'top:50%', 'width:22px', 'height:22px',
-    'margin:-11px 0 0 -11px', 'pointer-events:none', 'z-index:30',
-    'display:none',
-  ].join(';');
-  // Four arms + centre dot, white with a dark outline so it reads on
-  // bright sand and dark asphalt alike.
-  const arm = (w, h, l, t) => `<span style="position:absolute;width:${w};height:${h};left:${l};top:${t};background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,0.8);"></span>`;
-  el.innerHTML =
-    arm('2px', '7px', '10px', '0') + arm('2px', '7px', '10px', '15px') +
-    arm('7px', '2px', '0', '10px') + arm('7px', '2px', '15px', '10px') +
-    '<span style="position:absolute;width:3px;height:3px;left:9.5px;top:9.5px;background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,0.8);border-radius:50%;"></span>';
-  document.body.appendChild(el);
-  return el;
+// ---------- peta layar penuh (Tab) ----------
+export function drawFullMap(S) {
+  ensureEls();
+  const cv = els.fullmap;
+  // Daftar misi + statistik selalu di-update walau canvas tidak ada.
+  if (els.mapMissions) {
+    const mi = clamp(getMissionIndex(S), 0, 18);
+    let html = '<h3>MISSIONS</h3><ol>';
+    for (let i = 0; i < MISSION_LIST.length; i++) {
+      const done = i < mi;
+      const cur = i === mi && mi < 18;
+      html += '<li class="' + (done ? 'done' : (cur ? 'current' : '')) + '">'
+        + (done ? '✓ ' : (cur ? '▶ ' : ''))
+        + MISSION_LIST[i].name + ' — $' + MISSION_LIST[i].reward.toLocaleString('en-US')
+        + '</li>';
+    }
+    html += '</ol>';
+    if (els.mapMissions.innerHTML !== html) els.mapMissions.innerHTML = html;
+  }
+  if (els.mapStats) {
+    const mi = clamp(getMissionIndex(S), 0, 18);
+    const stashGot = (S && typeof S.stashFound === 'number') ? S.stashFound
+      : (S && typeof S.stashesFound === 'number' ? S.stashesFound
+      : (S && Array.isArray(S.stashes) ? S.stashes.filter(Boolean).length : 0));
+    const stats = 'Money ' + moneyFmt(getMoney(S))
+      + '  ·  Missions ' + mi + '/18'
+      + '  ·  REP ' + repName(S && S.rep) + ' (' + Math.floor(Number((S && S.rep) || 0)) + ')'
+      + '  ·  Stash ' + stashGot + '/6'
+      + '  ·  Wanted ' + getStars(S) + '★'
+      + '  ·  ' + clockText(getTime(S)) + ' ' + phaseFor(getTime(S));
+    setText(els.mapStats, stats);
+  }
+  if (!cv || typeof cv.getContext !== 'function') return;
+  const ctx = cv.getContext('2d');
+  if (!ctx) return;
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0d1f16';
+  ctx.fillRect(0, 0, W, H);
+
+  const city = (S && S.city) || null;
+  const bounds = (city && city.bounds) || { minX: -110, maxX: 110, minZ: -110, maxZ: 110 };
+  // Margin besar (46px) supaya label distrik di tepi tidak terpotong.
+  const margin = 46;
+  const toMap = (x, z) => worldToMap(x, z, bounds, W, H, margin);
+
+  // Air.
+  if (city && city.water) {
+    ctx.fillStyle = '#1d5f8a';
+    for (let i = 0; i < city.water.length; i++) {
+      const w = city.water[i];
+      const a = toMap(w.x - (w.w || 0) / 2, w.z - (w.d || 0) / 2);
+      const b = toMap(w.x + (w.w || 0) / 2, w.z + (w.d || 0) / 2);
+      ctx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y);
+    }
+  }
+  // Jalan.
+  if (city && city.roads) {
+    ctx.strokeStyle = 'rgba(220,220,220,0.6)';
+    ctx.lineWidth = 3;
+    for (let i = 0; i < city.roads.length; i++) {
+      const r = city.roads[i];
+      const a = toMap(r.x1, r.z1), b = toMap(r.x2, r.z2);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+  }
+  // Distrik: lingkaran warna + label — SEMUA 10 distrik wajib berlabel.
+  const districts = (city && city.districts && city.districts.length) ? city.districts : FALLBACK_DISTRICTS;
+  ctx.textAlign = 'center';
+  for (let i = 0; i < districts.length; i++) {
+    const d = districts[i];
+    const c = toMap(d.cx, d.cz);
+    const r = Math.max(10, (d.r || 20) * c.s);
+    ctx.fillStyle = (d.color || '#888888') + '55';
+    ctx.beginPath(); ctx.arc(c.x, c.y, r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = d.color || '#888888';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    // Label dengan outline gelap agar terbaca; posisi dijepit di dalam canvas.
+    const lx = clamp(c.x, margin - 10, W - margin + 10);
+    const ly = clamp(c.y, margin - 14, H - margin + 14);
+    ctx.font = 'bold 13px sans-serif';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#000000';
+    ctx.strokeText(d.name, lx, ly);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(d.name, lx, ly);
+  }
+  // POI: GARAGE / SHOP / SAFEHOUSE / MARINA.
+  const pois = [];
+  if (city) {
+    if (city.garage) pois.push({ p: city.garage, label: 'GARAGE', color: '#ff9f1c' });
+    if (city.shop) pois.push({ p: city.shop, label: 'SHOP', color: '#4ecdc4' });
+    if (city.safehouse) pois.push({ p: city.safehouse, label: 'SAFEHOUSE', color: '#7CFC00' });
+    if (city.marina) pois.push({ p: city.marina, label: 'MARINA', color: '#1f8fff' });
+  }
+  ctx.font = 'bold 11px sans-serif';
+  for (let i = 0; i < pois.length; i++) {
+    const pt = toMap(pois[i].p.x, pois[i].p.z);
+    ctx.fillStyle = pois[i].color;
+    ctx.fillRect(pt.x - 5, pt.y - 5, 10, 10);
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.strokeRect(pt.x - 5, pt.y - 5, 10, 10);
+    ctx.lineWidth = 3; ctx.strokeStyle = '#000';
+    ctx.strokeText(pois[i].label, pt.x, pt.y - 10);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(pois[i].label, pt.x, pt.y - 10);
+  }
+  // Target misi (live mission target wins, staged shot target next).
+  const target = (S && ((S.mission && S.mission.target) || S.missionTarget || S.target)) || null;
+  if (target && typeof target.x === 'number') {
+    const p = toMap(target.x, target.z);
+    ctx.fillStyle = '#ffd23f';
+    ctx.beginPath(); ctx.arc(p.x, p.y, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.font = 'bold 11px sans-serif';
+    ctx.fillStyle = '#ffd23f';
+    ctx.fillText('TARGET', p.x, p.y - 12);
+  }
+  // Pemain.
+  const pp = getPlayerPos(S);
+  const p = toMap(pp.x, pp.z);
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(-pp.heading);
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath();
+  ctx.moveTo(0, -9); ctx.lineTo(6, 7); ctx.lineTo(0, 3.5); ctx.lineTo(-6, 7);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.restore();
+  ctx.font = 'bold 12px sans-serif';
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'left';
+  ctx.fillText('SUNSET BAY — press Tab to close', 12, 22);
 }
 
-export function createHud() {
-  const slots = document.getElementById('weapon-slots');
-  const slotEls = [];
-  if (slots) {
-    for (let i = 0; i < 4; i += 1) {
-      const el = document.createElement('div');
-      el.className = 'wslot';
-      el.innerHTML = `<span class="wkey">${i + 1}</span><span class="wname"></span><span class="wammo"></span>`;
-      slots.appendChild(el);
-      slotEls.push(el);
-    }
+// ---------- pesan & popup ----------
+export function showMessage(S, text) {
+  ensureEls();
+  if (!els.message) return;
+  setText(els.message, text || '');
+  els.message.style.display = text ? 'block' : 'none';
+  if (messageTimer) clearTimeout(messageTimer);
+  if (text) {
+    messageTimer = setTimeout(() => {
+      if (els.message) els.message.style.display = 'none';
+    }, 5000);
   }
-  return {
-    cash: document.getElementById('cash'),
-    stars: document.getElementById('stars'),
-    heatFill: document.getElementById('heat-fill'),
-    repLine: document.getElementById('rep-line'),
-    repFill: document.getElementById('rep-fill'),
-    missionCard: document.getElementById('mission-card'),
-    missionNum: document.getElementById('mission-num'),
-    missionName: document.getElementById('mission-name'),
-    missionTimer: document.getElementById('mission-timer'),
-    missionStage: document.getElementById('mission-stage'),
-    missionStageFill: document.getElementById('mission-stage-fill'),
-    missionNext: document.getElementById('mission-next'),
-    district: document.getElementById('district'),
-    speed: document.getElementById('speed'),
-    speedNum: document.getElementById('speed-num'),
-    vehicleName: document.getElementById('vehicle-name'),
-    message: document.getElementById('message'),
-    title: document.getElementById('title'),
-    busted: document.getElementById('busted'),
-    bustedStats: document.getElementById('busted-stats'),
-    minimap: document.getElementById('minimap'),
-    help: document.getElementById('help'),
-    stats: document.getElementById('stats'),
-    paused: document.getElementById('paused'),
-    beaconArrow: document.getElementById('beacon-arrow'),
-    stealPrompt: document.getElementById('steal-prompt'),
-    interactPrompt: document.getElementById('interact-prompt'),
-    policePanel: document.getElementById('police-panel'),
-    policeList: document.getElementById('police-list'),
-    heliLine: document.getElementById('heli-line'),
-    radioStation: document.getElementById('radio-station'),
-    radioTrack: document.getElementById('radio-track'),
-    radioBtn: document.getElementById('radio-btn'),
-    slotEls,
-    healthFill: document.getElementById('health-fill'),
-    armourFill: document.getElementById('armour-fill'),
-    healthNum: document.getElementById('health-num'),
-    stashLine: document.getElementById('stash-line'),
-    popups: document.getElementById('popups'),
-    dialog: document.getElementById('dialog'),
-    dialogPortrait: document.getElementById('dialog-portrait'),
-    dialogName: document.getElementById('dialog-name'),
-    dialogText: document.getElementById('dialog-text'),
-    mapOverlay: document.getElementById('map-overlay'),
-    bigmap: document.getElementById('bigmap'),
-    mapMissions: document.getElementById('map-missions'),
-    mapStats: document.getElementById('map-stats'),
-    crosshair: buildCrosshair(),
-  };
 }
 
-const MISSION_NAMES = ['First Wheels', 'Package Run', 'Cool Down', 'Street Race', 'Stash Grab', 'Getaway', 'The Big Heist', 'Bay King', 'Dockside Deal', 'Neon Nights', 'Payback Run', 'Sunset Showdown', 'Pier Pressure', 'Beach Run', 'Midnight Courier'];
-
-export function updateHud(hud, game, camYaw = 0, paused = false, mapOpen = false) {
-  const onTitle = game.state === 'title';
-  // On the title screen the HUD stays hidden: no cash, stars or job timer
-  // over the menu, and no minimap blob behind it.
-  hud.stats.style.display = onTitle ? 'none' : 'block';
-  hud.minimap.style.display = onTitle ? 'none' : 'block';
-  hud.help.style.display = onTitle ? 'none' : 'block';
-  hud.policePanel.style.display = onTitle ? 'none' : 'block';
-  hud.cash.textContent = `$${game.money.toLocaleString('en-US')}`;
-  const stars = game.stars;
-  hud.stars.textContent = '★'.repeat(stars) + '☆'.repeat(5 - stars);
-  hud.stars.style.color = stars >= 3 ? '#ff5040' : '#ffd23e';
-  hud.heatFill.style.width = `${Math.round(clamp01(game.heat / 500) * 100)}%`;
-  hud.heatFill.style.background = stars >= 3 ? '#ff5040' : '#ffd23e';
-  const rep = game.repLevel;
-  hud.repLine.textContent = `REP LV ${rep.level} · ${rep.title}`;
-  hud.repFill.style.width = `${Math.round(rep.progress * 100)}%`;
-  // Stash hunt: how many of the 6 hidden packs this run has found.
-  if (hud.stashLine) {
-    hud.stashLine.textContent = `STASH ${game.stashesCollected}/${game.stashTotal}`;
-    hud.stashLine.style.color = game.stashesCollected >= game.stashTotal ? '#ffd23e' : '#ffe9a8';
-  }
-
-  // Mission card: number, name, big timer, stage bar, next objective.
-  const card = game.missionCard;
-  hud.missionNum.textContent = `MISSION ${card.num}/${card.total}${card.cycle > 0 ? ` · CYCLE ${card.cycle + 1}` : ''}`;
-  hud.missionName.textContent = `${card.name} — $${card.reward}`;
-  const mm = Math.floor(card.timeLeft / 60);
-  const ss = String(card.timeLeft % 60).padStart(2, '0');
-  hud.missionTimer.textContent = `${mm}:${ss}`;
-  hud.missionTimer.style.color = card.timeLeft <= 15 ? '#ff5040' : '#ffd23e';
-  hud.missionStage.textContent = `STAGE ${card.stageCur}/${card.stageTotal} · ${card.stageText}`;
-  hud.missionStageFill.style.width = `${Math.round(((card.stageCur - 1) / card.stageTotal) * 100)}%`;
-  hud.missionNext.textContent = `NEXT: ${card.nextText}`;
-
-  hud.district.textContent = game.district;
-  const inCar = game.playerCar !== null;
-  hud.speed.style.display = inCar && !onTitle ? 'block' : 'none';
-  if (inCar) {
-    hud.speedNum.textContent = `${Math.round(Math.abs(game.playerCar.speed) * 3.2)}`;
-    hud.vehicleName.textContent = game.playerCar.model || 'Car';
-  }
-
-  // Crosshair (v4): dead centre whenever a gun is in hand on foot — the
-  // player finally sees where a click will land. Hidden on the title
-  // screen, in a car (no shooting from the driver's seat), with fists,
-  // while paused, or with the map open.
-  if (hud.crosshair) {
-    const showCrosshair = !onTitle && game.state === 'playing' && !inCar
-      && game.weaponIndex > 0 && !paused && !mapOpen;
-    hud.crosshair.style.display = showCrosshair ? 'block' : 'none';
-  }
-
-  // Police response panel: named units, distance, tactic, sight status.
-  if (game.police.length > 0) {
-    hud.policeList.innerHTML = game.police.slice(0, 5).map((cop) => {
-      const status = cop.down ? 'DOWN' : cop.dist < 45 ? 'IN SIGHT' : 'SEARCHING';
-      const cls = cop.down ? 'down' : cop.dist < 45 ? 'sight' : 'search';
-      return `<div class="unit"><span class="uname">${cop.name || 'UNIT'}</span><span class="utactic ${cls}">${cop.tactic}</span><span class="udist">${Math.round(cop.dist)}m</span><span class="ustatus ${cls}">${status}</span></div>`;
-    }).join('');
-  } else {
-    hud.policeList.innerHTML = '<div class="unit quiet">No units responding — stay clean.</div>';
-  }
-  if (game.heli) {
-    hud.heliLine.style.display = 'block';
-    hud.heliLine.textContent = `AIR-1 HELICOPTER · ${Math.round(game.heli.dist)}m · SPOTLIGHT ON YOU`;
-  } else {
-    hud.heliLine.style.display = 'none';
-  }
-
-  // Radio widget: station, current track, and the station button.
-  if (game.radioStationName) {
-    hud.radioStation.textContent = `♪ ${game.radioStationName}`;
-    hud.radioTrack.textContent = game.radioTrack
-      ? `"${game.radioTrack.title}" — ${game.radioTrack.artist}` : '';
-  } else {
-    hud.radioStation.textContent = '♪ Radio off';
-    hud.radioTrack.textContent = 'Press M for music';
-  }
-
-  // Weapon slots 1-4: name + ammo, locked ones dimmed.
-  const weapons = [
-    { name: 'FISTS', ammo: '∞', locked: false },
-    { name: 'PISTOL', ammo: String(game.ammo.pistol), locked: !game.unlocked.pistol },
-    { name: 'SHOTGUN', ammo: String(game.ammo.shotgun), locked: !game.unlocked.shotgun },
-    { name: 'SMG', ammo: String(game.ammo.smg), locked: !game.unlocked.smg },
-  ];
-  hud.slotEls.forEach((el, i) => {
-    el.querySelector('.wname').textContent = weapons[i].name;
-    el.querySelector('.wammo').textContent = weapons[i].locked ? '—' : weapons[i].ammo;
-    el.classList.toggle('active', game.weaponIndex === i);
-    el.classList.toggle('locked', weapons[i].locked);
-  });
-
-  // Health + armour bars.
-  hud.healthFill.style.width = `${Math.round(game.player.health)}%`;
-  hud.healthFill.style.background = game.player.health < 30 ? '#ff5040' : '#2dd44f';
-  hud.healthNum.textContent = `${Math.round(game.player.health)}`;
-  hud.armourFill.style.width = `${Math.round(game.armour)}%`;
-
-  // Score popups (drift / near-miss).
-  hud.popups.innerHTML = game.popups.map((p) => `<div class="popup" style="opacity:${Math.min(1, p.t)}">${p.text}</div>`).join('');
-
-  // Crew dialog card, while its timer runs.
-  if (game.dialog && game.dialog.t > 0 && !onTitle) {
-    hud.dialog.style.display = 'flex';
-    hud.dialogPortrait.textContent = game.dialog.name[0];
-    hud.dialogPortrait.style.background = game.dialog.color;
-    hud.dialogName.textContent = game.dialog.name;
-    hud.dialogText.textContent = game.dialog.text;
-  } else {
-    hud.dialog.style.display = 'none';
-  }
-
-  // The paused overlay is driven by the paused flag, never by the timed
-  // message — updateHud must not overwrite it every frame.
-  hud.paused.style.display = paused ? 'flex' : 'none';
-  if (paused) {
-    hud.message.textContent = 'Paused — press P to resume';
-    hud.message.style.opacity = '1';
-  } else if (game.messageT > 0) {
-    hud.message.textContent = game.message;
-    hud.message.style.opacity = '1';
-  } else {
-    hud.message.style.opacity = '0';
-  }
-  hud.title.style.display = onTitle ? 'flex' : 'none';
-  const showBusted = game.state === 'busted';
-  hud.busted.style.display = showBusted ? 'flex' : 'none';
-  if (showBusted) {
-    hud.bustedStats.textContent = `You made $${game.money.toLocaleString('en-US')} · ${game.jobsDone} jobs done · ${game.carsStolen} cars stolen`;
-  }
-
-  // "Press E to steal" prompt when on foot next to a parked car.
-  let nearCar = false;
-  if (!onTitle && game.state === 'playing' && !inCar) {
-    for (const car of game.parked) {
-      if (Math.hypot(car.x - game.player.x, car.z - game.player.z) < 4.5) { nearCar = true; break; }
-    }
-  }
-  hud.stealPrompt.style.display = nearCar ? 'block' : 'none';
-
-  // Context prompt: garage / shop / safehouse.
-  let interact = '';
-  if (!onTitle && game.state === 'playing') {
-    if (game.nearGarage && inCar) interact = game.heat >= 200 ? 'G — Respray $200 (lose the heat)' : 'G — Garage: buy upgrade';
-    else if (game.nearGarage) interact = 'Get in a car to use the garage';
-    else if (game.nearShop && !inCar) interact = 'G — Shop: ammo $50 · armour $120';
-    else if (game.nearSafehouse) interact = 'Safehouse — healing, heat fading, progress saved';
-  }
-  hud.interactPrompt.style.display = interact ? 'block' : 'none';
-  hud.interactPrompt.textContent = interact;
-
-  // Screen-edge beacon arrow: points at the job target from the camera's
-  // point of view, with the distance, so the mission reads even when the
-  // pillar itself is behind a building.
-  const px = inCar ? game.playerCar.x : game.player.x;
-  const pz = inCar ? game.playerCar.z : game.player.z;
-  const job = game.jobTarget;
-  if (!onTitle && game.state === 'playing' && job) {
-    const dx = job.x - px;
-    const dz = job.z - pz;
-    const dist = Math.hypot(dx, dz);
-    if (dist > 12) {
-      const fx = -Math.sin(camYaw);
-      const fz = -Math.cos(camYaw);
-      const rx = Math.cos(camYaw);
-      const rz = -Math.sin(camYaw);
-      const fwd = dx * fx + dz * fz;
-      const right = dx * rx + dz * rz;
-      const angle = (Math.atan2(right, fwd) * 180) / Math.PI;
-      hud.beaconArrow.style.display = 'block';
-      hud.beaconArrow.style.transform = `translateX(-50%) rotate(${angle}deg)`;
-      hud.beaconArrow.textContent = `▲ ${Math.round(dist)}m`;
-    } else {
-      hud.beaconArrow.style.display = 'none';
-    }
-  } else {
-    hud.beaconArrow.style.display = 'none';
-  }
-
-  // Minimap.
-  const ctx = hud.minimap.getContext('2d');
-  drawMap(ctx, game, MAP_SIZE, false);
-
-  // Full-screen map (Tab): districts, POIs, mission list, stats.
-  hud.mapOverlay.style.display = mapOpen && !onTitle ? 'flex' : 'none';
-  if (mapOpen && !onTitle) {
-    const bctx = hud.bigmap.getContext('2d');
-    drawMap(bctx, game, 520, true);
-    const rep = game.repLevel;
-    hud.mapMissions.innerHTML = MISSION_NAMES.map((name, i) => {
-      const status = game.doneThisCycle[i] ? 'DONE' : i === game.missionIndex ? 'ACTIVE' : 'LOCKED';
-      return `<div class="map-mission ${status.toLowerCase()}"><span>${i + 1}. ${name}</span><span>${status}</span></div>`;
-    }).join('');
-    const topDistrict = Object.entries(game.districtJobs).sort((a, b) => b[1] - a[1])[0];
-    hud.mapStats.innerHTML = [
-      ['Completion', `${game.completionPct}%`],
-      ['Rep', `LV ${rep.level} ${rep.title}`],
-      ['Missions done', String(game.jobsDone)],
-      ['Cars stolen', String(game.carsStolen)],
-      ['Cops down', String(game.copsDowned)],
-      ['Near misses', String(game.nearMisses)],
-      ['Drifts', String(game.drifts)],
-      ['Coins', String(game.coinsCollected)],
-      ['Stash packs', `${game.stashesCollected}/${game.stashTotal}`],
-      ['Top district', topDistrict ? `${topDistrict[0]} (${topDistrict[1]})` : '—'],
-    ].map(([k, v]) => `<div class="map-stat"><span>${k}</span><b>${v}</b></div>`).join('');
+export function showPopup(text) {
+  ensureEls();
+  if (!els.popup) return;
+  setText(els.popup, text || '');
+  els.popup.style.display = text ? 'block' : 'none';
+  if (popupTimer) clearTimeout(popupTimer);
+  if (text) {
+    popupTimer = setTimeout(() => {
+      if (els.popup) els.popup.style.display = 'none';
+    }, 2600);
   }
 }
