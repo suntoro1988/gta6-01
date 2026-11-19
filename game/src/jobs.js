@@ -1,165 +1,34 @@
-// Sunset Bay v5 — jobs.js
-// Pekerjaan sampingan taksi: penumpang muncul di pinggir jalan, pemain
-// menjemput dengan mobil, mengantar ke tujuan, dan menerima fare.
-// Bisa dilakukan kapan saja di luar misi.
-//
-// State taksi: 'idle' | 'toPickup' | 'toDropoff'
-//   idle     — menunggu, timer jalan sampai penumpang berikutnya muncul
-//   toPickup — penumpang menunggu di pinggir jalan, jemput dengan mobil
-//   toDropoff— penumpang di dalam mobil, antar ke tujuan untuk dibayar
-//
-// Asumsi bentuk state S (dibagikan dari game.js):
-//   S.city   — objek kota (roads, bounds)
-//   S.player — {x, z, inCar} atau {x, z, car} saat mengemudi
-//   S.car    — objek mobil pemain (bila S.player.car tidak dipakai)
-//   S.money  — uang pemain (angka); fare langsung ditambahkan ke sini
-
-const PASSENGER_NAMES = [
-  'Maya', 'Dimas', 'Sinta', 'Budi', 'Rani', 'Agus',
-  'Laras', 'Fajar', 'Nina', 'Raka', 'Dewi', 'Ilham',
+// jobs.js — Sunset Bay job data: 18 chained missions + taxi fares. Data only.
+export const MISSIONS=[
+{id:1,name:'First Wheels',brief:'Borrow a car and learn the streets.',reward:100,stages:[{type:'go',x:60,z:40,text:'Reach the car park'},{type:'pickup',x:60,z:40,text:'Take the keys'},{type:'deliver',x:-80,z:90,text:'Drop the car at the garage'}]},
+{id:2,name:'Package Run',brief:'Grab the package and deliver it on time.',reward:150,stages:[{type:'pickup',x:-120,z:-60,text:'Pick up the package'},{type:'deliver',x:140,z:120,text:'Deliver to the client'},{type:'go',x:0,z:0,text:'Return to the safehouse'}]},
+{id:3,name:'Street Race',brief:'Beat the checkpoints across town.',reward:200,stages:[{type:'race',x:200,z:-100,text:'Checkpoint 1'},{type:'race',x:240,z:150,text:'Checkpoint 2'},{type:'race',x:-40,z:220,text:'Finish line'}]},
+{id:4,name:'Midnight Courier',brief:'Two drops before sunrise. No questions.',reward:250,stages:[{type:'pickup',x:-200,z:40,text:'Collect the goods'},{type:'deliver',x:90,z:-160,text:'First drop'},{type:'deliver',x:260,z:60,text:'Second drop'}]},
+{id:5,name:'Getaway Driver',brief:'Pick up the crew and lose the tail.',reward:300,stages:[{type:'pickup',x:120,z:200,text:'Pick up the crew'},{type:'escape',x:-240,z:-120,text:'Escape to the hideout'}]},
+{id:6,name:'Pier Pickup',brief:'Something washed up at the pier.',reward:350,stages:[{type:'go',x:300,z:40,text:'Reach the pier'},{type:'pickup',x:300,z:40,text:'Grab the crate'},{type:'deliver',x:-60,z:-200,text:'Deliver the crate'}]},
+{id:7,name:'Beach Run',brief:'Flat out along the sand.',reward:400,stages:[{type:'race',x:-180,z:280,text:'Checkpoint 1'},{type:'race',x:60,z:320,text:'Checkpoint 2'},{type:'race',x:280,z:260,text:'Finish line'}]},
+{id:8,name:'Bank Job',brief:'In and out of the bank. Fast.',reward:500,stages:[{type:'go',x:120,z:-80,text:'Reach the bank'},{type:'pickup',x:120,z:-80,text:'Grab the cash'},{type:'escape',x:-300,z:150,text:'Escape the area'}]},
+{id:9,name:'Boat Escape',brief:'Reach the marina and vanish by sea.',reward:550,stages:[{type:'go',x:-280,z:200,text:'Reach the marina'},{type:'escape',x:-320,z:320,text:'Board the boat'}]},
+{id:10,name:'Downtown Dash',brief:'Three checkpoints through downtown.',reward:600,stages:[{type:'race',x:40,z:-40,text:'Checkpoint 1'},{type:'race',x:-100,z:60,text:'Checkpoint 2'},{type:'race',x:160,z:-120,text:'Finish line'}]},
+{id:11,name:'Night Shift',brief:'Two late drops across the bay.',reward:650,stages:[{type:'deliver',x:180,z:-200,text:'First drop'},{type:'deliver',x:-220,z:220,text:'Second drop'}]},
+{id:12,name:'Harbor Deal',brief:'A quiet exchange at the harbor.',reward:700,stages:[{type:'pickup',x:-280,z:180,text:'Collect the briefcase'},{type:'deliver',x:100,z:100,text:'Hand it over'}]},
+{id:13,name:'Rooftop Drop',brief:'Up high, then gone.',reward:800,stages:[{type:'go',x:0,z:-240,text:'Reach the tower'},{type:'deliver',x:220,z:-260,text:'Make the drop'}]},
+{id:14,name:'High Roller',brief:'Win the race, then disappear.',reward:900,stages:[{type:'race',x:260,z:-180,text:'Checkpoint 1'},{type:'race',x:-60,z:-300,text:'Checkpoint 2'},{type:'escape',x:0,z:0,text:'Lose the heat'}]},
+{id:15,name:'The Long Haul',brief:'Cross the whole map with the cargo.',reward:1000,stages:[{type:'pickup',x:-320,z:-40,text:'Load the cargo'},{type:'deliver',x:320,z:-120,text:'First stop'},{type:'deliver',x:140,z:280,text:'Final stop'}]},
+{id:16,name:'Heat Wave',brief:'The whole city is looking for you.',reward:1100,stages:[{type:'escape',x:-160,z:-160,text:'Break the cordon'},{type:'escape',x:200,z:240,text:'Vanish at the docks'}]},
+{id:17,name:"Kingpin's Favor",brief:'One last job for the top.',reward:1250,stages:[{type:'pickup',x:80,z:240,text:'Collect the package'},{type:'deliver',x:-140,z:-240,text:'Deliver uptown'},{type:'race',x:260,z:120,text:'Race back downtown'}]},
+{id:18,name:'Sunset Heist',brief:'The big one. Hit the vault at sunset.',reward:1500,stages:[{type:'go',x:150,z:150,text:'Reach the vault'},{type:'pickup',x:150,z:150,text:'Crack the vault'},{type:'deliver',x:-260,z:260,text:'Move the loot'},{type:'escape',x:0,z:-320,text:'Escape by sunset'}]},
 ];
-
-function rand(a, b) { return a + Math.random() * (b - a); }
-function randInt(a, b) { return Math.floor(rand(a, b + 1)); }
-function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
-
-function dist2d(ax, az, bx, bz) {
-  const dx = ax - bx, dz = az - bz;
-  return Math.sqrt(dx * dx + dz * dz);
+export const TAXI_FARES={min:40,mid:70,max:120};
+export function taxiJob(pickup,dropoff){
+  const dx=(dropoff.x||0)-(pickup.x||0),dz=(dropoff.z||0)-(pickup.z||0);
+  const distance=Math.round(Math.hypot(dx,dz));
+  const fare=Math.max(TAXI_FARES.min,Math.min(TAXI_FARES.max,Math.round(distance*0.35)));
+  return {pickup:{x:pickup.x||0,z:pickup.z||0},dropoff:{x:dropoff.x||0,z:dropoff.z||0},fare,distance};
 }
-
-// Posisi + status berkendara pemain, toleran terhadap variasi bentuk S.
-function playerInfo(S) {
-  const p = S.player || {};
-  const x = typeof p.x === 'number' ? p.x : (typeof S.px === 'number' ? S.px : 0);
-  const z = typeof p.z === 'number' ? p.z : (typeof S.pz === 'number' ? S.pz : 0);
-  const inCar = !!(p.inCar || p.car || p.driving || S.car);
-  return { x, z, inCar };
-}
-
-// Satu titik di pinggir jalan: pilih jalan acak, titik acak di sepanjangnya,
-// lalu geser 6 unit ke sisi jalan (trotoar) supaya penumpang berdiri di
-// tempat yang masuk akal, bukan di tengah aspal.
-function roadsidePoint(city, nearX, nearZ, minDist, maxDist) {
-  const roads = (city && city.roads) || [];
-  if (roads.length === 0) {
-    return { x: nearX + rand(-40, 40), z: nearZ + rand(-40, 40) };
-  }
-  for (let tries = 0; tries < 24; tries++) {
-    const road = pick(roads);
-    const t = Math.random();
-    const x = road.x1 + (road.x2 - road.x1) * t;
-    const z = road.z1 + (road.z2 - road.z1) * t;
-    const d = dist2d(x, z, nearX, nearZ);
-    if (d < minDist || d > maxDist) continue;
-    // Arah tegak lurus jalan.
-    const len = Math.hypot(road.x2 - road.x1, road.z2 - road.z1) || 1;
-    const px = -(road.z2 - road.z1) / len;
-    const pz = (road.x2 - road.x1) / len;
-    const side = Math.random() < 0.5 ? 1 : -1;
-    return { x: x + px * 6 * side, z: z + pz * 6 * side };
-  }
-  return { x: nearX + 30, z: nearZ + 10 };
-}
-
-export function createTaxi(S) {
-  return {
-    passenger: null,   // {x, z, name, destX, destZ} saat ada penumpang
-    state: 'idle',
-    fare: 0,
-    timer: 6,          // penumpang pertama muncul ~6 detik setelah mulai
-    waitTimer: 0,      // berapa lama penumpang menunggu dijemput
-    lastFare: 0,       // fare terakhir yang dibayar (untuk popup/HUD)
-    message: '',       // pesan singkat terakhir (mis. 'Fare +$80')
-    city: (S && S.city) || null,
-  };
-}
-
-export function stepTaxi(T, S, dt) {
-  if (!S) return;
-  if (!T.city && S.city) T.city = S.city;
-  const me = playerInfo(S);
-
-  if (T.state === 'idle') {
-    T.timer -= dt;
-    if (T.timer <= 0) {
-      const spot = roadsidePoint(T.city, me.x, me.z, 25, 90);
-      T.passenger = {
-        x: spot.x, z: spot.z,
-        name: pick(PASSENGER_NAMES),
-        destX: 0, destZ: 0,
-      };
-      T.state = 'toPickup';
-      T.waitTimer = 0;
-      T.message = '';
-    }
-    return;
-  }
-
-  if (T.state === 'toPickup') {
-    if (!T.passenger) { T.state = 'idle'; T.timer = 8; return; }
-    T.waitTimer += dt;
-    const d = dist2d(me.x, me.z, T.passenger.x, T.passenger.z);
-    // Jemput: pemain harus datang dengan mobil dan berhenti dekat penumpang.
-    if (me.inCar && d < 7) {
-      const dest = roadsidePoint(T.city, T.passenger.x, T.passenger.z, 60, 160);
-      T.passenger.destX = dest.x;
-      T.passenger.destZ = dest.z;
-      const trip = dist2d(T.passenger.x, T.passenger.z, dest.x, dest.z);
-      // Fare $40..$120, naik dengan jarak tempuh.
-      T.fare = Math.round(Math.min(120, Math.max(40, 40 + trip * 0.5)) / 5) * 5;
-      T.state = 'toDropoff';
-      T.message = T.passenger.name + ' naik — antar ke tujuan!';
-      return;
-    }
-    // Penumpang bosan menunggu 45 detik lalu pergi.
-    if (T.waitTimer > 45) {
-      T.passenger = null;
-      T.state = 'idle';
-      T.timer = rand(8, 15);
-      T.message = 'Penumpang pergi — terlambat menjemput.';
-    }
-    return;
-  }
-
-  if (T.state === 'toDropoff') {
-    if (!T.passenger) { T.state = 'idle'; T.timer = 8; return; }
-    const d = dist2d(me.x, me.z, T.passenger.destX, T.passenger.destZ);
-    // Sampai tujuan dengan mobil: terima fare.
-    if (me.inCar && d < 9) {
-      if (typeof S.money === 'number') S.money += T.fare;
-      T.lastFare = T.fare;
-      T.message = 'Fare +$' + T.fare + ' — terima kasih, ' + T.passenger.name + '!';
-      T.passenger = null;
-      T.fare = 0;
-      T.state = 'idle';
-      T.timer = rand(10, 20);
-      return;
-    }
-    // Pemain turun dari mobil / kabur jauh: penumpang turun dan pergi.
-    if (!me.inCar) {
-      T.waitTimer += dt;
-      if (T.waitTimer > 10) {
-        T.passenger = null;
-        T.fare = 0;
-        T.state = 'idle';
-        T.timer = rand(8, 15);
-        T.message = 'Penumpang turun — butuh mobil untuk mengantar.';
-        T.waitTimer = 0;
-      }
-    } else {
-      T.waitTimer = 0;
-    }
-  }
-}
-
-export function taxiStatus(T) {
-  if (!T) return '';
-  if (T.state === 'toPickup' && T.passenger) {
-    return 'TAXI: jemput ' + T.passenger.name + ' di pinggir jalan!';
-  }
-  if (T.state === 'toDropoff' && T.passenger) {
-    return 'TAXI: antar ' + T.passenger.name + ' — fare $' + T.fare;
-  }
-  return 'TAXI: menunggu penumpang…';
-}
+export const missionHelpers={
+  byId(id){return MISSIONS.find(m=>m.id===id)||null;},
+  totalReward(){return MISSIONS.reduce((s,m)=>s+m.reward,0);},
+  stageCount(){return MISSIONS.reduce((s,m)=>s+m.stages.length,0);},
+  next(i){return MISSIONS[Math.min(i+1,MISSIONS.length-1)];},
+};

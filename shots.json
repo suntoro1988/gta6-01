@@ -1,1 +1,1 @@
-{"1-start.jpg":"?shot=start&seed=1","2-play.jpg":"?shot=play&seed=7","3-foot.jpg":"?shot=foot&seed=11","4-end.jpg":"?shot=end&seed=21"}
+{"shots":[{"id":"start","seed":7},{"id":"play","seed":7},{"id":"foot","seed":7},{"id":"end","seed":7}]}
