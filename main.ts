@@ -1,34 +1,103 @@
-import { access, cp, mkdir, writeFile } from "node:fs/promises";
-import { constants } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { buildDossier } from "./vendor/makefun-game.ts";
+// Sunset Bay — dossier builder (makefun/dossier/v1).
+// Copies game/ and screenshots/ into the output directory and writes
+// dossier.json describing every file. Node 22 stdlib only.
 
-const root = dirname(fileURLToPath(import.meta.url));
-const out = resolve(process.env.MAKEFUN_OUTPUT_DIR ?? "/output");
+import { cp, mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { join, relative, resolve, sep } from "node:path";
 
-async function has(p: string): Promise<boolean> {
-  try {
-    await access(p, constants.F_OK);
-    return true;
-  } catch {
-    return false;
+const TEXT_LIMIT = 163840;
+
+const outDir = resolve(process.env.MAKEFUN_OUTPUT_DIR || "/output");
+const rootDir = resolve(new URL(".", import.meta.url).pathname);
+
+const TEXT_EXTS = new Set([
+  ".html", ".js", ".ts", ".css", ".json", ".md", ".txt", ".svg", ".xml",
+]);
+
+function isTextFile(name) {
+  const dot = name.lastIndexOf(".");
+  if (dot < 0) return false;
+  return TEXT_EXTS.has(name.slice(dot).toLowerCase());
+}
+
+async function walk(dir, base) {
+  const entries = await readdir(dir, { withFileTypes: true });
+  const found = [];
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    const rel = relative(base, full).split(sep).join("/");
+    if (entry.isDirectory()) {
+      found.push(...(await walk(full, base)));
+    } else if (entry.isFile()) {
+      found.push(rel);
+    }
   }
+  return found;
 }
 
-await mkdir(out, { recursive: true });
-await cp(join(root, "game"), join(out, "game"), { recursive: true });
-if (await has(join(root, "screenshots"))) {
-  await cp(join(root, "screenshots"), join(out, "screenshots"), {
-    recursive: true,
-  });
+async function main() {
+  const gameDir = join(rootDir, "game");
+  const shotsDir = join(rootDir, "screenshots");
+
+  await mkdir(outDir, { recursive: true });
+  await cp(gameDir, join(outDir, "game"), { recursive: true });
+
+  let shotFiles = [];
+  try {
+    const st = await stat(shotsDir);
+    if (st.isDirectory()) {
+      await cp(shotsDir, join(outDir, "screenshots"), { recursive: true });
+      shotFiles = (await walk(join(outDir, "screenshots"), outDir))
+        .filter((p) => p.startsWith("screenshots/"))
+        .sort();
+    }
+  } catch {
+    // No screenshots directory yet; dossier still lists the game files.
+  }
+
+  const gameFiles = (await walk(join(outDir, "game"), outDir))
+    .filter((p) => p.startsWith("game/"))
+    .sort();
+
+  const files = [];
+  let textBytes = 0;
+  for (const rel of [...gameFiles, ...shotFiles]) {
+    const full = join(outDir, rel);
+    const info = await stat(full);
+    files.push({ path: rel, size: info.size });
+    if (isTextFile(rel)) textBytes += info.size;
+  }
+
+  if (textBytes > TEXT_LIMIT) {
+    console.error(
+      `dossier text budget exceeded: ${textBytes} > ${TEXT_LIMIT} bytes`,
+    );
+    process.exit(1);
+  }
+
+  const images = shotFiles
+    .filter((p) => /\.(png|jpg|jpeg|webp)$/i.test(p))
+    .slice(0, 4);
+
+  const dossier = {
+    schema: "makefun/dossier/v1",
+    files,
+    images,
+    textBytes,
+  };
+
+  await writeFile(
+    join(outDir, "dossier.json"),
+    JSON.stringify(dossier, null, 2) + "\n",
+    "utf8",
+  );
+
+  console.log(
+    `dossier written: ${files.length} files, ${images.length} images, ${textBytes} text bytes`,
+  );
 }
-const dossier = buildDossier(out, {
-  text_max_bytes: 163840,
-  screenshots: { max: 4, max_bytes: 262144 },
-  game_max_files: 993,
-  game_max_bytes: 50331648,
-  game_path_max_bytes: 1000,
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
 });
-await writeFile(join(out, "dossier.json"), dossier);
-console.log("dossier.json written:", join(out, "dossier.json"));

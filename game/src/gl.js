@@ -1,170 +1,147 @@
-// gl.js — raw WebGL renderer, no libraries. One shader program:
-// per-vertex color, directional sun light, distance fog.
-// Mesh format: { verts: Float32Array, idx: Uint16Array, colors: Float32Array }.
-// Normals are computed here from the index list (averaged per vertex),
-// so mesh builders never need to supply them.
-import { mat4Identity, mat4Mul, mat4Persp, mat4LookAt, norm } from './math3.js';
+// Sunset Bay — gl: wrapper WebGL minimal (shader warna + fog linear vec2).
+(function () {
+  var SB = window.SB = window.SB || {};
 
-const VS = `
-attribute vec3 aPos; attribute vec3 aCol; attribute vec3 aNrm;
-uniform mat4 uMVP; uniform mat4 uModel; uniform vec3 uSunDir;
-uniform vec3 uSunCol; uniform vec3 uAmb; uniform vec3 uTint;
-varying vec3 vCol; varying vec3 vWp;
-void main(){
-  vec4 wp = uModel * vec4(aPos, 1.0);
-  vec3 n = normalize(mat3(uModel) * aNrm);
-  float diff = max(dot(n, uSunDir), 0.0);
-  vCol = aCol * uTint * (uAmb + uSunCol * diff);
-  vWp = wp.xyz;
-  gl_Position = uMVP * wp;
-}`;
-const FS = `
-precision mediump float;
-varying vec3 vCol; varying vec3 vWp; uniform vec3 uFogCol; uniform vec3 uEye; uniform vec2 uFog;
-void main(){
-  float d = distance(vWp, uEye);
-  float f = clamp((d - uFog.x) / (uFog.y - uFog.x), 0.0, 1.0);
-  gl_FragColor = vec4(mix(vCol, uFogCol, f), 1.0);
-}`;
+  var VS =
+    'attribute vec3 aPos;\n' +
+    'attribute vec3 aCol;\n' +
+    'uniform mat4 uMVP;\n' +
+    'varying vec3 vCol;\n' +
+    'varying float vDepth;\n' +
+    'void main(){\n' +
+    '  vec4 p = uMVP * vec4(aPos, 1.0);\n' +
+    '  gl_Position = p;\n' +
+    '  vCol = aCol;\n' +
+    '  vDepth = -p.z;\n' +
+    '}\n';
 
-// Keyframes: [hour, sky, sunColor, ambient]. 18:00 is golden sunset.
-const KEYS = [
-  [0, [0.07, 0.06, 0.16], [0.22, 0.25, 0.5], [0.16, 0.16, 0.26]],
-  [5, [0.10, 0.08, 0.22], [0.25, 0.28, 0.5], [0.18, 0.18, 0.28]],
-  [7, [0.95, 0.62, 0.45], [1.0, 0.62, 0.35], [0.38, 0.32, 0.3]],
-  [12, [0.55, 0.8, 0.95], [1.0, 0.95, 0.85], [0.45, 0.45, 0.45]],
-  [17, [0.85, 0.65, 0.55], [1.0, 0.8, 0.55], [0.42, 0.4, 0.38]],
-  [18, [1.0, 0.55, 0.25], [1.0, 0.55, 0.2], [0.35, 0.28, 0.28]],
-  [19.5, [0.35, 0.2, 0.45], [0.7, 0.4, 0.5], [0.25, 0.22, 0.32]],
-  [21, [0.1, 0.08, 0.22], [0.25, 0.28, 0.5], [0.17, 0.17, 0.27]],
-  [24, [0.07, 0.06, 0.16], [0.22, 0.25, 0.5], [0.16, 0.16, 0.26]],
-];
-function lerp3(a, b, t) { return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]; }
+  var FS =
+    'precision mediump float;\n' +
+    'varying vec3 vCol;\n' +
+    'varying float vDepth;\n' +
+    'uniform vec2 uFog;\n' +   // uFog.x = near, uFog.y = far (vec2, bukan vec3)
+    'uniform vec3 uFogCol;\n' +
+    'void main(){\n' +
+    '  float f = clamp((vDepth - uFog.x) / max(uFog.y - uFog.x, 0.001), 0.0, 1.0);\n' +
+    '  gl_FragColor = vec4(mix(vCol, uFogCol, f), 1.0);\n' +
+    '}\n';
 
-function compileShader(gl, type, src) {
-  const s = gl.createShader(type);
-  gl.shaderSource(s, src);
-  gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-    throw new Error('shader: ' + gl.getShaderInfoLog(s));
-  }
-  return s;
-}
+  var gl = null, prog = null;
+  var uMVP = null, uFog = null, uFogCol = null;
+  var proj = null, view = null;
+  var fogNear = 60, fogFar = 260;
+  var fogColor = [0.55, 0.62, 0.75];
+  var canvas = null;
 
-export function createRenderer(canvas) {
-  const gl = canvas.getContext('webgl', { antialias: true });
-  if (!gl) throw new Error('WebGL unavailable');
-  const prog = gl.createProgram();
-  gl.attachShader(prog, compileShader(gl, gl.VERTEX_SHADER, VS));
-  gl.attachShader(prog, compileShader(gl, gl.FRAGMENT_SHADER, FS));
-  gl.linkProgram(prog);
-  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-    throw new Error('program: ' + gl.getProgramInfoLog(prog));
-  }
-  gl.useProgram(prog);
-  const loc = (n) => gl.getUniformLocation(prog, n);
-  const U = {
-    mvp: loc('uMVP'), model: loc('uModel'), sunDir: loc('uSunDir'),
-    sunCol: loc('uSunCol'), amb: loc('uAmb'), tint: loc('uTint'),
-    eye: loc('uEye'), fogCol: loc('uFogCol'), fog: loc('uFog'),
-  };
-  const A = {
-    pos: gl.getAttribLocation(prog, 'aPos'),
-    col: gl.getAttribLocation(prog, 'aCol'),
-    nrm: gl.getAttribLocation(prog, 'aNrm'),
-  };
-  gl.enable(gl.DEPTH_TEST);
-  gl.disable(gl.CULL_FACE); // mesh winding is not guaranteed
-  const cache = new WeakMap();
-  let proj = mat4Persp(1.05, 1, 0.1, 500);
-  let viewProj = mat4Identity();
-  let eye = [0, 5, 10];
-  let sky = [0.55, 0.8, 0.95];
-  gl.uniform2fv(U.fog, [70, 420]);
-  gl.uniform3fv(U.tint, [1, 1, 1]);
-
-  function buffersFor(mesh) {
-    let b = cache.get(mesh);
-    if (b) return b;
-    const n = mesh.verts.length;
-    const nrm = new Float32Array(n);
-    const idx = mesh.idx;
-    for (let t = 0; t + 2 < idx.length; t += 3) {
-      const a = idx[t] * 3, c = idx[t + 1] * 3, d = idx[t + 2] * 3;
-      const ux = mesh.verts[c] - mesh.verts[a], uy = mesh.verts[c + 1] - mesh.verts[a + 1], uz = mesh.verts[c + 2] - mesh.verts[a + 2];
-      const vx = mesh.verts[d] - mesh.verts[a], vy = mesh.verts[d + 1] - mesh.verts[a + 1], vz = mesh.verts[d + 2] - mesh.verts[a + 2];
-      const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-      for (const o of [a, c, d]) { nrm[o] += nx; nrm[o + 1] += ny; nrm[o + 2] += nz; }
+  function compile(type, src) {
+    var sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      throw new Error('shader: ' + gl.getShaderInfoLog(sh));
     }
-    for (let i = 0; i < n; i += 3) {
-      const l = Math.hypot(nrm[i], nrm[i + 1], nrm[i + 2]) || 1;
-      nrm[i] /= l; nrm[i + 1] /= l; nrm[i + 2] /= l;
-    }
-    const mk = (data, size) => {
-      const buf = gl.createBuffer();
-      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
-      return buf;
-    };
-    const ib = gl.createBuffer();
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.idx, gl.STATIC_DRAW);
-    b = { pos: mk(mesh.verts, 3), col: mk(mesh.colors, 3), nrm: mk(nrm, 3), ib, count: mesh.idx.length };
-    cache.set(mesh, b);
-    return b;
-  }
-  function bind(buf, attr, size) {
-    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-    gl.enableVertexAttribArray(attr);
-    gl.vertexAttribPointer(attr, size, gl.FLOAT, false, 0, 0);
+    return sh;
   }
 
-  return {
-    draw(mesh, matrix, color) {
-      const b = buffersFor(mesh);
-      gl.uniformMatrix4fv(U.model, false, matrix);
-      // uMVP is the view-projection only: the vertex shader already applies
-      // uModel to get the world position, so including the model here would
-      // transform every mesh twice (objects rendered at 2x their position).
-      gl.uniformMatrix4fv(U.mvp, false, viewProj);
-      gl.uniform3fv(U.tint, color || [1, 1, 1]);
-      bind(b.pos, A.pos, 3); bind(b.col, A.col, 3); bind(b.nrm, A.nrm, 3);
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, b.ib);
-      gl.drawElements(gl.TRIANGLES, b.count, gl.UNSIGNED_SHORT, 0);
-    },
-    setCamera(e, target, up) {
-      eye = e;
-      viewProj = mat4Mul(proj, mat4LookAt(e, target, up || [0, 1, 0]));
-      gl.uniform3fv(U.eye, eye);
-    },
-    setSun(t) {
-      const h = ((t % 24) + 24) % 24;
-      let k0 = KEYS[0], k1 = KEYS[KEYS.length - 1];
-      for (let i = 0; i + 1 < KEYS.length; i++) {
-        if (h >= KEYS[i][0] && h <= KEYS[i + 1][0]) { k0 = KEYS[i]; k1 = KEYS[i + 1]; break; }
-      }
-      const f = (h - k0[0]) / Math.max(k1[0] - k0[0], 0.001);
-      sky = lerp3(k0[1], k1[1], f);
-      const sunCol = lerp3(k0[2], k1[2], f);
-      const amb = lerp3(k0[3], k1[3], f);
-      const day = h >= 6 && h <= 18;
-      const a = ((h - 6) / 12) * Math.PI;
-      const dir = day
-        ? norm([Math.cos(a), Math.max(Math.sin(a), 0.08), 0.35])
-        : norm([-0.3, 0.55, 0.2]);
-      gl.uniform3fv(U.sunDir, dir);
-      gl.uniform3fv(U.sunCol, sunCol);
-      gl.uniform3fv(U.amb, amb);
-      gl.uniform3fv(U.fogCol, sky);
-    },
-    clear() {
-      gl.clearColor(sky[0], sky[1], sky[2], 1);
-      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    },
-    resize(w, h) {
+  function init(cv) {
+    canvas = cv;
+    gl = cv.getContext('webgl', { antialias: true }) ||
+         cv.getContext('experimental-webgl');
+    if (!gl) throw new Error('WebGL tidak tersedia');
+    var vs = compile(gl.VERTEX_SHADER, VS);
+    var fs = compile(gl.FRAGMENT_SHADER, FS);
+    prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      throw new Error('link: ' + gl.getProgramInfoLog(prog));
+    }
+    gl.useProgram(prog);
+    uMVP = gl.getUniformLocation(prog, 'uMVP');
+    uFog = gl.getUniformLocation(prog, 'uFog');
+    uFogCol = gl.getUniformLocation(prog, 'uFogCol');
+    gl.enable(gl.DEPTH_TEST);
+    gl.enable(gl.CULL_FACE);
+    gl.cullFace(gl.BACK);
+    // fog default via vec2
+    gl.uniform2f(uFog, fogNear, fogFar);
+    gl.uniform3f(uFogCol, fogColor[0], fogColor[1], fogColor[2]);
+    resize();
+    return gl;
+  }
+
+  function resize() {
+    if (!canvas) return;
+    var w = canvas.clientWidth || canvas.width;
+    var h = canvas.clientHeight || canvas.height;
+    if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w; canvas.height = h;
-      gl.viewport(0, 0, w, h);
-      proj = mat4Persp(1.05, w / Math.max(h, 1), 0.1, 500);
-    },
+    }
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    var M = SB.Math3;
+    proj = M.mat4Perspective(1.15, canvas.width / canvas.height, 0.1, 600);
+  }
+
+  function alive() {
+    return !!gl && !gl.isContextLost();
+  }
+
+  function clear(r, g, b) {
+    resize();
+    gl.clearColor(r, g, b, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    // warna kabut mengikuti warna langit (siang/malam diatur pemanggil via setFogColor)
+    gl.uniform3f(uFogCol, fogColor[0], fogColor[1], fogColor[2]);
+  }
+
+  function mesh(positions, colors) {
+    var pos = positions instanceof Float32Array ? positions : new Float32Array(positions);
+    var col = colors instanceof Float32Array ? colors : new Float32Array(colors);
+    var pb = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, pb);
+    gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+    var cb = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, cb);
+    gl.bufferData(gl.ARRAY_BUFFER, col, gl.STATIC_DRAW);
+    return { posBuf: pb, colBuf: cb, count: pos.length / 3 };
+  }
+
+  function setCamera(eye, center) {
+    var M = SB.Math3;
+    view = M.mat4LookAt(eye, center, [0, 1, 0]);
+  }
+
+  function setFog(near, far) {
+    fogNear = near; fogFar = far;
+    if (gl) gl.uniform2f(uFog, near, far);   // fog = vec2 (near, far)
+  }
+
+  function setFogColor(r, g, b) {
+    fogColor = [r, g, b];
+    if (gl) gl.uniform3f(uFogCol, r, g, b);
+  }
+
+  function draw(m, matrix, opts) {
+    if (!m || !m.posBuf || !proj || !view) return;
+    var M = SB.Math3;
+    var mvp = M.mat4Mul(proj, M.mat4Mul(view, matrix));
+    gl.uniformMatrix4fv(uMVP, false, new Float32Array(mvp));
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf);
+    var aPos = gl.getAttribLocation(prog, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.colBuf);
+    var aCol = gl.getAttribLocation(prog, 'aCol');
+    gl.enableVertexAttribArray(aCol);
+    gl.vertexAttribPointer(aCol, 3, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, m.count);
+  }
+
+  SB.GL = {
+    init: init, clear: clear, mesh: mesh, draw: draw,
+    setCamera: setCamera, setFog: setFog, setFogColor: setFogColor,
+    alive: alive,
+    get ctx() { return gl; }
   };
-}
+})();

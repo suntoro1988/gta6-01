@@ -1,144 +1,174 @@
-// meshes.js — procedural mesh builders. Every function returns
-// { verts: Float32Array, idx: Uint16Array, colors: Float32Array }
-// in the format gl.js draw() expects. All colors are [r,g,b] 0..1.
-// Y is up. Boxes are centered on (cx, cy, cz) unless noted.
-function mk() {
-  const v = [], i = [], c = [];
-  function quad(p0, p1, p2, p3, col) {
-    const b = v.length / 3;
-    v.push(...p0, ...p1, ...p2, ...p3);
-    for (let k = 0; k < 4; k++) c.push(col[0], col[1], col[2]);
-    i.push(b, b + 1, b + 2, b, b + 2, b + 3);
+// Sunset Bay — meshes: geometri segitiga warna flat (tanpa tekstur).
+// Setiap mesh = {pos: Float32Array, col: Float32Array}, y=0 di alas.
+(function () {
+  var SB = window.SB = window.SB || {};
+
+  function Builder() {
+    this.p = [];
+    this.c = [];
   }
-  function tri(p0, p1, p2, col) {
-    const b = v.length / 3;
-    v.push(...p0, ...p1, ...p2);
-    for (let k = 0; k < 3; k++) c.push(col[0], col[1], col[2]);
-    i.push(b, b + 1, b + 2);
+  Builder.prototype.shade = function (rgb, f) {
+    return [rgb[0] * f, rgb[1] * f, rgb[2] * f];
+  };
+  Builder.prototype.tri = function (a, b, c, rgb) {
+    this.p.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]);
+    for (var i = 0; i < 3; i++) this.c.push(rgb[0], rgb[1], rgb[2]);
+  };
+  Builder.prototype.quad = function (a, b, c, d, rgb) {
+    this.tri(a, b, c, rgb);
+    this.tri(a, c, d, rgb);
+  };
+  // Kotak: x,z berpusat di 0, y dari y0 sampai y0+h.
+  Builder.prototype.box = function (w, h, d, y0, rgb, topRgb) {
+    var x = w / 2, z = d / 2, y = y0, yt = y0 + h;
+    var top = topRgb || this.shade(rgb, 1.25);
+    var side = this.shade(rgb, 0.82);
+    var side2 = this.shade(rgb, 0.68);
+    var bot = this.shade(rgb, 0.5);
+    // atas
+    this.quad([-x, yt, -z], [x, yt, -z], [x, yt, z], [-x, yt, z], top);
+    // bawah
+    this.quad([-x, y, z], [x, y, z], [x, y, -z], [-x, y, -z], bot);
+    // depan (+z) & belakang (-z)
+    this.quad([-x, y, z], [x, y, z], [x, yt, z], [-x, yt, z], side);
+    this.quad([x, y, -z], [-x, y, -z], [-x, yt, -z], [x, yt, -z], side);
+    // kanan (+x) & kiri (-x)
+    this.quad([x, y, z], [x, y, -z], [x, yt, -z], [x, yt, z], side2);
+    this.quad([-x, y, -z], [-x, y, z], [-x, yt, z], [-x, yt, -z], side2);
+  };
+  Builder.prototype.finish = function () {
+    return { pos: new Float32Array(this.p), col: new Float32Array(this.c) };
+  };
+
+  function box(w, h, d) {
+    var b = new Builder();
+    b.box(w, h, d, 0, [0.75, 0.75, 0.75]);
+    return b.finish();
   }
-  function box(cx, cy, cz, w, h, d, col) {
-    const x0 = cx - w / 2, x1 = cx + w / 2;
-    const y0 = cy - h / 2, y1 = cy + h / 2;
-    const z0 = cz - d / 2, z1 = cz + d / 2;
-    quad([x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1], col); // top
-    quad([x0, y0, z1], [x1, y0, z1], [x1, y0, z0], [x0, y0, z0], col); // bottom
-    quad([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1], col); // front
-    quad([x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0], col); // back
-    quad([x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0], col); // left
-    quad([x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1], col); // right
+
+  // Bangunan: badan + atap + jendela bercahaya di 2 sisi (variasi dari seed).
+  // RNG lokal (mulberry32) — JANGAN sentuh SB.RNG global, agar urutan
+  // deterministik pemanggil lain tidak rusak.
+  function building(w, h, d, seed) {
+    var s = ((seed || 1) * 2654435761 + 97) | 0;
+    var rnd = function () {
+      s = s + 0x6D2B79F5 | 0;
+      var t = Math.imul(s ^ s >>> 15, 1 | s);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+    var b = new Builder();
+    var palettes = [
+      [0.62, 0.58, 0.52], [0.55, 0.60, 0.68], [0.68, 0.55, 0.50],
+      [0.50, 0.58, 0.55], [0.70, 0.65, 0.55], [0.58, 0.55, 0.62]
+    ];
+    var base = palettes[Math.floor(rnd() * palettes.length)];
+    b.box(w, h, d, 0, base);
+    // atap: slab tipis sedikit lebih lebar, warna gelap
+    b.box(w + 0.4, 0.5, d + 0.4, h, [0.22, 0.22, 0.26]);
+    // antena kecil kadang-kadang
+    if (rnd() < 0.4) {
+      b.box(0.3, 2.2, 0.3, h + 0.5, [0.35, 0.35, 0.38]);
+    }
+    // jendela: grid di sisi depan (+z) dan belakang (-z)
+    var rows = Math.max(1, Math.floor(h / 3.2));
+    var cols = Math.max(1, Math.floor(w / 2.6));
+    var lit = rnd() < 0.5 ? [1.0, 0.85, 0.45] : [0.75, 0.85, 0.95];
+    var dark = [0.12, 0.14, 0.18];
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        var wx = -w / 2 + (c + 0.5) * (w / cols);
+        var wy = 1.6 + r * 3.2;
+        if (wy > h - 1) continue;
+        var on = rnd() < 0.55;
+        var col = on ? lit : dark;
+        var s = 0.55, eps = 0.06;
+        // depan
+        b.quad([wx - s, wy - s, d / 2 + eps], [wx + s, wy - s, d / 2 + eps],
+               [wx + s, wy + s, d / 2 + eps], [wx - s, wy + s, d / 2 + eps], col);
+        // belakang
+        b.quad([wx + s, wy - s, -d / 2 - eps], [wx - s, wy - s, -d / 2 - eps],
+               [wx - s, wy + s, -d / 2 - eps], [wx + s, wy + s, -d / 2 - eps], col);
+      }
+    }
+    return b.finish();
   }
-  return { quad, tri, box, done() { return { verts: new Float32Array(v), idx: new Uint16Array(i), colors: new Float32Array(c) }; } };
-}
 
-export function box(w, h, d, color) {
-  const m = mk(); m.box(0, 0, 0, w, h, d, color); return m.done();
-}
-
-// Triangular prism: triangle cross-section in XY, extruded along Z.
-// Base sits at y=0, apex at y=h.
-export function prism(w, h, d, color) {
-  const m = mk();
-  const a = [-w / 2, 0, 0], b = [w / 2, 0, 0], p = [0, h, 0];
-  const z0 = -d / 2, z1 = d / 2;
-  m.tri([a[0], a[1], z1], [b[0], b[1], z1], [p[0], p[1], z1], color);
-  m.tri([b[0], b[1], z0], [a[0], a[1], z0], [p[0], p[1], z0], color);
-  m.quad([a[0], 0, z0], [b[0], 0, z0], [b[0], 0, z1], [a[0], 0, z1], color);
-  m.quad([b[0], 0, z1], [b[0], 0, z0], [p[0], h, z0], [p[0], h, z1], color);
-  m.quad([a[0], 0, z0], [a[0], 0, z1], [p[0], h, z1], [p[0], h, z0], color);
-  return m.done();
-}
-
-// Cylinder centered on origin, y from -h/2 to h/2.
-export function cyl(r, h, seg, color) {
-  const m = mk();
-  const y0 = -h / 2, y1 = h / 2;
-  const top = [], bot = [];
-  for (let s = 0; s < seg; s++) {
-    const a0 = (s / seg) * Math.PI * 2, a1 = ((s + 1) / seg) * Math.PI * 2;
-    const p0 = [Math.cos(a0) * r, y0, Math.sin(a0) * r];
-    const p1 = [Math.cos(a1) * r, y0, Math.sin(a1) * r];
-    const p2 = [Math.cos(a1) * r, y1, Math.sin(a1) * r];
-    const p3 = [Math.cos(a0) * r, y1, Math.sin(a0) * r];
-    m.quad(p0, p1, p2, p3, color);
-    top.push([Math.cos(a0) * r, y1, Math.sin(a0) * r]);
-    bot.push([Math.cos(a0) * r, y0, Math.sin(a0) * r]);
+  // Mobil: badan bawah + kabin + 4 roda (kotak kecil gelap). Menghadap +z.
+  // color boleh array [r,g,b] 0..1, angka hex 0xRRGGBB, atau string '#RRGGBB'
+  // (vehicles menyimpan warna sebagai angka hex).
+  function car(color) {
+    var c = color || [0.8, 0.2, 0.2];
+    if (typeof c === 'number') {
+      c = [((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255];
+    } else if (typeof c === 'string' && c.charAt(0) === '#' && c.length === 7) {
+      var n = parseInt(c.slice(1), 16);
+      c = [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+    }
+    var b = new Builder();
+    b.box(1.9, 0.55, 4.2, 0.35, c);                       // badan
+    b.box(1.6, 0.55, 2.1, 0.9, [0.15, 0.18, 0.22]);      // kabin/kaca
+    b.box(1.7, 0.12, 2.2, 1.42, b.shade(c, 1.15));        // atap kabin
+    // Roda sebagai kotak di posisi absolut (4 sudut):
+    var wheels = [
+      [-0.95, 1.35], [0.95, 1.35], [-0.95, -1.35], [0.95, -1.35]
+    ];
+    for (var k = 0; k < wheels.length; k++) {
+      var ox = wheels[k][0], oz = wheels[k][1];
+      var xw = 0.18, zw = 0.3, yb = 0.05, yt = 0.6;
+      b.quad([ox - xw, yt, oz - zw], [ox + xw, yt, oz - zw], [ox + xw, yt, oz + zw], [ox - xw, yt, oz + zw], [0.05, 0.05, 0.05]);
+      b.quad([ox - xw, yb, oz + zw], [ox + xw, yb, oz + zw], [ox + xw, yt, oz + zw], [ox - xw, yt, oz + zw], [0.1, 0.1, 0.1]);
+      b.quad([ox + xw, yb, oz - zw], [ox - xw, yb, oz - zw], [ox - xw, yt, oz - zw], [ox + xw, yt, oz - zw], [0.1, 0.1, 0.1]);
+      b.quad([ox + xw, yb, oz + zw], [ox + xw, yb, oz - zw], [ox + xw, yt, oz - zw], [ox + xw, yt, oz + zw], [0.07, 0.07, 0.07]);
+      b.quad([ox - xw, yb, oz - zw], [ox - xw, yb, oz + zw], [ox - xw, yt, oz + zw], [ox - xw, yt, oz - zw], [0.07, 0.07, 0.07]);
+    }
+    return b.finish();
   }
-  for (let s = 1; s + 1 < seg; s++) {
-    m.tri([0, y1, 0], top[s], top[s + 1], color);
-    m.tri([0, y0, 0], bot[s + 1], bot[s], color);
+
+  // Pejalan kaki: kaki, badan, kepala. Tinggi ~1.8.
+  // Warna baju acak via Math.random (bukan SB.RNG) agar tidak mengganggu
+  // urutan deterministik pemanggil lain.
+  function person() {
+    var b = new Builder();
+    var shirt = [[0.8, 0.3, 0.3], [0.3, 0.5, 0.85], [0.9, 0.75, 0.3], [0.35, 0.7, 0.4]][Math.floor(Math.random() * 4)];
+    b.box(0.5, 0.75, 0.28, 0, [0.2, 0.22, 0.3]);        // kaki
+    b.box(0.55, 0.65, 0.32, 0.75, shirt);                // badan
+    b.box(0.36, 0.36, 0.36, 1.4, [0.92, 0.75, 0.6]);     // kepala
+    return b.finish();
   }
-  return m.done();
-}
 
-// Car: body + cabin + 4 dark wheels. Faces +X, length along X.
-export function carMesh(bodyColor) {
-  const m = mk();
-  const dark = [0.08, 0.08, 0.09];
-  m.box(0, 0.62, 0, 2.2, 0.55, 1.1, bodyColor); // body, y 0.35..0.9
-  m.box(-0.1, 1.15, 0, 1.2, 0.5, 1.0, [0.15, 0.2, 0.25]); // cabin
-  for (const sx of [-0.7, 0.7]) for (const sz of [-0.55, 0.55]) {
-    m.box(sx, 0.18, sz, 0.35, 0.36, 0.2, dark);
+  // Speedboat: lambung runcing (pakai kotak + haluan segitiga) + konsol.
+  function boat() {
+    var b = new Builder();
+    var hull = [0.95, 0.95, 0.95];
+    // lambung: kotak utama
+    b.box(2.0, 0.7, 4.6, 0.1, hull);
+    // haluan: prisma segitiga di depan (+z)
+    var tip = [0, 0.8, 3.4];
+    var bw = 1.0, by = 0.1, ty = 0.8, bz = 2.3;
+    b.tri([-bw, by, bz], [bw, by, bz], tip, b.shade(hull, 0.9));
+    b.tri([bw, by, bz], [bw, ty, bz], tip, b.shade(hull, 0.75));
+    b.tri([-bw, ty, bz], [-bw, by, bz], tip, b.shade(hull, 0.75));
+    b.tri([-bw, ty, bz], [bw, ty, bz], tip, b.shade(hull, 1.15));
+    // konsol + kursi
+    b.box(1.1, 0.7, 0.9, 0.8, [0.2, 0.25, 0.3]);
+    b.box(1.2, 0.15, 1.0, 1.5, [0.15, 0.2, 0.25]);
+    // mesin belakang
+    b.box(0.7, 0.6, 0.5, 0.35, [0.12, 0.12, 0.14]);
+    return b.finish();
   }
-  return m.done();
-}
 
-// Building: plain box + lit windows (different color) on front/back.
-export function buildingMesh(w, h, d, winColor) {
-  const m = mk();
-  m.box(0, h / 2, 0, w, h, d, [0.72, 0.72, 0.76]);
-  const cols = Math.max(1, Math.floor(w / 1.4)), rows = Math.max(1, Math.floor(h / 1.6));
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-    const x = -w / 2 + ((c + 0.5) / cols) * w;
-    const y = 1.0 + r * 1.6 + 0.35;
-    if (y + 0.35 > h - 0.3) continue;
-    const ww = 0.55, wh = 0.7;
-    m.quad([x - ww / 2, y - wh / 2, d / 2 + 0.02], [x + ww / 2, y - wh / 2, d / 2 + 0.02],
-      [x + ww / 2, y + wh / 2, d / 2 + 0.02], [x - ww / 2, y + wh / 2, d / 2 + 0.02], winColor);
-    m.quad([x + ww / 2, y - wh / 2, -d / 2 - 0.02], [x - ww / 2, y - wh / 2, -d / 2 - 0.02],
-      [x - ww / 2, y + wh / 2, -d / 2 - 0.02], [x + ww / 2, y + wh / 2, -d / 2 - 0.02], winColor);
+  // Pohon: batang + 2 lapis tajuk kotak.
+  function tree() {
+    var b = new Builder();
+    b.box(0.35, 1.6, 0.35, 0, [0.45, 0.3, 0.18]);
+    b.box(1.9, 1.3, 1.9, 1.5, [0.25, 0.55, 0.25]);
+    b.box(1.3, 1.0, 1.3, 2.7, [0.3, 0.62, 0.28]);
+    return b.finish();
   }
-  return m.done();
-}
 
-export function treeMesh() {
-  const m = mk();
-  // Trunk is a box (keeps one builder); canopy is two green boxes.
-  const green = [0.16, 0.5, 0.2], green2 = [0.2, 0.6, 0.24];
-  m.box(0, 0.5, 0, 0.28, 1.0, 0.28, [0.4, 0.26, 0.14]);
-  m.box(0, 1.6, 0, 1.5, 1.3, 1.5, green);
-  m.box(0, 2.5, 0, 0.95, 0.8, 0.95, green2);
-  return m.done();
-}
-
-// Simple person: legs, shirt torso, arms, skin head. ~1.8 tall.
-export function personMesh(shirtColor, skinColor) {
-  const m = mk();
-  const pants = [0.15, 0.18, 0.25];
-  m.box(-0.12, 0.3, 0, 0.18, 0.6, 0.2, pants);
-  m.box(0.12, 0.3, 0, 0.18, 0.6, 0.2, pants);
-  m.box(0, 0.95, 0, 0.55, 0.7, 0.32, shirtColor); // torso
-  m.box(-0.36, 0.95, 0, 0.14, 0.6, 0.18, shirtColor); // arms
-  m.box(0.36, 0.95, 0, 0.14, 0.6, 0.18, shirtColor);
-  m.box(0, 1.55, 0, 0.36, 0.36, 0.36, skinColor); // head
-  return m.done();
-}
-
-// Boat: hull box + bow prism + cabin + mast. Faces +X.
-export function boatMesh(color) {
-  const m = mk();
-  m.box(-0.2, 0.3, 0, 2.2, 0.55, 1.0, color); // hull
-  m.box(-0.1, 0.75, 0, 0.9, 0.35, 0.8, [0.9, 0.9, 0.88]); // cabin
-  m.box(0.1, 1.35, 0, 0.08, 1.3, 0.08, [0.35, 0.25, 0.15]); // mast
-  m.tri([0.1, 1.9, 0], [0.1, 1.0, 0], [0.95, 1.0, 0], [0.95, 0.95, 0.9]); // sail
-  return m.done();
-}
-
-// Road segment: flat dark strip with a center line, 40 long (X) x 6 wide (Z).
-export function roadMesh() {
-  const m = mk();
-  m.box(0, -0.05, 0, 40, 0.1, 6, [0.16, 0.16, 0.18]);
-  m.box(0, 0.02, 0, 40, 0.02, 0.16, [0.9, 0.8, 0.2]); // center line
-  m.box(0, 0.02, -2.75, 40, 0.02, 0.12, [0.85, 0.85, 0.85]); // edges
-  m.box(0, 0.02, 2.75, 40, 0.02, 0.12, [0.85, 0.85, 0.85]);
-  return m.done();
-}
+  SB.Meshes = {
+    box: box, building: building, car: car,
+    person: person, boat: boat, tree: tree
+  };
+})();

@@ -1,1 +1,1 @@
-{"shots":[{"id":"start","seed":7},{"id":"play","seed":7},{"id":"foot","seed":7},{"id":"end","seed":7}]}
+{"shots":[{"name":"start","url":"/?shot=start"},{"name":"play","url":"/?shot=play"},{"name":"foot","url":"/?shot=foot"},{"name":"end","url":"/?shot=end"}]}

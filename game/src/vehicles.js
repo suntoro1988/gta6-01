@@ -1,224 +1,223 @@
-// Sunset Bay — traffic AI, parked cars and driving physics (fresh v6 rewrite).
-import { makeRng } from './rng.js';
+// Sunset Bay — vehicles module (v7, written fresh from SPEC)
+// 14 AI traffic cars driving the road grid + 5 parked cars. The player
+// can steal / enter / exit cars (E). AI cars pause briefly at crossings.
+(function () {
+  var SB = window.SB = window.SB || {};
 
-function toRng(seed, fallback) {
-  if (seed && typeof seed.next === 'function') return seed;
-  return makeRng(seed == null ? fallback : seed);
-}
-import { ROAD_STEP, ROAD_HALF, SEA_X } from './city.js';
+  var COLORS = [0xd83a2e, 0x2e6fd8, 0xe8c832, 0xeeeeee, 0x222222, 0x3aa655,
+    0xd86a1e, 0x7a4fd0, 0x9fb4c0, 0x5a2e1e, 0xc0c0c0, 0x1e8a8a];
+  var MAX_SPEED = 30, AI_SPEED_MIN = 8, AI_SPEED_MAX = 14;
+  var DRIFT_MIN_SPEED = 8, DRIFT_REWARD = 50, DRIFT_COOLDOWN = 2;
+  var driftCd = 0; // cooldown antar bonus drift (detik) — anti spam
 
-export const CAR_COLORS = [
-  '#c0392b', '#e74c3c', '#e67e22', '#f1c40f', '#f39c12', '#27ae60',
-  '#16a085', '#2980b9', '#3498db', '#8e44ad', '#9b59b6', '#ecf0f1',
-  '#bdc3c7', '#95a5a6', '#7f8c8d', '#2c3e50', '#34495e', '#d35400',
-  '#1abc9c', '#ff6b81', '#ffd32a', '#2ed573', '#ffa502', '#ff4757',
-];
-
-const DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1]];
-const CAR_R = 2.4; // collision radius used for cars (circle vs AABB)
-
-function roadCoord(v) { return Math.round(v / ROAD_STEP) * ROAD_STEP; }
-
-function nearCrossing(x, z) {
-  return Math.abs(x - roadCoord(x)) < 4 && Math.abs(z - roadCoord(z)) < 4;
-}
-
-// Circle vs AABB: returns push-out info or null.
-function hitBuilding(city, x, z, r) {
-  for (const c of city.colliders) {
-    const cx = Math.max(c.x0, Math.min(x, c.x1));
-    const cz = Math.max(c.z0, Math.min(z, c.z1));
-    let dx = x - cx, dz = z - cz;
-    let d2 = dx * dx + dz * dz;
-    if (d2 >= r * r) continue;
-    let d = Math.sqrt(d2);
-    if (d < 0.001) { dx = 0; dz = -1; d = 1; }
-    return { nx: dx / d, nz: dz / d, depth: r - d };
-  }
-  return null;
-}
-
-function spawnTrafficCar(city, rng) {
-  const vertical = rng.next() < 0.5;
-  const line = (Math.floor(rng.next() * 13) - 6) * ROAD_STEP;
-  const along = (rng.next() * 2 - 1) * 300;
-  const dir = vertical ? (rng.next() < 0.5 ? 1 : 3) : (rng.next() < 0.5 ? 0 : 2);
-  const x = vertical ? line : along;
-  const z = vertical ? along : line;
-  const max = 9 + rng.next() * 8;
-  return {
-    kind: 'traffic',
-    x, z, dir,
-    angle: Math.atan2(DIRS[dir][1], DIRS[dir][0]),
-    speed: max * (0.5 + rng.next() * 0.5), max,
-    color: CAR_COLORS[Math.floor(rng.next() * CAR_COLORS.length)],
-    len: 4.4, wid: 2, damage: 0,
-  };
-}
-
-function spawnParkedCar(city, rng) {
-  const vertical = rng.next() < 0.5;
-  const line = (Math.floor(rng.next() * 13) - 6) * ROAD_STEP;
-  const along = (rng.next() * 2 - 1) * 280;
-  const side = rng.next() < 0.5 ? 1 : -1;
-  const off = ROAD_HALF + 3.2;
-  const x = vertical ? line + side * off : along;
-  const z = vertical ? along : line + side * off;
-  if (x > SEA_X - 8) return null;
-  const angle = vertical ? (side > 0 ? Math.PI / 2 : -Math.PI / 2) : (side > 0 ? 0 : Math.PI);
-  const max = 22 + rng.next() * 12;
-  return {
-    kind: 'parked',
-    x, z, dir: vertical ? 1 : 0,
-    angle, speed: 0, max,
-    color: CAR_COLORS[Math.floor(rng.next() * CAR_COLORS.length)],
-    len: 4.4, wid: 2, damage: 0,
-  };
-}
-
-export function createTraffic(city, seed, count) {
-  const rng = toRng(seed, 4242);
-  const cars = [];
-  const n = count || 14;
-  for (let i = 0; i < n; i++) cars.push(spawnTrafficCar(city, rng));
-  const parked = [];
-  let guard = 0;
-  while (parked.length < 5 && guard++ < 40) {
-    const p = spawnParkedCar(city, rng);
-    if (p) parked.push(p);
-  }
-  const all = () => cars.concat(parked);
-
-  function carAhead(car, dist) {
-    const dv = DIRS[car.dir];
-    for (const o of cars) {
-      if (o === car) continue;
-      const dx = o.x - car.x, dz = o.z - car.z;
-      const fwd = dx * dv[0] + dz * dv[1];
-      if (fwd > 0 && fwd < dist && Math.abs(dx * dv[1] - dz * dv[0]) < 3.2) return o;
-    }
-    return null;
+  var keys = {};
+  if (typeof window !== "undefined") {
+    window.addEventListener("keydown", function (e) { keys[e.key.toLowerCase()] = true; });
+    window.addEventListener("keyup", function (e) { keys[e.key.toLowerCase()] = false; });
   }
 
-  function stepTraffic(car, dt, player, wanted) {
-    let want = car.max;
-    if (carAhead(car, 16)) want = 0;
-    if (wanted > 0 && player) {
-      const dx = car.x - player.x, dz = car.z - player.z;
-      if (dx * dx + dz * dz < 30 * 30) want = Math.min(want, car.max * 0.4);
+  function pickRoad(rngRoads, axis) {
+    var pool = [];
+    var i;
+    for (i = 0; i < rngRoads.length; i++) {
+      if (!axis || rngRoads[i].axis === axis) pool.push(rngRoads[i]);
     }
-    car.speed += Math.max(-14, Math.min(10, want - car.speed)) * dt * 2;
-    if (car.speed < 0) car.speed = 0;
-    const dv = DIRS[car.dir];
-    car.x += dv[0] * car.speed * dt;
-    car.z += dv[1] * car.speed * dt;
-    if (nearCrossing(car.x, car.z) && rng.next() < 0.3) {
-      const turn = rng.next() < 0.5 ? 1 : 3; // left or right, never reverse
-      car.dir = (car.dir + turn) % 4;
-      car.x = roadCoord(car.x);
-      car.z = roadCoord(car.z);
-      car.angle = Math.atan2(DIRS[car.dir][1], DIRS[car.dir][0]);
-    }
-    if (car.x > 360 || car.x < -360 || car.z > 360 || car.z < -360) {
-      car.dir = (car.dir + 2) % 4;
-      car.angle = Math.atan2(DIRS[car.dir][1], DIRS[car.dir][0]);
-    }
+    return pool.length ? pool[Math.floor(Math.random() * pool.length)] : rngRoads[0];
   }
 
-  // Player driving physics for the car in player.vehicle.
-  // player: {x, z, angle, speed, vehicle, input:{throttle, steer, handbrake}}
-  function drivePlayer(player, dt) {
-    const v = player.vehicle;
-    if (!v || v.kind === 'boat') return;
-    const inp = player.input || {};
-    const th = inp.throttle || 0, st = inp.steer || 0;
-    const maxF = v.max || 32, maxR = 10;
-    const ratio = Math.min(1, Math.abs(player.speed) / maxF);
-    // Progressive steering: sharp at low speed, stable at high speed.
-    const steerMax = 1.9 - 1.15 * ratio;
-    const grip = inp.handbrake ? 0.35 : 1;
-    const spdSign = Math.sign(player.speed || 1);
-    player.angle += st * steerMax * grip * spdSign * dt * (0.25 + 0.75 * ratio);
-    if (inp.handbrake) player.angle += st * 0.9 * spdSign * dt; // drift yaw
-    player.speed += th * 22 * dt;
-    if (inp.handbrake) player.speed -= player.speed * 1.4 * dt;
-    player.speed -= player.speed * 0.35 * dt; // drag + rolling resistance
-    if (th < 0 && player.speed > 0.5) player.speed -= 26 * dt; // brake
-    if (player.speed > maxF) player.speed = maxF;
-    if (player.speed < -maxR) player.speed = -maxR;
-    player.x += Math.cos(player.angle) * player.speed * dt;
-    player.z += Math.sin(player.angle) * player.speed * dt;
-    // Wall slide / bounce against buildings (circle vs AABB).
-    const hit = hitBuilding(city, player.x, player.z, CAR_R);
-    if (hit) {
-      player.x += hit.nx * hit.depth;
-      player.z += hit.nz * hit.depth;
-      const fx = Math.cos(player.angle), fz = Math.sin(player.angle);
-      const into = fx * hit.nx + fz * hit.nz;
-      if (into < 0) {
-        // Head-on component bounces back, sideways component slides.
-        player.speed *= -0.3;
-        v.damage = Math.min(1, (v.damage || 0) + 0.05);
+  function carOnRoad(road) {
+    var along = -260 + Math.random() * 520;
+    var lane = (Math.random() < 0.5 ? -1 : 1) * 2;
+    var dir = Math.random() < 0.5 ? 1 : -1;
+    var c = {
+      x: road.axis === "z" ? road.at + lane : along,
+      z: road.axis === "z" ? along : road.at + lane,
+      yaw: 0, speed: AI_SPEED_MIN + Math.random() * (AI_SPEED_MAX - AI_SPEED_MIN),
+      road: road, dir: dir, lane: lane, stop: 0, stopCd: 4 + Math.random() * 6,
+      color: COLORS[Math.floor(Math.random() * COLORS.length)],
+      ai: true, parked: false, driven: false, mesh: null
+    };
+    c.yaw = road.axis === "z" ? (dir > 0 ? 0 : Math.PI) : (dir > 0 ? Math.PI / 2 : -Math.PI / 2);
+    return c;
+  }
+
+  function hitsBuilding(x, z) {
+    var list = SB.City && SB.City.buildings;
+    if (!list) return false;
+    var i, b;
+    for (i = 0; i < list.length; i++) {
+      b = list[i];
+      if (Math.abs(x - b.x) < b.w / 2 + 1.5 && Math.abs(z - b.z) < b.d / 2 + 1.5) return true;
+    }
+    return false;
+  }
+
+  var Vehicles = {
+    cars: [],
+
+    spawnTraffic: function () {
+      var roads = (SB.City && SB.City.roads) || [];
+      this.cars = [];
+      var i;
+      if (roads.length) {
+        for (i = 0; i < 14; i++) this.cars.push(carOnRoad(pickRoad(roads)));
+      }
+      // 5 parked cars at curbside spots around the districts.
+      var spots = [
+        { x: -104, z: -40, yaw: 0 },            // Downtown edge
+        { x: 20, z: 120, yaw: Math.PI / 2 },    // Old Town
+        { x: -200, z: 120, yaw: 0 },            // Marina Bay
+        { x: 100, z: -200, yaw: Math.PI / 2 },  // Uptown
+        { x: 220, z: 200, yaw: 0 }              // Industrial
+      ];
+      for (i = 0; i < spots.length; i++) {
+        this.cars.push({
+          x: spots[i].x, z: spots[i].z, yaw: spots[i].yaw, speed: 0,
+          road: null, dir: 0, lane: 0, stop: 0, stopCd: 0,
+          color: COLORS[(i * 3 + 1) % COLORS.length],
+          ai: false, parked: true, driven: false, mesh: null
+        });
+      }
+    },
+
+    nearestParked: function (x, z) {
+      var best = null, bestD = 144; // within 12 units
+      var i, c, d;
+      for (i = 0; i < this.cars.length; i++) {
+        c = this.cars[i];
+        if (!c.parked) continue;
+        d = (c.x - x) * (c.x - x) + (c.z - z) * (c.z - z);
+        if (d < bestD) { bestD = d; best = c; }
+      }
+      return best;
+    },
+
+    // Take the closest car (parked or AI) within 6 units of the player.
+    stealNearest: function () {
+      var p = SB.G && SB.G.player;
+      if (!p || p.inCar || p.inBoat) return null;
+      var best = null, bestD = 36;
+      var i, c, d;
+      for (i = 0; i < this.cars.length; i++) {
+        c = this.cars[i];
+        if (c.driven) continue;
+        d = (c.x - p.x) * (c.x - p.x) + (c.z - p.z) * (c.z - p.z);
+        if (d < bestD) { bestD = d; best = c; }
+      }
+      if (!best) return null;
+      this.enterCar(best);
+      return best;
+    },
+
+    enterCar: function (car) {
+      var p = SB.G && SB.G.player;
+      if (!p || !car) return;
+      car.ai = false;
+      car.parked = false;
+      car.driven = true;
+      car.speed = 0;
+      p.inCar = true;
+      p.inBoat = false;
+      p.car = car;
+      if (SB.HUD) SB.HUD.showMessage("Mengemudi — W gas, S rem, A/D belok, Space drift, E keluar");
+    },
+
+    exitCar: function () {
+      var p = SB.G && SB.G.player;
+      if (!p || !p.inCar || !p.car) return;
+      var car = p.car;
+      car.driven = false;
+      car.parked = true;
+      car.speed = 0;
+      p.inCar = false;
+      p.car = null;
+      var spot = { x: car.x + 3, z: car.z + 2 };
+      if (SB.City && SB.City.findClearSpot) spot = SB.City.findClearSpot(car.x + 3, car.z + 2, 1);
+      p.x = spot.x; p.z = spot.z; p.speed = 0;
+    },
+
+    update: function (dt) {
+      var p = SB.G && SB.G.player;
+      var i, c;
+      for (i = 0; i < this.cars.length; i++) {
+        c = this.cars[i];
+        if (c.driven) {
+          // Player-driven car.
+          if (keys["w"] || keys["arrowup"]) c.speed += 16 * dt;
+          else if (keys["s"] || keys["arrowdown"]) c.speed -= 22 * dt;
+          else c.speed -= Math.sign(c.speed) * 8 * dt;
+          if (c.speed > MAX_SPEED) c.speed = MAX_SPEED;
+          if (c.speed < -8) c.speed = -8;
+          if (Math.abs(c.speed) < 0.2 && !keys["w"] && !keys["s"]) c.speed = 0;
+          var steer = 0;
+          if (keys["a"] || keys["arrowleft"]) steer += 1;
+          if (keys["d"] || keys["arrowright"]) steer -= 1;
+          // Drift: Space + belok (A/D) saat kecepatan > 8. Input drift
+          // disinkron main.js ke G.input.drift (Space); keys[" "] cadangan.
+          var driftHeld = (SB.G && SB.G.input && SB.G.input.drift) || keys[" "];
+          var drifting = driftHeld && steer !== 0 && c.speed > DRIFT_MIN_SPEED;
+          if (driftCd > 0) driftCd -= dt;
+          if (drifting && driftCd <= 0) {
+            driftCd = DRIFT_COOLDOWN;
+            SB.G.money += DRIFT_REWARD;
+            SB.G.drifts = (SB.G.drifts || 0) + 1;
+            if (SB.HUD) SB.HUD.showMessage("Drift +$" + DRIFT_REWARD);
+            if (SB.Audio) SB.Audio.sfx("pickup");
+          }
+          // Saat drift, mobil berbelok lebih tajam (rasa selip).
+          c.yaw += steer * 1.9 * dt * Math.min(1, Math.abs(c.speed) / 10) * (drifting ? 1.6 : 1);
+          var nx = c.x + Math.sin(c.yaw) * c.speed * dt;
+          var nz = c.z + Math.cos(c.yaw) * c.speed * dt;
+          if (!hitsBuilding(nx, nz) && nx > -278 && nx < 278 && nz > -278 && nz < 278) {
+            c.x = nx; c.z = nz;
+          } else {
+            c.speed *= 0.3; // bumped into something
+          }
+          if (p) { p.x = c.x; p.z = c.z; p.yaw = c.yaw; p.speed = c.speed; }
+          continue;
+        }
+        if (!c.ai || !c.road) continue;
+        // AI traffic.
+        if (c.stopCd > 0) c.stopCd -= dt;
+        if (c.stop > 0) { c.stop -= dt; continue; }
+        var step = c.speed * c.dir * dt;
+        if (c.road.axis === "z") c.z += step; else c.x += step;
+        var along = c.road.axis === "z" ? c.z : c.x;
+        // Pause briefly at crossings (grid lines) sometimes.
+        if (c.stopCd <= 0) {
+          var near = Math.abs(((along + 28) % 56) - 28);
+          if (near < 3 && Math.random() < 0.4) {
+            c.stop = 1 + Math.random() * 1.5;
+            c.stopCd = 6 + Math.random() * 6;
+          }
+        }
+        // End of the road: turn onto a crossing road at this intersection.
+        if (along > 276 || along < -276) {
+          var cross = pickRoad(SB.City.roads, c.road.axis === "z" ? "x" : "z");
+          var at = Math.max(-280, Math.min(280, Math.round(along / 56) * 56));
+          if (c.road.axis === "z") { c.z = at; c.road = cross; c.x = cross.at + c.lane; }
+          else { c.x = at; c.road = cross; c.z = cross.at + c.lane; }
+          c.dir = Math.random() < 0.5 ? 1 : -1;
+          c.yaw = c.road.axis === "z" ? (c.dir > 0 ? 0 : Math.PI) : (c.dir > 0 ? Math.PI / 2 : -Math.PI / 2);
+        }
+      }
+    },
+
+    draw: function () {
+      if (!SB.GL || !SB.GL.draw || !SB.Meshes || !SB.Meshes.car) return;
+      var i, c, m;
+      for (i = 0; i < this.cars.length; i++) {
+        c = this.cars[i];
+        if (!c.mesh) c.mesh = SB.Meshes.car(c.color);
+        m = SB.Math3.mat4Mul(
+          // Mesh mobil beralas di y~0 (BUKAN berpusat) — tanpa offset 0.7.
+          SB.Math3.mat4Translate(c.x, 0, c.z),
+          SB.Math3.mat4RotateY(c.yaw)
+        );
+        SB.GL.draw(c.mesh, m);
       }
     }
-    // Soft bump against other cars.
-    for (const o of all()) {
-      if (o === v) continue;
-      const dx = player.x - o.x, dz = player.z - o.z;
-      const d2 = dx * dx + dz * dz;
-      if (d2 < 5 * 5 && d2 > 0.01) {
-        const d = Math.sqrt(d2);
-        player.x = o.x + dx / d * 5;
-        player.z = o.z + dz / d * 5;
-        player.speed *= 0.6;
-      }
-    }
-    v.x = player.x; v.z = player.z; v.angle = player.angle; v.speed = player.speed;
-  }
+  };
 
-  function update(dt, player, wanted) {
-    for (const c of cars) if (!c.driver) stepTraffic(c, dt, player, wanted || 0);
-    if (player && player.vehicle) drivePlayer(player, dt);
-  }
-
-  function nearestRide(player, maxD) {
-    let best = null, bd = maxD * maxD;
-    for (const o of all()) {
-      const dx = o.x - player.x, dz = o.z - player.z, d2 = dx * dx + dz * dz;
-      if (d2 < bd) { bd = d2; best = o; }
-    }
-    if (player.boat) {
-      const dx = player.boat.x - player.x, dz = player.boat.z - player.z;
-      if (dx * dx + dz * dz < bd) best = player.boat;
-    }
-    return best;
-  }
-
-  // Player presses E near a car (or the speedboat) to get in.
-  function enterNearest(player) {
-    if (player.vehicle) return player.vehicle;
-    const ride = nearestRide(player, 7.5);
-    if (!ride) return null;
-    player.vehicle = ride;
-    player.inCar = true;
-    player.angle = ride.angle || 0;
-    player.speed = 0;
-    ride.driver = player;
-    return ride;
-  }
-
-  function exitCar(player) {
-    const v = player.vehicle;
-    if (!v) return false;
-    const side = (v.angle || 0) + Math.PI / 2;
-    player.x = v.x + Math.cos(side) * 4;
-    player.z = v.z + Math.sin(side) * 4;
-    player.vehicle = null;
-    player.inCar = false;
-    player.speed = 0;
-    if (v.driver === player) v.driver = null;
-    return true;
-  }
-
-  return { cars, parked, update, enterNearest, exitCar };
-}
+  SB.Vehicles = Vehicles;
+})();

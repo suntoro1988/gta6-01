@@ -1,63 +1,77 @@
-// math3.js — tiny 3D math helpers. Plain arrays for vectors,
-// Float32Array (column-major) for 4x4 matrices, WebGL style.
-export function v3(x = 0, y = 0, z = 0) { return [x, y, z]; }
-export function add(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
-export function sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
-export function scale(a, s) { return [a[0] * s, a[1] * s, a[2] * s]; }
-export function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
-export function cross(a, b) {
-  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-}
-export function len(a) { return Math.hypot(a[0], a[1], a[2]); }
-export function norm(a) {
-  const l = len(a) || 1;
-  return [a[0] / l, a[1] / l, a[2] / l];
-}
-export function mat4Identity() {
-  const m = new Float32Array(16);
-  m[0] = m[5] = m[10] = m[15] = 1;
-  return m;
-}
-// Column-major multiply: out = a * b (apply b first, then a).
-export function mat4Mul(a, b) {
-  const o = new Float32Array(16);
-  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
-    let s = 0;
-    for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
-    o[c * 4 + r] = s;
+// Sunset Bay — math3: vektor 3D dan matriks 4x4 (column-major, array 16 angka).
+(function () {
+  var SB = window.SB = window.SB || {};
+
+  function v3(x, y, z) { return [x || 0, y || 0, z || 0]; }
+  function add(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
+  function sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+  function scale(a, s) { return [a[0] * s, a[1] * s, a[2] * s]; }
+  function len(a) { return Math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]); }
+  function norm(a) {
+    var l = len(a);
+    return l > 0.000001 ? [a[0] / l, a[1] / l, a[2] / l] : [0, 0, 0];
   }
-  return o;
-}
-export function mat4Persp(fov, aspect, near, far) {
-  const f = 1 / Math.tan(fov / 2), m = new Float32Array(16);
-  m[0] = f / aspect; m[5] = f;
-  m[10] = (far + near) / (near - far); m[11] = -1;
-  m[14] = (2 * far * near) / (near - far);
-  return m;
-}
-export function mat4LookAt(eye, target, up) {
-  const z = norm(sub(eye, target));
-  const x = norm(cross(up, z));
-  const y = cross(z, x);
-  const m = mat4Identity();
-  m[0] = x[0]; m[1] = y[0]; m[2] = z[0];
-  m[4] = x[1]; m[5] = y[1]; m[6] = z[1];
-  m[8] = x[2]; m[9] = y[2]; m[10] = z[2];
-  m[12] = -dot(x, eye); m[13] = -dot(y, eye); m[14] = -dot(z, eye);
-  return m;
-}
-export function mat4Trans(x, y, z) {
-  const m = mat4Identity();
-  m[12] = x; m[13] = y; m[14] = z;
-  return m;
-}
-export function mat4RotY(a) {
-  const c = Math.cos(a), s = Math.sin(a), m = mat4Identity();
-  m[0] = c; m[2] = -s; m[8] = s; m[10] = c;
-  return m;
-}
-export function mat4RotX(a) {
-  const c = Math.cos(a), s = Math.sin(a), m = mat4Identity();
-  m[5] = c; m[6] = s; m[9] = -s; m[10] = c;
-  return m;
-}
+  function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+  function cross(a, b) {
+    return [
+      a[1] * b[2] - a[2] * b[1],
+      a[2] * b[0] - a[0] * b[2],
+      a[0] * b[1] - a[1] * b[0]
+    ];
+  }
+
+  function mat4Identity() {
+    return [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  }
+  function mat4Translate(x, y, z) {
+    var m = mat4Identity();
+    m[12] = x; m[13] = y; m[14] = z;
+    return m;
+  }
+  function mat4RotateY(a) {
+    var c = Math.cos(a), s = Math.sin(a);
+    // column-major: kolom 0 = (c,0,-s), kolom 2 = (s,0,c)
+    return [c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1];
+  }
+  function mat4Mul(a, b) {
+    // hasil = a * b, column-major: out[col*4+row] = sum_k a[k*4+row]*b[col*4+k]
+    var o = new Array(16);
+    for (var c = 0; c < 4; c++) {
+      for (var r = 0; r < 4; r++) {
+        var s = 0;
+        for (var k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+        o[c * 4 + r] = s;
+      }
+    }
+    return o;
+  }
+  function mat4Perspective(fov, aspect, near, far) {
+    var f = 1 / Math.tan(fov / 2);
+    var nf = 1 / (near - far);
+    return [
+      f / aspect, 0, 0, 0,
+      0, f, 0, 0,
+      0, 0, (far + near) * nf, -1,
+      0, 0, 2 * far * near * nf, 0
+    ];
+  }
+  function mat4LookAt(eye, center, up) {
+    var z = norm(sub(eye, center));       // sumbu kamera menghadap -z
+    var x = norm(cross(up, z));
+    var y = cross(z, x);
+    return [
+      x[0], y[0], z[0], 0,
+      x[1], y[1], z[1], 0,
+      x[2], y[2], z[2], 0,
+      -dot(x, eye), -dot(y, eye), -dot(z, eye), 1
+    ];
+  }
+
+  SB.Math3 = {
+    v3: v3, add: add, sub: sub, scale: scale, len: len, norm: norm,
+    dot: dot, cross: cross,
+    mat4Identity: mat4Identity, mat4Translate: mat4Translate,
+    mat4RotateY: mat4RotateY, mat4Mul: mat4Mul,
+    mat4Perspective: mat4Perspective, mat4LookAt: mat4LookAt
+  };
+})();

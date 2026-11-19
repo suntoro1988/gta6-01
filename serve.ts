@@ -1,52 +1,62 @@
+// Sunset Bay — static file server for local play and screenshots.
+// Serves only the game/ directory. Node 22 stdlib only.
+
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
-import { extname, join, normalize, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readFile, stat } from "node:fs/promises";
+import { extname, join, normalize, resolve } from "node:path";
 
-// Local dev server for Sunset Bay. No dependencies, Node 22 only.
-// Usage: node serve.ts [port]   (default port 8080)
-// Query strings such as ?seed=7 or ?shot=play are left alone: the game
-// reads them client-side, the server only resolves the path part.
-const root = resolve(fileURLToPath(new URL(".", import.meta.url)));
-const port = Number(process.argv[2] ?? 8080);
+const PORT = Number(process.env.PORT || 8080);
+const GAME_DIR = resolve(new URL("./game", import.meta.url).pathname);
 
-const TYPES: Record<string, string> = {
+const CONTENT_TYPES = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
-  ".mjs": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
   ".ico": "image/x-icon",
-  ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".json": "application/json; charset=utf-8",
   ".svg": "image/svg+xml",
-  ".wasm": "application/wasm",
+  ".txt": "text/plain; charset=utf-8",
 };
 
 const server = createServer(async (req, res) => {
   try {
-    const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    let path = decodeURIComponent(url.pathname);
-    if (path === "/") path = "/game/index.html";
-    const clean = normalize(path).replace(/^(\.\.[/\\])+/, "");
-    const file = resolve(join(root, clean));
-    if (file !== root && !file.startsWith(root + sep)) {
-      res.writeHead(403, { "content-type": "text/plain" });
-      res.end("forbidden");
+    const url = new URL(req.url || "/", "http://localhost");
+    let pathname = decodeURIComponent(url.pathname);
+    if (pathname === "/") pathname = "/index.html";
+
+    const target = resolve(join(GAME_DIR, normalize(pathname)));
+    if (!target.startsWith(GAME_DIR + "/") && target !== GAME_DIR) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("404 Not Found\n");
       return;
     }
-    const body = await readFile(file);
+
+    const info = await stat(target);
+    if (!info.isFile()) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("404 Not Found\n");
+      return;
+    }
+
+    const body = await readFile(target);
+    const type =
+      CONTENT_TYPES[extname(target).toLowerCase()] ||
+      "application/octet-stream";
     res.writeHead(200, {
-      "content-type": TYPES[extname(file)] ?? "application/octet-stream",
+      "Content-Type": type,
+      "Content-Length": body.length,
+      "Cache-Control": "no-store",
     });
     res.end(body);
   } catch {
-    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-    res.end("not found");
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("404 Not Found\n");
   }
 });
 
-server.listen(port, () => {
-  console.log(`Sunset Bay dev server: http://localhost:${port}/`);
+server.listen(PORT, () => {
+  console.log(`Sunset Bay serving game/ on http://localhost:${PORT}`);
 });

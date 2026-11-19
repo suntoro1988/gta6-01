@@ -1,370 +1,463 @@
-// game.js — Sunset Bay core: state, missions, wanted, clock, stash, save/load.
-// Fresh build. Imports jobs (MISSIONS), player, city (collider) and vehicles
-// (wanted/heli visuals only — every call guarded; game.js owns the logic).
-import { MISSIONS, taxiJob } from './jobs.js';
-import { createPlayer } from './player.js';
-import * as City from './city.js';
-import * as Vehicles from './vehicles.js';
+(function () {
+  "use strict";
+  var SB = window.SB = window.SB || {};
+  var SAVE_KEY = "sunset-bay-save-v1";
+  var SAFE = { x: 8, z: 8 }; // safehouse
+  var GARAGE = { x: 60, z: -40 }; // garage Downtown (respray)
+  var bustT = 0, decayT = 0;
 
-export const SAVE_KEY = 'sunset-bay-save-v1';
-const DAY_SECONDS = 360; // one full 24h cycle = 360 real seconds (1 game-hour = 15s)
-const BOUND = 380;
-const SAFEHOUSE = { x: 0, z: 0 };
-const STASH_SPOTS = [
-  { id: 0, x: 210, z: -140 }, { id: 1, x: -260, z: 90 }, { id: 2, x: 40, z: 300 },
-  { id: 3, x: -120, z: -280 }, { id: 4, x: 300, z: 180 }, { id: 5, x: -40, z: -40 },
-];
-const REP_RANKS = [
-  { min: 0, name: 'ROOKIE' }, { min: 600, name: 'HUSTLER' }, { min: 1300, name: 'KINGPIN' },
-];
-const CRIME_WANTED = { steal: 1, hit: 1, shoot: 1, kill: 2 };
-
-const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
-const d2 = (ax, az, bx, bz) => Math.hypot(ax - bx, az - bz);
-const num = (v, d, a, b) => { const n = Number(v); return Number.isFinite(n) ? clamp(n, a, b) : d; };
-
-// 0 = deep night, 1 = noon. Clock 18:00 (sunset) -> 0, 12:00 -> 1, 0:00 -> 0.
-export function daylight(clock) {
-  const s = Math.sin((clock - 6) / 12 * Math.PI);
-  if (s <= 0.001) return 0;
-  if (s >= 0.999) return 1;
-  return s;
-}
-function rankFor(rep) {
-  let r = REP_RANKS[0];
-  for (const k of REP_RANKS) if (rep >= k.min) r = k;
-  return r.name;
-}
-function parTime(m) { return 60 + m.stages.length * 40; }
-
-function defaultState() {
-  return {
-    money: 250, rep: 0, repRank: 'ROOKIE', wanted: 0, heat: 0,
-    missionIndex: 0, stageIndex: 0, missionActive: false, missionTime: 0,
-    clock: 18, daylight: 0, speed: 0, health: 100, armor: 0,
-    stashFound: [], pos: { x: 0, y: 0, z: 0 }, vehicle: null, player: null,
-    upgrades: { engine: 0, armor: 0, weapon: 0 },
-    stats: { missionsDone: 0, earned: 0, stashes: 0, drifts: 0, busted: 0, wasted: 0, taxiDone: 0, crimes: 0, distance: 0 },
-    police: [], heli: null, taxi: null,
-    bustedTimer: 0, driftCd: 0, over: false, lastCash: null,
-  };
-}
-
-// Merge a loaded save into live state field-by-field with validation.
-// Never assigns raw save data onto state; unknown/missing fields keep live values.
-export function applySave(G, data) {
-  if (!G || !data || typeof data !== 'object') return G;
-  G.money = num(data.money, G.money, 0, 9999999);
-  G.rep = num(data.rep, G.rep, 0, 1800); // max legit: 18 missions x 100
-  G.repRank = rankFor(G.rep);
-  G.missionIndex = clamp(Math.floor(num(data.missionIndex, 0, 0, MISSIONS.length - 1)), 0, MISSIONS.length - 1);
-  G.stageIndex = 0; G.missionActive = false; G.missionTime = 0;
-  if (Array.isArray(data.stashFound)) {
-    G.stashFound = [...new Set(data.stashFound)].filter(id => Number.isInteger(id) && id >= 0 && id < STASH_SPOTS.length);
+  function msg(t) {
+    if (SB.HUD && SB.HUD.showMessage) SB.HUD.showMessage(t);
   }
-  if (data.upgrades && typeof data.upgrades === 'object') {
-    for (const k of ['engine', 'armor', 'weapon']) G.upgrades[k] = clamp(Math.floor(num(data.upgrades[k], G.upgrades[k], 0, 3)), 0, 3);
+
+  function sfx(n) {
+    if (SB.Audio && SB.Audio.sfx) SB.Audio.sfx(n);
   }
-  if (data.stats && typeof data.stats === 'object') {
-    for (const k of Object.keys(G.stats)) G.stats[k] = num(data.stats[k], G.stats[k], 0, 1e9);
+
+  function freshState() {
+    return {
+      money: 250, rep: 0, wanted: 0,
+      mission: 0, missionStage: 0,
+      clock: 18.0,
+      player: { x: SAFE.x, z: SAFE.z, yaw: 0, hp: 100, inCar: false, car: null, speed: 0, inBoat: false },
+      police: [], heli: null,
+      dist: 0, drifts: 0, busted: 0,
+      // Stash pickup di dunia (4 titik, diisi Game.start via initStash):
+      // [{x, z, taken}] — disimpan di SB.G agar save/load konsisten.
+      stash: null,
+      // Senjata: mulai dengan Pistol (ammo 24) agar klik/F langsung menembak;
+      // Fists selalu tersedia sebagai fallback saat ammo habis.
+      weapon: 'Pistol', ammo: { Pistol: 24 },
+      paused: false, input: {}
+    };
   }
-  G.clock = num(data.clock, G.clock, 0, 24);
-  if (G.player && data.pos && typeof data.pos === 'object') {
-    G.player.pos.x = num(data.pos.x, G.player.pos.x, -BOUND, BOUND);
-    G.player.pos.z = num(data.pos.z, G.player.pos.z, -BOUND, BOUND);
-    G.player.pos.y = 0; G.player.vel.x = 0; G.player.vel.z = 0;
+
+  if (!SB.G) SB.G = freshState();
+
+  function st(text, x, z, reward, water) {
+    var s = { text: text, target: { x: x, z: z }, reward: reward };
+    if (water) s.target.water = true; // target di laut — jangan snap ke darat
+    return s;
   }
-  if (G.player) {
-    G.player.health = num(data.health, G.player.health, 0, 100);
-    G.player.armor = num(data.armor, G.player.armor, 0, 100);
-    G.health = G.player.health; G.armor = G.player.armor;
-    if (Array.isArray(data.ammo)) {
-      for (let i = 1; i < 4; i++) {
-        const a = num(data.ammo[i], G.player.ammo[i], 0, 9999);
-        if (Number.isFinite(a)) G.player.ammo[i] = a;
+
+  // 18 missions, 49 stages. Stage counts: 4,3,2,3,2,3,3,2,3,3,2,3,2,3,3,2,3,3.
+  var MISSIONS = [
+    { name: "First Wheels", stages: [
+      st("Walk to the parked car by the safehouse", 14, 6, 0),
+      st("Take the car (press E)", 14, 6, 0),
+      st("Drive to the garage in Downtown", 60, -40, 0),
+      st("Park at the safehouse to finish", 8, 8, 150) ] },
+    { name: "Package Run", stages: [
+      st("Pick up the package at the Harbor", -120, 80, 0),
+      st("Deliver it in Old Town", -40, 120, 60),
+      st("Deliver the second box in Marina Bay", 120, 60, 120) ] },
+    { name: "Taxi Nights", stages: [
+      st("Pick up the passenger in Uptown", 90, -90, 0),
+      st("Drop them off at Beachfront", -90, -140, 90) ] },
+    { name: "Harbor Lights", stages: [
+      st("Meet the contact at the docks", -140, 60, 0),
+      st("Check the warehouse on the pier", -100, 100, 50),
+      st("Bring the crate back to the Harbor gate", -160, 20, 110) ] },
+    { name: "Hillcrest Climb", stages: [
+      st("Drive up to Hillcrest overlook", 150, -120, 0),
+      st("Reach the summit house", 170, -150, 140) ] },
+    { name: "Marina Getaway", stages: [
+      // Target air (water:true) TIDAK di-snap ke darat oleh stageTarget —
+      // kapal tidak bisa mencapai titik darat, jadi stage 2/3 harus di laut.
+      st("Board the speedboat at the marina", -282, 44, 0),
+      st("Sail to the far buoy", -420, 200, 60, true),
+      st("Return to the marina dock", -292, 50, 130, true) ] },
+    { name: "Night Shift", stages: [
+      st("Clock in at the Downtown garage", 60, -40, 0),
+      st("Tow the broken car in Southside", -60, -60, 50),
+      st("Drop it at the safehouse lot", 0, 0, 120) ] },
+    { name: "Downtown Dash", stages: [
+      st("Race to the Downtown plaza", 40, -20, 0),
+      st("Beat the clock to the north gate", 80, -60, 150) ] },
+    { name: "Beachfront Cruise", stages: [
+      st("Cruise the Beachfront strip", -90, -140, 0),
+      st("Stop at the pier cafe", -130, -120, 60),
+      st("Park at the lifeguard tower", -60, -160, 130) ] },
+    { name: "Industrial Heat", stages: [
+      st("Sneak into the Industrial yard", -160, -40, 0),
+      st("Grab the parts from the depot", -180, -80, 70),
+      st("Get out through the west gate", -140, -10, 150) ] },
+    { name: "Old Town Tour", stages: [
+      st("Visit the Old Town square", -40, 120, 0),
+      st("Photograph the old chapel", -70, 90, 130) ] },
+    { name: "Uptown Hustle", stages: [
+      st("Meet the buyer in Uptown", 90, -90, 0),
+      st("Collect the payment downtown", 110, -120, 60),
+      st("Stash the cash at the safehouse", 70, -70, 140) ] },
+    { name: "Southside Story", stages: [
+      st("Find the informant in Southside", 20, 150, 0),
+      st("Escort them to the safe street", 60, 130, 140) ] },
+    { name: "Northside Nights", stages: [
+      st("Patrol the Northside blocks", -20, -160, 0),
+      st("Check the alley behind the market", 20, -140, 60),
+      st("Report back at the corner store", -60, -180, 140) ] },
+    { name: "Sunset Chase", stages: [
+      st("Chase the rival car from the plaza", 0, 0, 0),
+      st("Cut them off near the marina road", 120, -60, 80),
+      st("Corner them at the Harbor fence", -120, 40, 160) ] },
+    { name: "Harbor Heist", stages: [
+      st("Slip into the Harbor warehouse", -140, 60, 0),
+      st("Escape with the goods to the boat", -100, 20, 180) ] },
+    { name: "Bay Finale", stages: [
+      st("One last run: marina to Hillcrest", 120, 60, 0),
+      st("Down the hill to the bay road", 150, -120, 100),
+      st("Finish at the safehouse", 8, 8, 200) ] },
+    { name: "Legend of the Bay", stages: [
+      st("Prove it at the Downtown garage", 60, -40, 0),
+      st("One final delivery in Old Town", -40, 120, 150),
+      st("Take the crown at the plaza", 0, 0, 300) ] }
+  ];
+
+  // Stash pickup: 4 titik di distrik berbeda, JAUH dari stage misi mana pun
+  // (bukan reward misi 12 stage 3 — itu $140 dan tidak diubah).
+  // Anchor di-snap ke titik bebas bangunan via City.findClearSpot.
+  var STASH_ANCHORS = [
+    { x: -120, z: 120 },  // Harbor
+    { x: 0, z: -100 },    // Uptown
+    { x: -220, z: -200 }, // Beachfront
+    { x: 220, z: 100 }    // Industrial
+  ];
+
+  function initStash() {
+    var G = SB.G;
+    G.stash = STASH_ANCHORS.map(function (a) {
+      var c = a;
+      if (SB.City && SB.City.findClearSpot) c = SB.City.findClearSpot(a.x, a.z, 2);
+      return { x: c.x, z: c.z, taken: false };
+    });
+    return G.stash;
+  }
+
+  // Pemain jalan kaki melewati titik stash (radius 2) → +$100, sekali saja.
+  function checkStash() {
+    var G = SB.G;
+    if (!G || !G.stash) return;
+    if (G.player.inCar || G.player.inBoat) return;
+    for (var i = 0; i < G.stash.length; i++) {
+      var s = G.stash[i];
+      if (s.taken) continue;
+      if (Math.hypot(G.player.x - s.x, G.player.z - s.z) < 2) {
+        s.taken = true;
+        G.money += 100;
+        msg("Stash found: +$100");
+        sfx("pickup");
       }
     }
-    if (Number.isInteger(data.weapon)) G.player.weapon = clamp(data.weapon, 0, 3);
   }
-  // Fresh session starts clean: no cops, no heli, no active job.
-  G.wanted = 0; G.heat = 0; G.police = []; G.heli = null; G.taxi = null; G.bustedTimer = 0;
-  return G;
-}
 
-export function createGame(city, rng) {
-  const rand = (rng && typeof rng.next === 'function') ? () => rng.next()
-    : (typeof rng === 'function' ? rng : Math.random);
-  const G = defaultState();
-  const spawn = (city && city.SPAWN) || City.SPAWN || SAFEHOUSE;
-  // `let`: reset() swaps in a fresh player object and every closure below
-  // (update, respawn, doBusted, doWasted, ...) must follow the new one.
-  // (Was `const`: after a New Game the closures kept driving the stale
-  // pre-reset player while G.player/rendering used the new one, so the
-  // visible player stopped moving and wasted/busted broke.)
-  let player = createPlayer({ x: spawn.x || 0, z: spawn.z || 0 });
-  G.player = player;
-  G.pos = player.pos; // same object reference: G.pos always tracks the player
-  G.health = player.health;
-  G.armor = player.armor;
+  function curMission() { return MISSIONS[SB.G.mission] || null; }
+  function curStage() {
+    var m = curMission();
+    return m ? (m.stages[SB.G.missionStage] || null) : null;
+  }
 
-  function addCash(n, why) {
-    G.money = Math.max(0, Math.round(G.money + n));
-    if (n > 0) G.stats.earned += n;
-    G.lastCash = { n, why: why || '', at: G.clock };
-    return G.money;
-  }
-  function ensureHeli() {
-    if (G.wanted >= 3 && !G.heli) {
-      const a = rand() * Math.PI * 2;
-      const hx = G.pos.x + Math.cos(a) * 30, hz = G.pos.z + Math.sin(a) * 30;
-      let id = null;
-      try { if (typeof Vehicles.spawnHeli === 'function') id = Vehicles.spawnHeli(hx, hz) || null; } catch (e) {}
-      G.heli = { id, x: hx, z: hz, y: 55 };
-    } else if (G.wanted < 3 && G.heli) {
-      try { if (typeof Vehicles.removeHeli === 'function') Vehicles.removeHeli(G.heli.id); } catch (e) {}
-      G.heli = null;
+  function stageTarget(s) {
+    if (!s) return null;
+    var t = s.target;
+    // Target air (misi kapal) tidak boleh di-snap ke darat: findClearSpot
+    // hanya mengembalikan titik darat, kapal takkan pernah sampai.
+    if (t.water) return { x: t.x, z: t.z };
+    if (SB.City && SB.City.findClearSpot) {
+      var c = SB.City.findClearSpot(t.x, t.z, 4);
+      if (c) return { x: c.x, z: c.z };
     }
+    return { x: t.x, z: t.z };
   }
-  function syncPolice() {
-    const want = clamp(G.wanted, 0, 5);
-    while (G.police.length < want) {
-      const a = rand() * Math.PI * 2, d = 40 + rand() * 20;
-      const x = G.pos.x + Math.cos(a) * d, z = G.pos.z + Math.sin(a) * d;
-      let id = null;
-      try { if (typeof Vehicles.spawnPoliceCar === 'function') id = Vehicles.spawnPoliceCar(x, z) || null; } catch (e) {}
-      G.police.push({ id, x, z, hp: 100 });
-    }
-    while (G.police.length > want) {
-      const c = G.police.pop();
-      try { if (typeof Vehicles.removePoliceCar === 'function') Vehicles.removePoliceCar(c.id); } catch (e) {}
-    }
-  }
-  function setWanted(n) {
-    G.wanted = clamp(Math.round(n), 0, 5);
-    G.heat = G.wanted > 0 ? Math.max(G.heat, G.wanted * 20) : 0;
-    ensureHeli();
-    syncPolice();
-    return G.wanted;
-  }
-  // kind: 'steal' (take a car), 'hit' (ram/hit someone), 'shoot', 'kill' (down a cop).
-  // Called by main/vehicles when the player commits the crime.
-  function commitCrime(kind) {
-    G.stats.crimes++;
-    G.heat = 100;
-    return setWanted(G.wanted + (CRIME_WANTED[kind] || 1));
-  }
-  function startMission(i) {
-    const idx = (i === undefined || i === null) ? G.missionIndex : i;
-    if (idx < 0 || idx >= MISSIONS.length) return false;
-    G.missionIndex = idx; G.stageIndex = 0; G.missionActive = true; G.missionTime = 0;
-    return true;
-  }
-  function missionState() {
-    if (!G.missionActive) return null;
-    const m = MISSIONS[G.missionIndex];
-    const st = m.stages[G.stageIndex];
-    return { missionId: m.id, name: m.name, brief: m.brief, stageIndex: G.stageIndex,
-      stageTotal: m.stages.length, stage: st, reward: m.reward,
-      elapsed: G.missionTime, par: parTime(m), fastBonus: Math.round(m.reward * 0.5) };
-  }
-  function completeMission() {
-    const m = MISSIONS[G.missionIndex];
-    const bonus = G.missionTime <= parTime(m) ? Math.round(m.reward * 0.5) : 0;
-    addCash(m.reward + bonus, 'mission:' + m.name);
-    G.rep += 100; G.repRank = rankFor(G.rep);
-    G.stats.missionsDone++;
-    G.missionActive = false; G.stageIndex = 0; G.missionTime = 0;
-    if (G.missionIndex < MISSIONS.length - 1) G.missionIndex++;
-    else G.over = true;
-    return { reward: m.reward, bonus, total: m.reward + bonus, name: m.name };
-  }
-  function failMission() { G.missionActive = false; G.stageIndex = 0; G.missionTime = 0; }
-  function startTaxi(pickup, dropoff) {
-    const job = taxiJob(pickup, dropoff);
-    G.taxi = { pickup: job.pickup, dropoff: job.dropoff, fare: job.fare, distance: job.distance, stage: 'pickup' };
-    return G.taxi;
-  }
-  function buyUpgrade(kind) {
-    if (!Object.prototype.hasOwnProperty.call(G.upgrades, kind)) return false;
-    const lvl = G.upgrades[kind];
-    if (lvl >= 3) return false;
-    const cost = 300 * (lvl + 1);
-    if (G.money < cost) return false;
-    addCash(-cost, 'upgrade:' + kind);
-    G.upgrades[kind] = lvl + 1;
-    if (kind === 'armor') { player.armor = Math.min(100, player.armor + 50); G.armor = player.armor; }
-    return true;
-  }
+
   function respawn() {
-    const sh = (city && city.SAFEHOUSE) || City.SAFEHOUSE || SAFEHOUSE;
-    player.pos.x = sh.x || 0; player.pos.z = sh.z || 0; player.pos.y = 0;
-    player.vel.x = 0; player.vel.z = 0;
-    player.health = 100; player.armor = 0;
-    G.health = 100; G.armor = 0; G.vehicle = null;
-  }
-  function clearPoliceVisuals() {
-    try { if (typeof Vehicles.clearPolice === 'function') Vehicles.clearPolice(); } catch (e) {}
-    try { if (typeof Vehicles.removeHeli === 'function' && G.heli) Vehicles.removeHeli(G.heli.id); } catch (e) {}
-    G.police = []; G.heli = null;
-  }
-  function doBusted() {
-    const loss = Math.round(G.money * 0.1);
-    addCash(-loss, 'busted');
-    G.stats.busted++;
-    G.wanted = 0; G.heat = 0; G.bustedTimer = 0;
-    failMission();
-    clearPoliceVisuals();
-    respawn();
-    return { loss };
-  }
-  function doWasted() {
-    const loss = Math.round(G.money * 0.1);
-    addCash(-loss, 'wasted');
-    G.stats.wasted++;
-    G.wanted = Math.max(0, G.wanted - 1);
-    G.heat = 0;
-    failMission();
-    respawn();
-    ensureHeli(); syncPolice();
-    return { loss };
-  }
-  function nearestPolice() {
-    let best = Infinity;
-    for (const c of G.police) best = Math.min(best, d2(c.x, c.z, G.pos.x, G.pos.z));
-    return best;
+    var p = SB.G.player;
+    p.x = SAFE.x; p.z = SAFE.z; p.yaw = 0;
+    p.hp = 100; p.inCar = false; p.car = null; p.speed = 0; p.inBoat = false;
+    SB.G.police = []; SB.G.heli = null; SB.G.wanted = 0;
   }
 
-  function update(dt, input) {
-    dt = clamp(dt || 0, 0, 0.05);
-    G.clock = (G.clock + dt * 24 / DAY_SECONDS) % 24;
-    G.daylight = daylight(G.clock);
-    player.update(dt, input || {}, city);
-    G.health = player.health; G.armor = player.armor;
-    const speed = G.vehicle ? (G.vehicle.speed || 0) : Math.hypot(player.vel.x, player.vel.z);
-    G.speed = speed;
-    G.stats.distance += speed * dt;
-    if (G.driftCd > 0) G.driftCd -= dt;
+  function loseCut(label) {
+    var lost = Math.floor(SB.G.money * 0.10);
+    SB.G.money -= lost;
+    msg(label + " You lost $" + lost + ".");
+    return lost;
+  }
 
-    // --- missions: reach the current stage target to advance ---
-    if (G.missionActive) {
-      G.missionTime += dt;
-      const m = MISSIONS[G.missionIndex];
-      const st = m.stages[G.stageIndex];
-      const r = st.type === 'race' ? 7 : 9;
-      if (d2(G.pos.x, G.pos.z, st.x, st.z) < r) {
-        G.stageIndex++;
-        if (G.stageIndex >= m.stages.length) completeMission();
+  SB.Game = {
+    MISSIONS: MISSIONS,
+    SAVE_KEY: SAVE_KEY,
+    safehouse: SAFE,
+
+    start: function () {
+      SB.G = freshState();
+      bustT = 0; decayT = 0;
+      initStash();
+      msg("Welcome to Sunset Bay. Mission 1: First Wheels.");
+      sfx("mission");
+    },
+
+    // Daftar titik stash (untuk QA/debug; init bila belum ada).
+    stashSpots: function () {
+      if (!SB.G.stash) initStash();
+      return SB.G.stash;
+    },
+
+    missionTarget: function () { return stageTarget(curStage()); },
+
+    update: function (dt) {
+      var G = SB.G;
+      if (!G) return;
+      // Day/night clock: 1 game hour per 50 seconds.
+      G.clock = (G.clock + dt * 0.02) % 24;
+      // WASTED: hp hit zero.
+      if (G.player.hp <= 0) {
+        loseCut("WASTED!");
+        G.busted = (G.busted || 0) + 1;
+        respawn();
+        sfx("busted");
+        return;
       }
-    }
-    // --- taxi: pickup first, then dropoff pays the fare ---
-    if (G.taxi) {
-      const t = G.taxi.stage === 'pickup' ? G.taxi.pickup : G.taxi.dropoff;
-      if (d2(G.pos.x, G.pos.z, t.x, t.z) < 8) {
-        if (G.taxi.stage === 'pickup') G.taxi.stage = 'dropoff';
-        else { addCash(G.taxi.fare, 'taxi'); G.stats.taxiDone++; G.taxi = null; }
+      // Mission progress: reach the stage marker.
+      var s = curStage();
+      if (s) {
+        var t = stageTarget(s);
+        var d = Math.hypot(G.player.x - t.x, G.player.z - t.z);
+        if (d < 5) SB.Game.completeStage();
       }
-    }
-    // --- hidden stash packs: +$100 each ---
-    for (const s of STASH_SPOTS) {
-      if (G.stashFound.indexOf(s.id) === -1 && d2(G.pos.x, G.pos.z, s.x, s.z) < 3.5) {
-        G.stashFound.push(s.id);
-        addCash(100, 'stash:' + s.id);
-        G.stats.stashes++;
+      // Stash pickup (jalan kaki, +$100 per titik, sekali saja).
+      if (!G.stash) initStash();
+      checkStash();
+      SB.Game.updatePolice(dt);
+      SB.Game.bustCheck(dt);
+      // Wanted slowly cools off when the player stays clean.
+      if (G.wanted > 0) {
+        decayT += dt;
+        if (decayT > 90) { decayT = 0; SB.Game.wantedDown(); }
+      } else decayT = 0;
+    },
+
+    completeStage: function () {
+      var G = SB.G;
+      var m = curMission(), s = curStage();
+      if (!m || !s) return;
+      if (s.reward) {
+        G.money += s.reward;
+        msg("Stage complete: +$" + s.reward);
+      } else {
+        msg("Stage complete.");
       }
-    }
-    // --- drift bonus: +$50, max once per 3s (vehicle.drifting set by vehicles.js) ---
-    if (G.vehicle && G.vehicle.drifting && G.driftCd <= 0) {
-      addCash(50, 'drift');
-      G.stats.drifts++;
-      G.driftCd = 3;
-    }
-    // --- wanted / heat: cools down while hiding, faster on 'escape' stages ---
-    if (G.wanted > 0) {
-      const near = nearestPolice();
-      const hidden = speed < 3 && near > 35 && !G.heli;
-      const escaping = G.missionActive && MISSIONS[G.missionIndex].stages[G.stageIndex].type === 'escape';
-      let decay = hidden ? 6 : 0.8;
-      if (escaping) decay *= 2;
-      G.heat -= decay * dt;
-      if (G.heat <= 0) {
-        G.wanted--;
-        G.heat = G.wanted > 0 ? 60 : 0;
-        ensureHeli(); syncPolice();
-      }
-    }
-    // --- police chase: prefer external positions when vehicles.js provides them ---
-    let ext = null;
-    try { if (typeof Vehicles.getPolicePositions === 'function') ext = Vehicles.getPolicePositions(); } catch (e) {}
-    if (Array.isArray(ext)) {
-      G.police = ext.map((e, i) => ({ id: (G.police[i] && G.police[i].id) || null,
-        x: e.x, z: e.z, hp: (G.police[i] && G.police[i].hp) || 100 }));
-    } else {
-      for (const c of G.police) {
-        const d = d2(c.x, c.z, G.pos.x, G.pos.z);
-        if (d > 4) {
-          const step = Math.min(15 * dt, d - 4);
-          c.x += (G.pos.x - c.x) / d * step;
-          c.z += (G.pos.z - c.z) / d * step;
+      sfx("mission");
+      G.missionStage++;
+      if (G.missionStage >= m.stages.length) {
+        // SATU misi yang selesai = total REP +100 (konsisten di semua misi,
+        // berapa pun jumlah stage-nya; tidak ada REP per stage).
+        G.rep = (G.rep || 0) + 100;
+        msg("Mission complete: " + m.name + "! +100 REP");
+        G.mission++;
+        G.missionStage = 0;
+        if (G.mission >= MISSIONS.length) {
+          msg("All missions complete. You are a legend of the Bay!");
+        } else {
+          var next = MISSIONS[G.mission];
+          msg("New mission: " + next.name + " — " + next.stages[0].text);
         }
       }
-    }
-    // --- heli AIR-1 chases from above while wanted >= 3 ---
-    if (G.heli) {
-      let hx = null;
-      try { if (typeof Vehicles.getHeliPosition === 'function') hx = Vehicles.getHeliPosition(); } catch (e) {}
-      if (hx && typeof hx.x === 'number') { G.heli.x = hx.x; G.heli.z = hx.z; }
-      else {
-        const d = d2(G.heli.x, G.heli.z, G.pos.x, G.pos.z);
-        if (d > 6) {
-          const step = Math.min(20 * dt, d - 6);
-          G.heli.x += (G.pos.x - G.heli.x) / d * step;
-          G.heli.z += (G.pos.z - G.heli.z) / d * step;
-        }
-      }
-    }
-    // --- busted: cop within 5 units AND player speed < 4, sustained 4.5s ---
-    if (nearestPolice() < 5 && speed < 4) {
-      G.bustedTimer += dt;
-      if (G.bustedTimer >= 4.5) doBusted();
-    } else {
-      G.bustedTimer = Math.max(0, G.bustedTimer - dt * 2);
-    }
-    // --- wasted: health 0 -> respawn at safehouse, lose 10% cash ---
-    if (player.health <= 0) doWasted();
-    G.health = player.health; G.armor = player.armor;
-  }
+    },
 
-  function saveData() {
-    return { v: 1, money: G.money, rep: G.rep, missionIndex: G.missionIndex,
-      stashFound: G.stashFound.slice(), upgrades: { ...G.upgrades },
-      stats: { ...G.stats }, clock: G.clock,
-      pos: { x: player.pos.x, z: player.pos.z },
-      health: player.health, armor: player.armor,
-      ammo: player.ammo.slice(), weapon: player.weapon };
-  }
-  function save() {
-    try { localStorage.setItem(SAVE_KEY, JSON.stringify(saveData())); return true; }
-    catch (e) { return false; }
-  }
-  function load() {
-    try {
-      const raw = localStorage.getItem(SAVE_KEY);
-      if (!raw) return false;
-      applySave(G, JSON.parse(raw));
+    save: function () {
+      try {
+        var s = JSON.parse(JSON.stringify(SB.G));
+        s.player.car = null; // never persist a live car reference
+        s.player.inCar = false;
+        localStorage.setItem(SAVE_KEY, JSON.stringify(s));
+        return true;
+      } catch (e) { return false; }
+    },
+
+    load: function () {
+      try {
+        var raw = localStorage.getItem(SAVE_KEY);
+        if (!raw) return null;
+        var s = JSON.parse(raw);
+        if (!s || typeof s.money !== "number") return null;
+        return s;
+      } catch (e) { return null; }
+    },
+
+    applySave: function (s) {
+      if (!s) return false;
+      var G = SB.G;
+      G.money = s.money; G.rep = s.rep || 0; G.wanted = s.wanted || 0;
+      G.mission = s.mission || 0; G.missionStage = s.missionStage || 0;
+      G.clock = (typeof s.clock === "number") ? s.clock : 18.0;
+      if (s.player) {
+        G.player.x = s.player.x || SAFE.x;
+        G.player.z = s.player.z || SAFE.z;
+        G.player.yaw = s.player.yaw || 0;
+        G.player.hp = s.player.hp || 100;
+      }
+      G.player.inCar = false; G.player.car = null;
+      G.player.inBoat = false;
+      G.dist = s.dist || 0; G.drifts = s.drifts || 0; G.busted = s.busted || 0;
+      // Pulihkan titik stash yang sudah diambil (save/load konsisten);
+      // save lama tanpa stash → init titik baru (belum diambil).
+      if (s.stash && s.stash.length) G.stash = s.stash;
+      else initStash();
+      G.police = []; G.heli = null;
+      // Pulihkan senjata; pastikan field runtime main.js selalu ada
+      // (Game.start() mengganti objek SB.G, jadi default ini penting).
+      G.weapon = s.weapon || 'Pistol';
+      G.ammo = s.ammo || { Pistol: 24 };
+      if (typeof G.paused !== 'boolean') G.paused = false;
+      if (!G.input) G.input = {};
       return true;
-    } catch (e) { return false; }
-  }
-  function reset() {
-    const fresh = defaultState();
-    for (const k of Object.keys(G)) delete G[k];
-    Object.assign(G, fresh);
-    const np = createPlayer({ x: spawn.x || 0, z: spawn.z || 0 });
-    player = np; // keep the closure player in sync with G.player
-    G.player = np; G.pos = np.pos; G.health = np.health; G.armor = np.armor;
-    clearPoliceVisuals();
-  }
+    },
 
-  return { G, update, startMission, missionState, addCash, setWanted, commitCrime,
-    startTaxi, buyUpgrade, save, load, reset, applySave, daylight, respawn, parTime };
-}
-export { STASH_SPOTS, REP_RANKS };
+    wantedUp: function (n) {
+      var G = SB.G;
+      G.wanted = Math.min(5, (G.wanted || 0) + (n || 1));
+      decayT = 0;
+      if (G.wanted >= 3) SB.Game.spawnHeli();
+    },
+
+    wantedDown: function () {
+      SB.G.wanted = Math.max(0, (SB.G.wanted || 0) - 1);
+      if (SB.G.wanted < 3) SB.G.heli = null;
+    },
+
+    spawnHeli: function () {
+      var G = SB.G;
+      if (!G.heli) {
+        G.heli = { x: G.player.x + 50, y: 55, z: G.player.z + 50 };
+        msg("AIR-1 helicopter is on you!");
+      }
+    },
+
+    updatePolice: function (dt) {
+      var G = SB.G;
+      var want = G.wanted | 0;
+      if (want <= 0) {
+        if (G.police.length) G.police = [];
+        if (G.heli) G.heli = null;
+        return;
+      }
+      var wantCount = Math.min(want * 2, 8);
+      while (G.police.length < wantCount) {
+        var a = Math.random() * Math.PI * 2;
+        var r = 30 + Math.random() * 20;
+        G.police.push({ x: G.player.x + Math.cos(a) * r, z: G.player.z + Math.sin(a) * r, hp: 100 });
+      }
+      while (G.police.length > wantCount) G.police.pop();
+      var sp = 6.5 + want * 0.4;
+      for (var i = 0; i < G.police.length; i++) {
+        var p = G.police[i];
+        var dx = G.player.x - p.x, dz = G.player.z - p.z;
+        var d = Math.hypot(dx, dz) || 1;
+        p.x += dx / d * sp * dt;
+        p.z += dz / d * sp * dt;
+      }
+      G.police = G.police.filter(function (p) { return p.hp > 0; });
+      if (want >= 3) {
+        SB.Game.spawnHeli();
+        if (G.heli) {
+          G.heli.x += (G.player.x - G.heli.x) * dt * 0.8;
+          G.heli.z += (G.player.z - G.heli.z) * dt * 0.8;
+          G.heli.y = 55;
+        }
+      } else if (G.heli) G.heli = null;
+    },
+
+    bustCheck: function (dt) {
+      var G = SB.G;
+      if (!G.wanted || G.player.inCar) { bustT = 0; return; }
+      var near = false;
+      for (var i = 0; i < G.police.length; i++) {
+        var p = G.police[i];
+        if (Math.hypot(G.player.x - p.x, G.player.z - p.z) < 3.5) { near = true; break; }
+      }
+      // Running away (speed > 6) breaks the bust timer.
+      if (near && G.player.speed <= 6) bustT += dt;
+      else bustT = Math.max(0, bustT - dt * 2);
+      if (bustT > 3) {
+        bustT = 0;
+        loseCut("BUSTED! The police caught you.");
+        G.busted = (G.busted || 0) + 1;
+        respawn();
+        sfx("busted");
+      }
+    },
+
+    // Garage respray: $150 clears the wanted level.
+    respray: function () {
+      var G = SB.G;
+      if (G.wanted <= 0) { msg("No heat to clear."); return false; }
+      if (G.money < 150) { msg("Respray costs $150. Not enough cash."); return false; }
+      G.money -= 150;
+      G.wanted = 0; G.police = []; G.heli = null;
+      msg("Respray done. Heat cleared.");
+      sfx("pickup");
+      return true;
+    },
+
+    // True bila pemain berada di area garage (respray, radius 10).
+    // Dipakai main.js (tombol F) sebelum menembak.
+    atGarage: function () {
+      var p = SB.G && SB.G.player;
+      if (!p) return false;
+      return Math.hypot(p.x - GARAGE.x, p.z - GARAGE.z) < 10;
+    },
+
+    // Polisi terdekat dalam radius r dari pemain (atau null).
+    _nearestPolice: function (r) {
+      var G = SB.G;
+      var best = null, bestD = r * r;
+      for (var i = 0; i < G.police.length; i++) {
+        var p = G.police[i];
+        var d = (p.x - G.player.x) * (p.x - G.player.x) +
+                (p.z - G.player.z) * (p.z - G.player.z);
+        if (d < bestD) { bestD = d; best = p; }
+      }
+      return best;
+    },
+
+    // Tembak (klik / F saat bersenjata): polisi terdekat dalam 40 unit
+    // kena 34 damage, ammo -1, wanted +1 (SPEC: tembak polisi naik wanted).
+    // Tanpa senjata api / ammo habis → fallback ke punch().
+    shoot: function () {
+      var G = SB.G;
+      if (!G) return false;
+      if (G.player.inCar || G.player.inBoat) return false;
+      var w = G.weapon || 'Fists';
+      var ammo = (G.ammo && G.ammo[w]) || 0;
+      if (w === 'Fists' || ammo <= 0) {
+        if (w !== 'Fists' && ammo <= 0) msg("No ammo — punching instead.");
+        return SB.Game.punch();
+      }
+      G.ammo[w] = ammo - 1;
+      sfx("shoot");
+      var target = SB.Game._nearestPolice(40);
+      if (target) {
+        target.hp -= 34;
+        SB.Game.wantedUp(1);
+        if (target.hp <= 0) msg("Officer down.");
+      }
+      return true;
+    },
+
+    // Pukul (F saat Fists): polisi terdekat dalam 3 unit kena 20 damage.
+    punch: function () {
+      var G = SB.G;
+      if (!G) return false;
+      if (G.player.inCar || G.player.inBoat) return false;
+      sfx("punch");
+      var target = SB.Game._nearestPolice(3);
+      if (target) {
+        target.hp -= 20;
+        SB.Game.wantedUp(1);
+        if (target.hp <= 0) msg("Officer down.");
+        return true;
+      }
+      return false;
+    }
+  };
+})();
