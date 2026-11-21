@@ -1,38 +1,63 @@
-// Sunset Bay v8 — game.js
-// Misi (18 misi / 49 stage), wanted, polisi, heli, busted/wasted, save/load, ammo.
-// Menempel ke namespace global window.SB. State di SB.G.
+// Sunset Bay — game.js (v9, ditulis ulang)
+// Inti permainan: rantai misi, wanted/polisi/heli, busted/wasted,
+// tembak & ammo, respray, save/load localStorage. State hidup di SB.G
+// dan dipakai modul lain (main, hud, player, vehicles, jobs).
 (function () {
   'use strict';
+  var SB = window.SB = window.SB || {};
 
+  // ---- konstanta tuning ----
   var SAVE_KEY = 'sunset-bay-save-v1';
-  var SAFEHOUSE = { x: 0, z: 0, yaw: 0 };
-  var STAGE_ARRIVE_DIST = 6;
-  var AMMO_PRICE = 50;
-  var AMMO_AMOUNT = 24;
-  var RESPRAY_PRICE = 150;
-  var REP_PER_STAGE = 15;   // v8: tiap stage selesai +15 REP
-  var REP_PER_MISSION = 40; // v8: tiap misi selesai +40 REP
-  // Misi 1 (4 stage) = 4x15 + 40 = +100 REP.
+  var HOME = { x: 0, z: 0, yaw: 0 };      // safehouse
+  var ARRIVE_RADIUS = 6;                  // jarak anggap "sampai" di target stage
+  var AMMO_PRICE = 50;                    // $50 ...
+  var AMMO_PACK = 24;                     // ... untuk +24 peluru pistol
+  var RESPRAY_PRICE = 150;                // bersihkan wanted
+  var REP_STAGE = 15;                     // REP tiap stage selesai
+  var REP_MISSION = 40;                   // REP tiap misi selesai
+  var BUST_FINE = 0.10;                   // busted: kehilangan 10% uang
+  var MAX_WANTED = 5;
+  var HELI_WANTED = 3;                    // heli AIR-1 muncul dari wanted 3
+  var DAY_LENGTH = 0.02;                  // jam game per detik nyata (1 jam / 50 dtk)
 
-  function G() { return window.SB.G; }
+  // ---- helper kecil ----
+  function state() { return SB.G; }
 
-  function showMessage(t) {
-    if (window.SB.HUD && window.SB.HUD.showMessage) window.SB.HUD.showMessage(t);
+  function notify(text) {
+    if (SB.HUD && SB.HUD.showMessage) SB.HUD.showMessage(text);
   }
 
-  function sfx(name) {
-    if (window.SB.Audio && window.SB.Audio.sfx) window.SB.Audio.sfx(name);
+  function play(name) {
+    if (SB.Audio && SB.Audio.sfx) SB.Audio.sfx(name);
   }
 
-  function dist2(ax, az, bx, bz) {
-    var dx = ax - bx, dz = az - bz;
+  function flatDist(ax, az, bx, bz) {
+    var dx = ax - bx;
+    var dz = az - bz;
     return Math.sqrt(dx * dx + dz * dz);
   }
 
+  function freshState() {
+    return {
+      money: 250, rep: 0, wanted: 0,
+      mission: 0, missionStage: 0,
+      clock: 18.0,
+      player: { x: HOME.x, z: HOME.z, yaw: HOME.yaw, hp: 100,
+                inCar: false, car: null, speed: 0 },
+      police: [], heli: null,
+      dist: 0, drifts: 0, busted: 0,
+      ammo: { pistol: 48 }, weapon: 'pistol'
+    };
+  }
+
   // ---------------------------------------------------------------------------
-  // 18 misi, total 49 stage. Stage counts: 4,3,3,3,3,3,3,2,3,2,3,2,3,2,3,2,3,2
+  // Rantai misi: 18 misi, total 49 stage.
+  // Jumlah stage per misi: 4,3,3,3,3,3,3,2,3,2,3,2,3,2,3,2,3,2.
+  // Misi 1 = 4 stage x 15 REP + 40 REP bonus misi = +100 REP total.
+  // Catatan jarak: stage 2 misi 1 (60,40) berjarak ~64 unit dari stage 1
+  // (20,-10), jadi tidak mungkin terpicu otomatis saat stage 1 selesai.
   // ---------------------------------------------------------------------------
-  var MISSIONS = [
+  var MISSION_LIST = [
     { name: 'First Wheels', fastBonus: 50, stages: [
       { text: 'Pergi ke mobil parkir di sudut jalan', target: { x: 20, z: -10 }, reward: 25 },
       { text: 'Bawa mobil ke garasi di seberang kota', target: { x: 60, z: 40 }, reward: 50 },
@@ -120,29 +145,25 @@
     ] }
   ];
 
-  function currentMission() {
-    var g = G();
-    if (!g) return null;
-    return MISSIONS[g.mission] || null;
+  function activeMission(g) {
+    return MISSION_LIST[g.mission] || null;
   }
 
-  function currentStage() {
-    var m = currentMission();
-    var g = G();
-    if (!m || !g) return null;
+  function activeStage(g) {
+    var m = activeMission(g);
+    if (!m) return null;
     return m.stages[g.missionStage] || null;
   }
 
-  function respawn(reason) {
-    var g = G();
+  // Kembalikan pemain ke safehouse setelah busted / wasted.
+  function sendHome(reason) {
+    var g = state();
     if (!g || !g.player) return;
     var p = g.player;
-    if (p.car && window.SB.Vehicles && window.SB.Vehicles.exitCar) {
-      window.SB.Vehicles.exitCar();
-    }
-    p.x = SAFEHOUSE.x;
-    p.z = SAFEHOUSE.z;
-    p.yaw = SAFEHOUSE.yaw;
+    if (p.car && SB.Vehicles && SB.Vehicles.exitCar) SB.Vehicles.exitCar();
+    p.x = HOME.x;
+    p.z = HOME.z;
+    p.yaw = HOME.yaw;
     p.hp = 100;
     p.inCar = false;
     p.car = null;
@@ -150,82 +171,68 @@
     g.police = [];
     g.heli = null;
     g.wanted = 0;
-    g._bustTimer = 0;
+    Game._bustTimer = 0;
     if (reason === 'busted') {
-      var lost = Math.floor((g.money || 0) * 0.10);
-      g.money = (g.money || 0) - lost;
+      var fine = Math.floor((g.money || 0) * BUST_FINE);
+      g.money = (g.money || 0) - fine;
       g.busted = (g.busted || 0) + 1;
-      showMessage('BUSTED! Polisi menyita $' + lost + ' (-10%)');
+      notify('BUSTED! Polisi menyita $' + fine + ' (-10%)');
     } else if (reason === 'wasted') {
-      showMessage('WASTED! Kamu bangun di safehouse.');
+      notify('WASTED! Kamu bangun di safehouse.');
     }
-    sfx('busted');
+    play('busted');
   }
 
   var Game = {
-    MISSIONS: MISSIONS,
+    MISSIONS: MISSION_LIST,
     SAVE_KEY: SAVE_KEY,
     _missionStart: 0,
     _bustTimer: 0,
 
+    // ---- mulai permainan baru ----
     start: function () {
-      // SB.G belum pernah dibuat modul mana pun: buat state awal di sini
-      // (tanpa ini Game.start() return dini dan game tak punya state).
-      var g = G();
+      var g = state();
       if (!g) {
-        g = window.SB.G = {
-          money: 250, rep: 0, wanted: 0, mission: 0, missionStage: 0,
-          clock: 18.0,
-          player: { x: SAFEHOUSE.x, z: SAFEHOUSE.z, yaw: SAFEHOUSE.yaw, hp: 100, inCar: false, car: null, speed: 0 },
-          police: [], heli: null, dist: 0, drifts: 0, busted: 0,
-          ammo: { pistol: 48 }, weapon: 'pistol'
-        };
+        g = SB.G = freshState();
+      } else {
+        // Reset penuh ke kondisi awal (bukan menimpa field satu-satu dari
+        // state lama): panggil freshState lalu ganti referensinya.
+        var clean = freshState();
+        for (var key in clean) g[key] = clean[key];
       }
-      g.money = 250;
-      g.rep = 0;
-      g.wanted = 0;
-      g.mission = 0;
-      g.missionStage = 0;
-      g.clock = 18.0;
-      g.player = { x: SAFEHOUSE.x, z: SAFEHOUSE.z, yaw: SAFEHOUSE.yaw, hp: 100, inCar: false, car: null, speed: 0 };
-      g.police = [];
-      g.heli = null;
-      g.dist = 0;
-      g.drifts = 0;
-      g.busted = 0;
-      g.ammo = { pistol: 48 };
-      g.weapon = 'pistol';
       this._missionStart = Date.now();
       this._bustTimer = 0;
-      if (window.SB.Jobs) {
-        window.SB.Jobs.taxi.active = false;
-        window.SB.Jobs.package.active = false;
+      if (SB.Jobs) {
+        SB.Jobs.taxi.active = false;
+        SB.Jobs.package.active = false;
       }
-      showMessage('Misi 1: First Wheels — pergi ke mobil parkir!');
+      notify('Misi 1: First Wheels — pergi ke mobil parkir!');
     },
 
+    // ---- tick utama (dipanggil main.js tiap frame) ----
     update: function (dt) {
-      var g = G();
+      var g = state();
       if (!g || !g.player) return;
 
-      // Siklus siang-malam: 1 jam game per ~50 detik nyata.
-      g.clock = (g.clock + dt * 0.02) % 24;
+      // Siklus siang-malam.
+      g.clock = (g.clock + dt * DAY_LENGTH) % 24;
 
-      // Cek penyelesaian stage aktif (kedekatan dengan target).
-      var stage = currentStage();
+      // Stage selesai bila pemain cukup dekat dengan targetnya.
+      var stage = activeStage(g);
       if (stage && stage.target) {
-        var d = dist2(g.player.x, g.player.z, stage.target.x, stage.target.z);
-        if (d < STAGE_ARRIVE_DIST) this.completeStage();
+        if (flatDist(g.player.x, g.player.z, stage.target.x, stage.target.z) < ARRIVE_RADIUS) {
+          this.completeStage();
+        }
       }
 
-      if (window.SB.Jobs) window.SB.Jobs.update(dt);
+      if (SB.Jobs) SB.Jobs.update(dt);
       this.updatePolice(dt);
       this.bustCheck(dt);
 
-      // WASTED: HP habis -> respawn di safehouse.
-      if (g.player.hp <= 0) respawn('wasted');
+      // HP habis -> WASTED.
+      if (g.player.hp <= 0) sendHome('wasted');
 
-      // Heli mengikuti pemain saat aktif.
+      // Heli selalu melayang tepat di atas pemain selama aktif.
       if (g.heli) {
         g.heli.x = g.player.x;
         g.heli.z = g.player.z;
@@ -233,222 +240,230 @@
       }
     },
 
+    // ---- misi ----
     completeStage: function () {
-      var g = G();
-      var m = currentMission();
-      var stage = currentStage();
+      var g = state();
+      var m = activeMission(g);
+      var stage = activeStage(g);
       if (!g || !m || !stage) return;
+
       g.money = (g.money || 0) + (stage.reward || 0);
-      g.rep = (g.rep || 0) + REP_PER_STAGE; // v8: +15 REP per stage
-      sfx('mission');
-      var lastStage = g.missionStage >= m.stages.length - 1;
-      if (lastStage) {
-        g.rep = (g.rep || 0) + REP_PER_MISSION; // v8: +40 REP per misi selesai
-        var bonusMsg = '';
+      g.rep = (g.rep || 0) + REP_STAGE;
+      play('mission');
+
+      var isLast = g.missionStage >= m.stages.length - 1;
+      if (isLast) {
+        g.rep = (g.rep || 0) + REP_MISSION;
+        var extra = '';
         if (m.fastBonus) {
-          var elapsed = (Date.now() - this._missionStart) / 1000;
-          if (elapsed < 300) {
+          var elapsedSec = (Date.now() - this._missionStart) / 1000;
+          if (elapsedSec < 300) {
             g.money = (g.money || 0) + m.fastBonus;
-            bonusMsg = ' Fast bonus +$' + m.fastBonus + '!';
+            extra = ' Fast bonus +$' + m.fastBonus + '!';
           }
         }
-        showMessage('Misi selesai: ' + m.name + '! +$' + (stage.reward || 0) +
-          ' (+15 REP stage, +40 REP misi).' + bonusMsg);
+        notify('Misi selesai: ' + m.name + '! +$' + (stage.reward || 0) +
+          ' (+15 REP stage, +40 REP misi).' + extra);
         g.mission++;
         g.missionStage = 0;
         this._missionStart = Date.now();
-        if (g.mission >= MISSIONS.length) {
-          showMessage('SEMUA MISI SELESAI! Kamu legenda Sunset Bay!');
+        if (g.mission >= MISSION_LIST.length) {
+          notify('SEMUA MISI SELESAI! Kamu legenda Sunset Bay!');
         } else {
-          showMessage('Misi ' + (g.mission + 1) + ': ' + MISSIONS[g.mission].name);
+          notify('Misi ' + (g.mission + 1) + ': ' + MISSION_LIST[g.mission].name);
         }
       } else {
-        showMessage('Stage selesai! +$' + (stage.reward || 0) + ' (+15 REP)');
+        notify('Stage selesai! +$' + (stage.reward || 0) + ' (+15 REP)');
         g.missionStage++;
       }
       this.save();
     },
 
-    // --- Wanted ---
+    // ---- wanted ----
     wantedUp: function (n) {
-      var g = G();
+      var g = state();
       if (!g) return;
-      g.wanted = Math.max(0, Math.min(5, (g.wanted || 0) + (n || 1)));
-      if (g.wanted >= 3) this.spawnHeli();
+      g.wanted = Math.max(0, Math.min(MAX_WANTED, (g.wanted || 0) + (n || 1)));
+      if (g.wanted >= HELI_WANTED) this.spawnHeli();
     },
 
     wantedDown: function (n) {
-      var g = G();
+      var g = state();
       if (!g) return;
       g.wanted = Math.max(0, (g.wanted || 0) - (n || 1));
-      if (g.wanted < 3) g.heli = null;
+      if (g.wanted < HELI_WANTED) g.heli = null;
     },
 
-    // Respray di garage (F): bersihkan wanted ke 0, biaya $150.
+    // Respray di garage: bersihkan wanted sampai 0, biaya $150.
+    // Gagal bila uang kurang atau memang tidak ada wanted.
     respray: function () {
-      var g = G();
+      var g = state();
       if (!g) return false;
       if ((g.money || 0) < RESPRAY_PRICE) {
-        showMessage('Respray butuh $' + RESPRAY_PRICE + '!');
+        notify('Respray butuh $' + RESPRAY_PRICE + '!');
         return false;
       }
       if ((g.wanted || 0) === 0) {
-        showMessage('Tidak ada wanted untuk dibersihkan.');
+        notify('Tidak ada wanted untuk dibersihkan.');
         return false;
       }
       g.money -= RESPRAY_PRICE;
       g.wanted = 0;
       g.police = [];
       g.heli = null;
-      showMessage('Respray selesai! Wanted bersih. -$' + RESPRAY_PRICE);
-      sfx('pickup');
+      notify('Respray selesai! Wanted bersih. -$' + RESPRAY_PRICE);
+      play('pickup');
       return true;
     },
 
-    // --- Heli ---
+    // ---- heli polisi ----
     spawnHeli: function () {
-      var g = G();
+      var g = state();
       if (!g || !g.player) return;
       if (!g.heli) {
         g.heli = { x: g.player.x, y: 60, z: g.player.z };
-        showMessage('AIR-1 di udara! Heli polisi mengawasimu.');
+        notify('AIR-1 di udara! Heli polisi mengawasimu.');
       }
     },
 
-    // --- Polisi ---
+    // ---- polisi ----
     updatePolice: function (dt) {
-      var g = G();
+      var g = state();
       if (!g || !g.player) return;
       var wanted = g.wanted || 0;
       if (wanted <= 0) {
         if (g.police.length > 0) g.police = [];
         return;
       }
-      // Jumlah polisi aktif mengikuti level wanted (maks 5).
-      var want = Math.min(wanted, 5);
-      while (g.police.length < want) {
-        var a = Math.random() * Math.PI * 2;
+      // Jumlah mobil polisi aktif mengikuti level wanted (maks 5).
+      var target = Math.min(wanted, MAX_WANTED);
+      while (g.police.length < target) {
+        var angle = Math.random() * Math.PI * 2;
         g.police.push({
-          x: g.player.x + Math.cos(a) * 40,
-          z: g.player.z + Math.sin(a) * 40,
+          x: g.player.x + Math.cos(angle) * 40,
+          z: g.player.z + Math.sin(angle) * 40,
           hp: 100
         });
       }
-      while (g.police.length > want) g.police.pop();
+      while (g.police.length > target) g.police.pop();
 
-      // Polisi mengejar pemain.
-      var speed = 7 + wanted * 1.5;
+      var chaseSpeed = 7 + wanted * 1.5;
       for (var i = 0; i < g.police.length; i++) {
         var cop = g.police[i];
-        var dx = g.player.x - cop.x, dz = g.player.z - cop.z;
+        var dx = g.player.x - cop.x;
+        var dz = g.player.z - cop.z;
         var d = Math.sqrt(dx * dx + dz * dz) || 1;
-        cop.x += (dx / d) * speed * dt;
-        cop.z += (dz / d) * speed * dt;
-        // Polisi menembak bila dekat: kurangi HP pemain perlahan.
+        cop.x += (dx / d) * chaseSpeed * dt;
+        cop.z += (dz / d) * chaseSpeed * dt;
+        // Polisi menembak bila dekat (wanted >= 2): HP pemain terkikis.
         if (d < 25 && wanted >= 2) {
           g.player.hp = Math.max(0, g.player.hp - 2 * dt);
         }
       }
     },
 
-    // Tembak polisi: kurangi HP-nya; menembak polisi → wanted +1 (SPEC).
-    // Bila mati, pesan tumbang (total tetap +1, bukan +2).
+    // Tembak satu polisi: HP-nya berkurang, wanted naik +1 (sekali per
+    // tembakan, bukan per polisi yang tumbang). Mengembalikan true bila
+    // polisi itu tumbang.
     damagePolice: function (index, dmg) {
-      var g = G();
+      var g = state();
       if (!g || !g.police || !g.police[index]) return false;
       var cop = g.police[index];
       cop.hp -= (dmg || 25);
       this.wantedUp(1);
       if (cop.hp <= 0) {
         g.police.splice(index, 1);
-        showMessage('Polisi tumbang! Wanted +1');
+        notify('Polisi tumbang! Wanted +1');
         return true;
       }
       return false;
     },
 
-    // Tembak polisi terdekat dalam jangkauan (dipakai combat klik/F).
+    // Cari polisi terdekat dalam jangkauan lalu tembak.
     shootNearestPolice: function (range, dmg) {
-      var g = G();
+      var g = state();
       if (!g || !g.player || !g.police || g.police.length === 0) return false;
-      var best = -1, bestD = range || 40;
+      var best = -1;
+      var bestD = range || 40;
       for (var i = 0; i < g.police.length; i++) {
-        var d = dist2(g.player.x, g.player.z, g.police[i].x, g.police[i].z);
+        var d = flatDist(g.player.x, g.player.z, g.police[i].x, g.police[i].z);
         if (d < bestD) { bestD = d; best = i; }
       }
       if (best < 0) return false;
       return this.damagePolice(best, dmg || 25);
     },
 
-    // Tembak (F / klik): habiskan 1 ammo Pistol, kenai polisi terdekat.
-    // Dipanggil main.js doFireOrRespray — tanpa ini tembakan hanya bunyi.
+    // Tembak (tombol F / klik): 1 peluru pistol, kenai polisi terdekat.
     fire: function () {
-      var g = G();
+      var g = state();
       if (!g || !g.player) return false;
       if (!g.ammo) g.ammo = { pistol: 0 };
       if ((g.ammo.pistol || 0) <= 0) {
-        showMessage('Pistol kehabisan ammo! Beli di garage (G) — $50/+24.');
-        sfx('click');
+        notify('Pistol kehabisan ammo! Beli di garage (G) — $50/+24.');
+        play('click');
         return false;
       }
       g.ammo.pistol--;
-      sfx('shoot');
+      play('shoot');
       this.shootNearestPolice(40, 34);
       return true;
     },
 
-    // Busted: polisi menangkap bila sangat dekat dan pemain lambat/tidak lari.
+    // Busted: polisi menangkap bila sangat dekat (<3 unit) sementara
+    // pemain jalan kaki dan lambat — tahan 3 detik baru tertangkap.
     bustCheck: function (dt) {
-      var g = G();
+      var g = state();
       if (!g || !g.player) return;
       if ((g.wanted || 0) <= 0 || !g.police || g.police.length === 0) {
         this._bustTimer = 0;
         return;
       }
-      var near = false;
+      var cornered = false;
       for (var i = 0; i < g.police.length; i++) {
-        var d = dist2(g.player.x, g.player.z, g.police[i].x, g.police[i].z);
-        if (d < 3) { near = true; break; }
+        if (flatDist(g.player.x, g.player.z, g.police[i].x, g.police[i].z) < 3) {
+          cornered = true;
+          break;
+        }
       }
-      var playerSpeed = g.player.speed || 0;
-      if (near && playerSpeed < 4 && !g.player.inCar) {
+      var speed = g.player.speed || 0;
+      if (cornered && speed < 4 && !g.player.inCar) {
         this._bustTimer += dt;
         if (this._bustTimer > 3) {
           this._bustTimer = 0;
-          respawn('busted');
+          sendHome('busted');
         }
       } else {
         this._bustTimer = Math.max(0, this._bustTimer - dt * 2);
       }
     },
 
-    // --- Ammo (baru v8): $50 untuk +24 ammo Pistol ---
+    // ---- ammo: $50 untuk +24 peluru pistol (hanya untuk pistol) ----
     buyAmmo: function () {
-      var g = G();
+      var g = state();
       if (!g) return false;
       if ((g.weapon || 'pistol') !== 'pistol') {
-        showMessage('Isi ulang ammo hanya untuk Pistol!');
+        notify('Isi ulang ammo hanya untuk Pistol!');
         return false;
       }
       if ((g.money || 0) < AMMO_PRICE) {
-        showMessage('Beli ammo butuh $' + AMMO_PRICE + '!');
+        notify('Beli ammo butuh $' + AMMO_PRICE + '!');
         return false;
       }
       if (!g.ammo) g.ammo = { pistol: 0 };
       if (typeof g.ammo.pistol !== 'number') g.ammo.pistol = 0;
       g.money -= AMMO_PRICE;
-      g.ammo.pistol += AMMO_AMOUNT;
-      showMessage('Ammo Pistol +24! -$' + AMMO_PRICE + ' (total ' + g.ammo.pistol + ')');
-      sfx('pickup');
+      g.ammo.pistol += AMMO_PACK;
+      notify('Ammo Pistol +24! -$' + AMMO_PRICE + ' (total ' + g.ammo.pistol + ')');
+      play('pickup');
       return true;
     },
 
-    // --- Save / Load ---
+    // ---- save / load ----
     save: function () {
-      var g = G();
+      var g = state();
       if (!g) return;
       try {
-        var s = {
+        var snapshot = {
           money: g.money, rep: g.rep, wanted: g.wanted,
           mission: g.mission, missionStage: g.missionStage, clock: g.clock,
           player: {
@@ -458,7 +473,7 @@
           dist: g.dist, drifts: g.drifts, busted: g.busted,
           ammo: g.ammo, weapon: g.weapon
         };
-        localStorage.setItem(SAVE_KEY, JSON.stringify(s));
+        localStorage.setItem(SAVE_KEY, JSON.stringify(snapshot));
       } catch (e) { /* storage tidak tersedia: abaikan */ }
     },
 
@@ -466,51 +481,45 @@
       try {
         var raw = localStorage.getItem(SAVE_KEY);
         if (!raw) return null;
-        var s = JSON.parse(raw);
-        this.applySave(s);
-        return s;
+        var data = JSON.parse(raw);
+        this.applySave(data);
+        return data;
       } catch (e) {
         return null;
       }
     },
 
-    applySave: function (s) {
-      var g = G();
-      if (!s) return;
+    applySave: function (data) {
+      var g = state();
+      if (!data) return;
       if (!g) {
-        g = window.SB.G = {
-          money: 250, rep: 0, wanted: 0, mission: 0, missionStage: 0,
-          clock: 18.0,
-          player: { x: 0, z: 0, yaw: 0, hp: 100, inCar: false, car: null, speed: 0 },
-          police: [], heli: null, dist: 0, drifts: 0, busted: 0,
-          ammo: { pistol: 48 }, weapon: 'pistol'
-        };
+        g = SB.G = freshState();
       }
-      g.money = (typeof s.money === 'number') ? s.money : 250;
-      g.rep = s.rep || 0;
-      g.wanted = s.wanted || 0;
-      g.mission = s.mission || 0;
-      g.missionStage = s.missionStage || 0;
-      g.clock = (typeof s.clock === 'number') ? s.clock : 18.0;
-      if (s.player) {
+      g.money = (typeof data.money === 'number') ? data.money : 250;
+      g.rep = data.rep || 0;
+      g.wanted = data.wanted || 0;
+      g.mission = data.mission || 0;
+      g.missionStage = data.missionStage || 0;
+      g.clock = (typeof data.clock === 'number') ? data.clock : 18.0;
+      if (data.player) {
         g.player = {
-          x: s.player.x || 0, z: s.player.z || 0, yaw: s.player.yaw || 0,
-          hp: (typeof s.player.hp === 'number') ? s.player.hp : 100,
+          x: data.player.x || 0, z: data.player.z || 0, yaw: data.player.yaw || 0,
+          hp: (typeof data.player.hp === 'number') ? data.player.hp : 100,
           inCar: false, car: null, speed: 0
         };
       }
-      g.dist = s.dist || 0;
-      g.drifts = s.drifts || 0;
-      g.busted = s.busted || 0;
-      g.ammo = s.ammo || { pistol: 48 };
-      g.weapon = s.weapon || 'pistol';
+      g.dist = data.dist || 0;
+      g.drifts = data.drifts || 0;
+      g.busted = data.busted || 0;
+      g.ammo = data.ammo || { pistol: 48 };
+      g.weapon = data.weapon || 'pistol';
       g.police = [];
       g.heli = null;
-      if (g.wanted >= 3) this.spawnHeli();
+      if (g.wanted >= HELI_WANTED) this.spawnHeli();
       this._missionStart = Date.now();
       this._bustTimer = 0;
     }
   };
 
-  window.SB.Game = Game;
+  SB.Game = Game;
 })();

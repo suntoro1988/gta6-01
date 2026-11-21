@@ -7,39 +7,54 @@
 <link rel="icon" href="favicon.ico">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { width: 100%; height: 100%; overflow: hidden; background: #0a1a24;
-    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #fff; }
+  html, body {
+    width: 100%; height: 100%; overflow: hidden;
+    background: #0a1a24; color: #fff;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
   #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+  /* ---- HUD (disembunyikan sampai permainan dimulai) ---- */
   #hud { position: fixed; inset: 0; pointer-events: none; display: none; z-index: 5; }
   .panel { background: rgba(0,0,0,0.55); border-radius: 8px; padding: 6px 10px; }
   #hud-topleft { position: absolute; top: 12px; left: 12px; font-size: 15px; line-height: 1.5; }
   #hud-money { font-size: 22px; font-weight: 700; color: #7dff9b; }
   #hud-wanted { color: #ffd23f; font-size: 18px; letter-spacing: 2px; }
+  #hud-mission {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    font-size: 15px; color: #ffd23f; text-align: center; max-width: 46vw;
+  }
   #hud-topright { position: absolute; top: 12px; right: 12px; text-align: right; font-size: 14px; line-height: 1.5; }
-  #hud-mission { position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
-    font-size: 15px; color: #ffd23f; text-align: center; max-width: 46vw; }
-  #hud-bottomright { position: absolute; right: 12px; bottom: 12px; text-align: right;
-    font-size: 14px; line-height: 1.5; }
+  #hud-bottomright { position: absolute; right: 12px; bottom: 12px; text-align: right; font-size: 14px; line-height: 1.5; }
   #hud-speed { font-size: 24px; font-weight: 700; }
-  #minimap { position: absolute; left: 12px; bottom: 12px; width: 180px; height: 180px;
-    border: 2px solid rgba(255,255,255,0.5); border-radius: 6px; background: #0d2733; }
-  #hud-message { position: absolute; left: 50%; bottom: 22%; transform: translateX(-50%);
-    font-size: 20px; font-weight: 700; color: #ffd23f; text-shadow: 0 2px 6px #000;
-    opacity: 0; transition: opacity 0.3s; text-align: center; }
-  #crosshair { position: absolute; left: 50%; top: 50%; width: 24px; height: 24px;
-    margin: -12px 0 0 -12px; display: none; pointer-events: none; }
+  #minimap {
+    position: absolute; left: 12px; bottom: 12px; width: 180px; height: 180px;
+    border: 2px solid rgba(255,255,255,0.5); border-radius: 6px; background: #0d2733;
+  }
+  #hud-message {
+    position: absolute; left: 50%; bottom: 22%; transform: translateX(-50%);
+    font-size: 20px; font-weight: 700; color: #ffd23f; text-align: center;
+    text-shadow: 0 2px 6px #000; opacity: 0; transition: opacity 0.3s;
+  }
+  #crosshair { position: absolute; left: 50%; top: 50%; width: 24px; height: 24px; margin: -12px 0 0 -12px; display: none; }
   #crosshair::before, #crosshair::after { content: ""; position: absolute; background: #fff; }
   #crosshair::before { left: 11px; top: 0; width: 2px; height: 24px; }
   #crosshair::after { top: 11px; left: 0; height: 2px; width: 24px; }
-  .overlay { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
-    flex-direction: column; background: rgba(4,12,18,0.82); z-index: 10; text-align: center; }
+
+  /* ---- overlay layar penuh (judul / pause / peta / garage) ---- */
+  .overlay {
+    position: fixed; inset: 0; display: none; z-index: 10;
+    align-items: center; justify-content: center; flex-direction: column;
+    background: rgba(4,12,18,0.82); text-align: center;
+  }
   #title { display: flex; background: linear-gradient(180deg, rgba(10,26,36,0.25), rgba(4,12,18,0.88)); }
-  #title h1 { font-size: 64px; letter-spacing: 4px; color: #ffd23f;
-    text-shadow: 0 4px 24px rgba(0,0,0,0.8); margin-bottom: 6px; }
+  #title h1 { font-size: 64px; letter-spacing: 4px; color: #ffd23f; text-shadow: 0 4px 24px rgba(0,0,0,0.8); margin-bottom: 6px; }
   #title p { font-size: 18px; color: #cfe8f5; margin-bottom: 28px; }
-  .btn { pointer-events: auto; display: block; width: 260px; margin: 8px auto; padding: 13px;
-    font-size: 18px; font-weight: 700; color: #06222e; background: #ffd23f; border: none;
-    border-radius: 8px; cursor: pointer; }
+  .btn {
+    pointer-events: auto; display: block; width: 260px; margin: 8px auto; padding: 13px;
+    font-size: 18px; font-weight: 700; color: #06222e; background: #ffd23f;
+    border: none; border-radius: 8px; cursor: pointer;
+  }
   .btn:hover { background: #ffda5e; }
   .btn.secondary { background: #70a1ff; color: #06222e; }
   .btn.ghost { background: transparent; color: #fff; border: 2px solid #fff; }
@@ -59,6 +74,7 @@
 <body>
 <canvas id="game"></canvas>
 
+<!-- HUD -->
 <div id="hud">
   <div id="hud-topleft" class="panel">
     <div id="hud-money">$250</div>
@@ -81,6 +97,7 @@
   <div id="crosshair"></div>
 </div>
 
+<!-- Layar judul -->
 <div id="title" class="overlay">
   <h1>SUNSET BAY</h1>
   <p>An open-world sunset city. Steal cars, drift, run missions, outrun the law.</p>
@@ -90,11 +107,13 @@
   Shift run &middot; M radio &middot; Tab map &middot; P pause &middot; G garage</div>
 </div>
 
+<!-- Pause -->
 <div id="pause" class="overlay">
   <h2>PAUSED</h2>
   <p>Press P to resume.</p>
 </div>
 
+<!-- Peta layar penuh -->
 <div id="map" class="overlay">
   <canvas id="mapCanvas" width="640" height="640"></canvas>
   <div id="map-side">
@@ -113,6 +132,7 @@
   </div>
 </div>
 
+<!-- Garage & toko -->
 <div id="garage" class="overlay">
   <div class="shop">
     <h2>Garage &amp; Shop</h2>
@@ -127,6 +147,7 @@
   </div>
 </div>
 
+<!-- Modul game (klasik, berurutan — semuanya menempel ke window.SB) -->
 <script src="src/math3.js"></script>
 <script src="src/rng.js"></script>
 <script src="src/gl.js"></script>
@@ -140,6 +161,7 @@
 <script src="src/hud.js"></script>
 <script src="src/audio.js"></script>
 <script src="src/shots.js"></script>
-<script src="src/main.js"></script>
+<!-- Entrypoint sebagai module: dieksekusi setelah semua script klasik di atas -->
+<script type="module" src="./src/main.js"></script>
 </body>
 </html>

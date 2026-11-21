@@ -1,10 +1,30 @@
-// Sunset Bay — HUD (v8, written fresh from SPEC-v8)
-// window.SB.HUD: { update, draw, showMessage }
-// DOM HUD + minimap (canvas 2D) + fullscreen map (Tab) + pause (P) + crosshair.
+// Sunset Bay — HUD (v9, ditulis fresh dari SPEC-v8)
+// window.SB.HUD: { update, draw, drawMap, toggleMap, togglePause,
+//                  isPaused, isMapOpen, showMessage, mapOpen, paused }
+// HUD DOM + minimap (canvas 2D) + peta fullscreen (Tab) + jeda (P) + crosshair.
+//
+// PERBAIKAN BUG v8 — crosshair: di v8 crosshair hanya muncul bila nama
+// senjata persis 'Pistol'/'pistol', dan tidak pernah tampil saat menembak.
+// Di v9 crosshair tampil bila senjata api sedang dipakai (nama senjata
+// dinormalisasi ke lowercase dulu) ATAU saat baru saja menembak —
+// Shots.fire() menandai g._fireFlashUntil, jadi crosshair dijamin terlihat
+// selama momen tembakan. Warna titik polisi di minimap memakai konstanta
+// string literal, tidak pernah dihitung dari pembagian — tidak bisa NaN.
 (function () {
   'use strict';
   var SB = window.SB = window.SB || {};
-  var G = function () { return SB.G; };
+  function G() { return SB.G; }
+
+  // Warna-warna HUD: semuanya literal, tidak ada yang dihitung runtime.
+  var COP_DOT = '#ff4757';      // titik polisi di minimap (merah, tetap)
+  var PLAYER_DOT = '#2ed573';   // panah pemain (hijau)
+  var TARGET_DOT = '#ffd23f';   // target misi (kuning)
+  var MAP_WATER = '#14506e';
+  var MAP_LAND = '#0d2733';
+  var MAP_BUILDING = '#3a4a55';
+
+  // Senjata yang menampilkan crosshair (dibandingkan lowercase).
+  var GUNS = ['pistol', 'smg', 'shotgun', 'rifle'];
 
   var msgTimer = null;
   var mapOpen = false;
@@ -41,10 +61,25 @@
     return 'On foot';
   }
 
-  function currentWeapon() {
+  // Nama senjata aktif, dinormalisasi ke lowercase supaya 'Pistol' dan
+  // 'pistol' diperlakukan sama. Cek g.weapon, lalu slot senjata, lalu nama.
+  function weaponName() {
     var g = G();
-    return g.weapon || g.currentWeapon ||
-      (g.weapons && g.weapons[g.weaponSlot || 0] && g.weapons[g.weaponSlot || 0].name) || '';
+    var w = g.weapon || g.currentWeapon || '';
+    if (!w && g.weapons && g.weapons[g.weaponSlot || 0]) {
+      w = g.weapons[g.weaponSlot || 0].name || '';
+    }
+    return String(w || '').toLowerCase();
+  }
+
+  // Crosshair tampil bila: senjata api sedang dipakai, atau pemain baru
+  // saja menembak (flash beberapa ratus ms setelah Shots.fire()).
+  function crosshairVisible() {
+    var g = G();
+    if (!g) return false;
+    if (GUNS.indexOf(weaponName()) !== -1) return true;
+    if (g._fireFlashUntil && Date.now() < g._fireFlashUntil) return true;
+    return false;
   }
 
   var HUD = {
@@ -54,7 +89,10 @@
     update: function () {
       var g = G();
       if (!g) return;
-      var set = function (id, txt) { var el = $(id); if (el) el.textContent = txt; };
+      var set = function (id, txt) {
+        var el = $(id);
+        if (el) el.textContent = txt;
+      };
       set('hud-money', '$' + Math.floor(g.money || 0));
       set('hud-rep', 'REP ' + Math.floor(g.rep || 0));
       set('hud-drifts', 'Drifts ' + (g.drifts || 0));
@@ -64,18 +102,16 @@
       set('hud-speed', spd + ' km/h');
       set('hud-vehicle', vehicleName());
       set('hud-mission', missionText());
-      var st = SB.Audio && SB.Audio.stations ? SB.Audio.stations[SB.Audio.station || 0] : '';
+      var st = SB.Audio && SB.Audio.stations
+        ? SB.Audio.stations[SB.Audio.station || 0] : '';
       set('hud-radio', st ? '♪ ' + st : '');
       var dist = g.district || (SB.City && SB.City.districtAt && g.player
         ? SB.City.districtAt(g.player.x, g.player.z) : '');
       set('hud-district', dist || '');
-      // crosshair only when Pistol equipped (weapon disimpan lowercase 'pistol')
+      // Crosshair — lihat crosshairVisible(): senjata api ATAU baru menembak.
       var ch = $('crosshair');
-      if (ch) {
-        var w = currentWeapon();
-        ch.style.display = (w === 'Pistol' || w === 'pistol') ? 'block' : 'none';
-      }
-      // pause overlay
+      if (ch) ch.style.display = crosshairVisible() ? 'block' : 'none';
+      // Overlay jeda & peta
       var pv = $('pause');
       if (pv) pv.style.display = paused ? 'flex' : 'none';
       var mv = $('map');
@@ -84,28 +120,28 @@
     },
 
     draw: function () {
-      // minimap (small 2D canvas)
+      // Minimap (canvas 2D kecil di sudut layar).
       var cv = $('minimap');
       if (!cv) return;
       var ctx = cv.getContext('2d');
       if (!ctx) return;
       var W = cv.width, H = cv.height;
       var g = G();
-      ctx.fillStyle = '#0d2733';
+      ctx.fillStyle = MAP_LAND;
       ctx.fillRect(0, 0, W, H);
-      var range = 220; // world units visible
+      var range = 220; // satuan dunia yang terlihat di minimap
       var px = g.player ? g.player.x : 0;
       var pz = g.player ? g.player.z : 0;
       function toMap(x, z) {
         return [W / 2 + (x - px) / range * W / 2, H / 2 + (z - pz) / range * H / 2];
       }
-      // water (west + south edges)
-      ctx.fillStyle = '#14506e';
+      // Air di tepi barat + selatan.
+      ctx.fillStyle = MAP_WATER;
       ctx.fillRect(0, 0, W * 0.08, H);
       ctx.fillRect(0, H * 0.92, W, H * 0.08);
-      // buildings
+      // Gedung-gedung.
       if (SB.City && SB.City.buildings) {
-        ctx.fillStyle = '#3a4a55';
+        ctx.fillStyle = MAP_BUILDING;
         for (var i = 0; i < SB.City.buildings.length; i++) {
           var b = SB.City.buildings[i];
           var p = toMap(b.x, b.z);
@@ -113,37 +149,38 @@
           ctx.fillRect(p[0] - 1.5, p[1] - 1.5, 3, 3);
         }
       }
-      // mission target
+      // Target misi aktif.
       var M = SB.Game && SB.Game.MISSIONS;
       if (M && M[g.mission] && M[g.mission].stages && M[g.mission].stages[g.missionStage]) {
         var t = M[g.mission].stages[g.missionStage].target;
         if (t) {
           var tp = toMap(t.x, t.z);
-          ctx.fillStyle = '#ffd23f';
+          ctx.fillStyle = TARGET_DOT;
           ctx.beginPath(); ctx.arc(tp[0], tp[1], 5, 0, Math.PI * 2); ctx.fill();
           ctx.strokeStyle = '#000'; ctx.stroke();
         }
       }
-      // police
+      // Polisi — warna dari konstanta COP_DOT, tidak pernah dihitung.
       if (g.police) {
-        ctx.fillStyle = '#ff4757';
+        ctx.fillStyle = COP_DOT;
         for (var j = 0; j < g.police.length; j++) {
           var pp = toMap(g.police[j].x, g.police[j].z);
           ctx.beginPath(); ctx.arc(pp[0], pp[1], 3, 0, Math.PI * 2); ctx.fill();
         }
       }
-      // player arrow
+      // Panah pemain (menghadap sesuai yaw).
       ctx.save();
       ctx.translate(W / 2, H / 2);
       ctx.rotate(-(g.player ? g.player.yaw || 0 : 0));
-      ctx.fillStyle = '#2ed573';
+      ctx.fillStyle = PLAYER_DOT;
       ctx.beginPath(); ctx.moveTo(0, -6); ctx.lineTo(4, 5); ctx.lineTo(-4, 5); ctx.closePath(); ctx.fill();
       ctx.restore();
-      // north marker
+      // Penanda utara.
       ctx.fillStyle = '#fff'; ctx.font = 'bold 10px sans-serif'; ctx.fillText('N', W - 12, 12);
     },
 
     drawMap: function () {
+      // Peta fullscreen (Tab): seluruh kota + POI + daftar misi + statistik.
       var cv = $('mapCanvas');
       if (!cv) return;
       var ctx = cv.getContext('2d');
@@ -152,15 +189,15 @@
       var g = G();
       ctx.fillStyle = '#0a1a24';
       ctx.fillRect(0, 0, W, H);
-      // water west + south
-      ctx.fillStyle = '#14506e';
+      // Air barat + selatan.
+      ctx.fillStyle = MAP_WATER;
       ctx.fillRect(0, 0, W * 0.10, H);
       ctx.fillRect(0, H * 0.90, W, H * 0.10);
-      // city bounds: assume world ~ -260..260
+      // Dunia kota diasumsikan ~ -260..260.
       function toMap(x, z) {
         return [(x + 260) / 520 * W, (z + 260) / 520 * H];
       }
-      // district labels
+      // Label distrik.
       var names = (SB.City && SB.City.districts) || [];
       ctx.fillStyle = 'rgba(255,255,255,0.55)';
       ctx.font = '11px sans-serif';
@@ -169,7 +206,7 @@
         var gy = Math.floor(d / 5) * (H / 2) + 20;
         ctx.fillText(names[d], gx, gy);
       }
-      // buildings
+      // Gedung-gedung.
       if (SB.City && SB.City.buildings) {
         ctx.fillStyle = '#5a7180';
         for (var i = 0; i < SB.City.buildings.length; i++) {
@@ -178,7 +215,7 @@
           ctx.fillRect(p[0] - 2, p[1] - 2, 4, 4);
         }
       }
-      // POI markers: safehouse, garage, marina, beach
+      // POI: safehouse, garage, marina, beach.
       var pois = [
         { x: 0, z: 0, label: 'Safehouse', color: '#2ed573' },
         { x: 120, z: -80, label: 'Garage', color: '#ffa502' },
@@ -193,25 +230,25 @@
         ctx.fillStyle = '#fff';
         ctx.fillText(pois[k].label, q[0] + 9, q[1] + 4);
       }
-      // mission target
+      // Target misi aktif.
       var M = SB.Game && SB.Game.MISSIONS;
       if (M && M[g.mission] && M[g.mission].stages && M[g.mission].stages[g.missionStage]) {
         var t = M[g.mission].stages[g.missionStage].target;
         if (t) {
           var tp = toMap(t.x, t.z);
-          ctx.fillStyle = '#ffd23f';
+          ctx.fillStyle = TARGET_DOT;
           ctx.beginPath(); ctx.arc(tp[0], tp[1], 9, 0, Math.PI * 2); ctx.fill();
           ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke(); ctx.lineWidth = 1;
         }
       }
-      // player
+      // Pemain.
       if (g.player) {
         var pp = toMap(g.player.x, g.player.z);
-        ctx.fillStyle = '#2ed573';
+        ctx.fillStyle = PLAYER_DOT;
         ctx.beginPath(); ctx.arc(pp[0], pp[1], 6, 0, Math.PI * 2); ctx.fill();
         ctx.strokeStyle = '#fff'; ctx.stroke();
       }
-      // mission list (DOM)
+      // Daftar misi (DOM).
       var ml = $('map-missions');
       if (ml && M) {
         var html = '';

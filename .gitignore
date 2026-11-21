@@ -1,3 +1,9 @@
-node_modules
+# Sunset Bay v9 — pola ignore untuk build & artefak lokal
+node_modules/
 .DS_Store
 *.log
+out/
+dist/
+/tmp/
+*.tmp
+.env

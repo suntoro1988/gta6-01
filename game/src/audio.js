@@ -1,85 +1,97 @@
-// Sunset Bay — Audio (v8, written fresh from SPEC-v8)
-// window.SB.Audio: { init, sfx, stations, setStation, nextStation }
-// All sound is synthesized with WebAudio — no audio files, no network.
+// Sunset Bay — Audio (v9, ditulis fresh dari SPEC-v8)
+// window.SB.Audio: { init, sfx, stations, setStation, nextStation, station }
+// Semua suara disintesis dengan WebAudio — tanpa file audio, tanpa network.
+// Musik: 5 stasiun radio dengan karakter gelombang/tempo/skala berbeda,
+// termasuk TIDE FM. SFX: tembakan, tabrakan, pickup, misi, drift, busted.
 (function () {
   'use strict';
   var SB = window.SB = window.SB || {};
 
-  var actx = null;
-  var master = null;
-  var musicGain = null;
-  var station = 0;
-  var musicTimer = null;
-  var step = 0;
+  var ctx = null;        // AudioContext (dibuat saat init, butuh gestur user)
+  var masterBus = null;  // gain utama
+  var radioBus = null;   // gain khusus musik radio
+  var current = 0;       // indeks stasiun aktif
+  var radioClock = null; // interval penjadwal nada radio
+  var beat = 0;          // langkah melodi berjalan
 
-  // Per-station character: waveform, tempo (steps/sec), scale, bass note.
-  var STYLES = [
-    { wave: 'triangle', tempo: 6, scale: [0, 3, 5, 7, 10, 12], bass: 55, name: 'BAY FM' },
-    { wave: 'sawtooth', tempo: 8, scale: [0, 2, 4, 7, 9, 12], bass: 49, name: 'SUNSET DRIVE' },
-    { wave: 'sine', tempo: 5, scale: [0, 4, 5, 7, 11, 12], bass: 65, name: 'PALM COURT' },
-    { wave: 'square', tempo: 10, scale: [0, 3, 5, 6, 10, 12], bass: 46, name: 'NIGHT WAVE' },
-    { wave: 'sine', tempo: 7, scale: [0, 2, 5, 7, 9, 12], bass: 58, name: 'TIDE FM' }
+  // Karakter tiap stasiun: bentuk gelombang lead, langkah/detik, tangga nada
+  // (interval semitone dari root), dan nada bass (nomor MIDI).
+  var PROGRAMS = [
+    { wave: 'triangle', stepsPerSec: 6,  notes: [0, 3, 5, 7, 10, 12], bassMidi: 55, label: 'BAY FM' },
+    { wave: 'sawtooth', stepsPerSec: 8,  notes: [0, 2, 4, 7, 9, 12],  bassMidi: 49, label: 'SUNSET DRIVE' },
+    { wave: 'sine',     stepsPerSec: 5,  notes: [0, 4, 5, 7, 11, 12], bassMidi: 65, label: 'PALM COURT' },
+    { wave: 'square',   stepsPerSec: 10, notes: [0, 3, 5, 6, 10, 12], bassMidi: 46, label: 'NIGHT WAVE' },
+    { wave: 'sine',     stepsPerSec: 7,  notes: [0, 2, 5, 7, 9, 12],  bassMidi: 58, label: 'TIDE FM' }
   ];
 
-  function midi(n) { return 440 * Math.pow(2, (n - 69) / 12); }
-
-  function tone(freq, dur, type, vol, when, dest) {
-    if (!actx) return;
-    var t0 = when || actx.currentTime;
-    var o = actx.createOscillator();
-    var g = actx.createGain();
-    o.type = type || 'sine';
-    o.frequency.setValueAtTime(freq, t0);
-    g.gain.setValueAtTime(0.0001, t0);
-    g.gain.exponentialRampToValueAtTime(Math.max(vol || 0.2, 0.0001), t0 + 0.01);
-    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-    o.connect(g);
-    g.connect(dest || master);
-    o.start(t0);
-    o.stop(t0 + dur + 0.05);
+  function midiToHz(midi) {
+    return 440 * Math.pow(2, (midi - 69) / 12);
   }
 
-  function noise(dur, vol, freq, when) {
-    if (!actx) return;
-    var t0 = when || actx.currentTime;
-    var len = Math.floor(actx.sampleRate * dur);
-    var buf = actx.createBuffer(1, len, actx.sampleRate);
-    var d = buf.getChannelData(0);
-    for (var i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
-    var src = actx.createBufferSource();
+  // Satu nada osilator dengan envelope attack/decay sederhana.
+  function blip(hz, seconds, wave, loudness, at, out) {
+    if (!ctx) return;
+    var start = (at == null) ? ctx.currentTime : at;
+    var osc = ctx.createOscillator();
+    var env = ctx.createGain();
+    osc.type = wave || 'sine';
+    osc.frequency.setValueAtTime(hz, start);
+    env.gain.setValueAtTime(0.0001, start);
+    env.gain.exponentialRampToValueAtTime(Math.max(loudness || 0.2, 0.0001), start + 0.01);
+    env.gain.exponentialRampToValueAtTime(0.0001, start + seconds);
+    osc.connect(env);
+    env.connect(out || masterBus);
+    osc.start(start);
+    osc.stop(start + seconds + 0.05);
+  }
+
+  // Semburan noise terfilter (tembakan, tabrakan, hi-hat radio).
+  function burst(seconds, loudness, cutoffHz, at) {
+    if (!ctx) return;
+    var start = (at == null) ? ctx.currentTime : at;
+    var len = Math.max(1, Math.floor(ctx.sampleRate * seconds));
+    var buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    var data = buf.getChannelData(0);
+    for (var i = 0; i < len; i++) {
+      data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    }
+    var src = ctx.createBufferSource();
     src.buffer = buf;
-    var f = actx.createBiquadFilter();
-    f.type = 'lowpass';
-    f.frequency.value = freq || 1200;
-    var g = actx.createGain();
-    g.gain.value = vol || 0.3;
-    src.connect(f); f.connect(g); g.connect(master);
-    src.start(t0);
+    var filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = cutoffHz || 1200;
+    var env = ctx.createGain();
+    env.gain.value = loudness || 0.3;
+    src.connect(filter);
+    filter.connect(env);
+    env.connect(masterBus);
+    src.start(start);
   }
 
-  function musicStep() {
-    if (!actx || !musicGain) return;
-    var st = STYLES[station];
-    var s = step++;
-    var deg = st.scale[s % st.scale.length];
-    var oct = 60 + (Math.floor(s / st.scale.length) % 2) * 12;
-    // lead note every step, quieter on off-beats
-    tone(midi(oct + deg), 0.22, st.wave, s % 2 === 0 ? 0.10 : 0.05, 0, musicGain);
-    // bass every 4 steps
-    if (s % 4 === 0) tone(midi(st.bass), 0.5, 'sine', 0.12, 0, musicGain);
-    // soft hat tick every 2 steps
-    if (s % 2 === 1) noise(0.03, 0.04, 6000);
+  // Satu langkah sequencer radio: nada lead, bass tiap 4 langkah,
+  // ketukan hi-hat tiap langkah genap.
+  function radioStep() {
+    if (!ctx || !radioBus) return;
+    var prog = PROGRAMS[current];
+    var n = beat++;
+    var degree = prog.notes[n % prog.notes.length];
+    var root = 60 + (Math.floor(n / prog.notes.length) % 2) * 12;
+    blip(midiToHz(root + degree), 0.22, prog.wave, n % 2 === 0 ? 0.10 : 0.05, 0, radioBus);
+    if (n % 4 === 0) blip(midiToHz(prog.bassMidi), 0.5, 'sine', 0.12, 0, radioBus);
+    if (n % 2 === 1) burst(0.03, 0.04, 6000);
   }
 
-  function startMusic() {
-    stopMusic();
-    if (!actx) return;
-    var st = STYLES[station];
-    musicTimer = setInterval(musicStep, 1000 / st.tempo);
+  function startRadio() {
+    stopRadio();
+    if (!ctx) return;
+    radioClock = setInterval(radioStep, 1000 / PROGRAMS[current].stepsPerSec);
   }
 
-  function stopMusic() {
-    if (musicTimer) { clearInterval(musicTimer); musicTimer = null; }
+  function stopRadio() {
+    if (radioClock) {
+      clearInterval(radioClock);
+      radioClock = null;
+    }
   }
 
   var Audio = {
@@ -87,57 +99,62 @@
     station: 0,
 
     init: function () {
-      if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+      if (ctx) {
+        if (ctx.state === 'suspended') ctx.resume();
+        return;
+      }
       try {
         var AC = window.AudioContext || window.webkitAudioContext;
         if (!AC) return;
-        actx = new AC();
-        master = actx.createGain();
-        master.gain.value = 0.5;
-        master.connect(actx.destination);
-        musicGain = actx.createGain();
-        musicGain.gain.value = 0.6;
-        musicGain.connect(master);
-        startMusic();
-      } catch (e) { actx = null; }
+        ctx = new AC();
+        masterBus = ctx.createGain();
+        masterBus.gain.value = 0.5;
+        masterBus.connect(ctx.destination);
+        radioBus = ctx.createGain();
+        radioBus.gain.value = 0.6;
+        radioBus.connect(masterBus);
+        startRadio();
+      } catch (e) {
+        ctx = null;
+      }
     },
 
     sfx: function (name) {
-      if (!actx) return;
-      var t = actx.currentTime;
+      if (!ctx) return;
+      var now = ctx.currentTime;
       if (name === 'shoot') {
-        noise(0.12, 0.5, 2500, t);
-        tone(180, 0.1, 'square', 0.25, t);
+        burst(0.12, 0.5, 2500, now);
+        blip(180, 0.1, 'square', 0.25, now);
       } else if (name === 'crash') {
-        noise(0.3, 0.5, 700, t);
-        tone(70, 0.3, 'sawtooth', 0.3, t);
+        burst(0.3, 0.5, 700, now);
+        blip(70, 0.3, 'sawtooth', 0.3, now);
       } else if (name === 'pickup') {
-        tone(660, 0.12, 'sine', 0.3, t);
-        tone(880, 0.18, 'sine', 0.3, t + 0.09);
+        blip(660, 0.12, 'sine', 0.3, now);
+        blip(880, 0.18, 'sine', 0.3, now + 0.09);
       } else if (name === 'mission') {
-        tone(523, 0.15, 'triangle', 0.3, t);
-        tone(659, 0.15, 'triangle', 0.3, t + 0.12);
-        tone(784, 0.3, 'triangle', 0.3, t + 0.24);
+        blip(523, 0.15, 'triangle', 0.3, now);
+        blip(659, 0.15, 'triangle', 0.3, now + 0.12);
+        blip(784, 0.3, 'triangle', 0.3, now + 0.24);
       } else if (name === 'drift') {
-        noise(0.4, 0.25, 900, t);
+        burst(0.4, 0.25, 900, now);
       } else if (name === 'busted') {
-        tone(220, 0.4, 'sawtooth', 0.3, t);
-        tone(175, 0.5, 'sawtooth', 0.3, t + 0.3);
+        blip(220, 0.4, 'sawtooth', 0.3, now);
+        blip(175, 0.5, 'sawtooth', 0.3, now + 0.3);
       } else if (name === 'click') {
-        tone(440, 0.05, 'square', 0.15, t);
+        blip(440, 0.05, 'square', 0.15, now);
       }
     },
 
     setStation: function (i) {
-      station = ((i % 5) + 5) % 5;
-      Audio.station = station;
-      if (actx) startMusic();
+      current = ((i % 5) + 5) % 5;
+      Audio.station = current;
+      if (ctx) startRadio();
       if (SB.HUD) SB.HUD.update();
     },
 
     nextStation: function () {
-      Audio.setStation(station + 1);
-      if (SB.HUD) SB.HUD.showMessage('Radio: ' + Audio.stations[station]);
+      Audio.setStation(current + 1);
+      if (SB.HUD) SB.HUD.showMessage('Radio: ' + Audio.stations[current]);
     }
   };
 
