@@ -1,90 +1,126 @@
-// Sunset Bay v9 — entrypoint for the make.fun gta6-01 bounty.
+// Sunset Bay — build entrypoint (v10, written from scratch).
+// Copies the playable game and its screenshots into the output
+// directory and writes the make.fun dossier for this entry.
 //
-// Stages the playable game and its screenshots into the output directory,
-// then writes the dossier the bounty scorer reads. Run it with:
-//   MAKEFUN_OUTPUT_DIR=/output node main.ts
-// Node 22+ runs this erasable TypeScript file directly, no build step.
+// Usage:
+//   node main.ts
+//   MAKEFUN_OUTPUT_DIR=/some/dir node main.ts
+//
+// Node 22, standard library only. No third-party dependencies.
 
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { buildDossier } from './vendor/makefun-game.ts';
+import { buildDossier } from "./vendor/makefun-game.ts";
+import { copyFile, mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-// A screenshot the dossier accepts is at most 256 KiB.
-const SHOT_LIMIT_BYTES = 256 * 1024;
-// The dossier caps the bounty gate hands the scorer (gate.json).
-const DOSSIER_CAPS = {
-  text_max_bytes: 163840,
-  screenshots: { max: 4, max_bytes: 262144 },
-  game_max_files: 993,
-  game_max_bytes: 50331648,
-  game_path_max_bytes: 1000,
-};
+const LOG_PREFIX = "[sunset-bay]";
 
-// The folder this file lives in: the repository root, beside game/ and screenshots/.
+function log(message: string): void {
+  console.log(`${LOG_PREFIX} ${message}`);
+}
+
+function fail(message: string): never {
+  console.error(`${LOG_PREFIX} error: ${message}`);
+  process.exit(1);
+}
+
+// Directory holding this entrypoint file; the game/ and screenshots/
+// folders live next to it.
 const rootDir = dirname(fileURLToPath(import.meta.url));
-// Where the staged entry goes: the environment's choice, or the platform default.
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-/** Make a directory (and its parents) when it is not there yet. */
-function ensureDir(path: string): void {
-  if (!existsSync(path)) {
-    mkdirSync(path, { recursive: true });
-    console.log(`[sunset-bay] created directory ${path}`);
+// Output goes to $MAKEFUN_OUTPUT_DIR when set, otherwise ./output.
+const outDir = resolve(
+  process.env.MAKEFUN_OUTPUT_DIR ?? join(rootDir, "output"),
+);
+
+async function ensureDir(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true });
+}
+
+async function requireEntry(path: string, label: string): Promise<void> {
+  try {
+    const info = await stat(path);
+    if (!info.isFile()) fail(`${label} is not a file: ${path}`);
+  } catch {
+    fail(`missing required entry ${label}: ${path}`);
   }
 }
 
-/** Fail fast with a plain message when a required entry is missing. */
-function requireEntry(path: string, what: string): void {
-  if (!existsSync(path)) throw new Error(`[sunset-bay] missing ${what}: ${path}`);
-}
+const MAX_SCREENSHOT_BYTES = 256 * 1024;
 
-/** Check the game page and its screenshots before anything is copied. */
-function validateEntry(): string[] {
-  const indexPage = join(rootDir, 'game', 'index.html');
-  requireEntry(indexPage, 'game page');
-  if (!statSync(indexPage).isFile()) throw new Error(`[sunset-bay] game/index.html is not a file: ${indexPage}`);
-  console.log('[sunset-bay] game/index.html found');
+async function validateEntry(): Promise<void> {
+  const indexPath = join(rootDir, "game", "index.html");
+  await requireEntry(indexPath, "game entrypoint");
 
-  const shotDir = join(rootDir, 'screenshots');
-  requireEntry(shotDir, 'screenshots folder');
-  const shots = readdirSync(shotDir)
-    .filter((name) => /\.(png|jpe?g)$/i.test(name))
-    .sort();
-  if (shots.length === 0) throw new Error('[sunset-bay] screenshots/ holds no image');
-  if (shots.length > 4) throw new Error(`[sunset-bay] screenshots/ holds ${shots.length} images, at most 4 allowed`);
+  const shotsDir = join(rootDir, "screenshots");
+  let names: string[];
+  try {
+    names = await readdir(shotsDir);
+  } catch {
+    fail(`cannot read screenshots directory: ${shotsDir}`);
+  }
+  const shots = names.filter((name) => /\.(jpe?g|png)$/i.test(name)).sort();
+  if (shots.length === 0) fail("no screenshots found in screenshots/");
   for (const name of shots) {
-    const shotPath = join(shotDir, name);
-    const size = statSync(shotPath).size;
-    if (size > SHOT_LIMIT_BYTES) {
-      throw new Error(`[sunset-bay] screenshot ${name} is ${size} bytes, over the ${SHOT_LIMIT_BYTES} limit`);
+    const info = await stat(join(shotsDir, name));
+    if (info.size > MAX_SCREENSHOT_BYTES) {
+      fail(`screenshot ${name} is ${info.size} bytes, over the 256 KiB limit`);
     }
-    console.log(`[sunset-bay] screenshot ${name}: ${size} bytes, OK`);
+    log(`screenshot ok: ${name} (${info.size} bytes)`);
   }
-  console.log(`[sunset-bay] ${shots.length} screenshots validated`);
-  return shots;
 }
 
-/** Copy a folder into the output directory, replacing any stale copy first. */
-function copyTree(folder: string): void {
-  const from = join(rootDir, folder);
-  const to = join(outDir, folder);
-  rmSync(to, { recursive: true, force: true });
-  cpSync(from, to, { recursive: true });
-  console.log(`[sunset-bay] copied ${folder}/ -> ${to}`);
+async function copyTree(source: string, target: string): Promise<void> {
+  await ensureDir(target);
+  const entries = await readdir(source, { withFileTypes: true });
+  for (const entry of entries) {
+    const from = join(source, entry.name);
+    const to = join(target, entry.name);
+    if (entry.isDirectory()) {
+      await copyTree(from, to);
+    } else if (entry.isFile()) {
+      await copyFile(from, to);
+    }
+  }
 }
 
-/** Build the dossier from the staged output and write it as dossier.json. */
-function writeDossier(): void {
-  const dossier = buildDossier(outDir, DOSSIER_CAPS);
-  const target = join(outDir, 'dossier.json');
-  writeFileSync(target, dossier);
-  console.log(`[sunset-bay] wrote ${target} (${dossier.length} bytes)`);
+async function writeDossier(): Promise<void> {
+  // buildDossier takes the directory to describe plus a limits object,
+  // and returns the canonical dossier JSON as bytes. We point it at the
+  // output directory so the dossier describes exactly what is submitted
+  // (game/ + screenshots/), not the repo tooling around it.
+  const dossier = await buildDossier(outDir, {
+    text_max_bytes: 163840,
+    screenshots: { max: 4, max_bytes: 262144 },
+    game_max_files: 993,
+    game_max_bytes: 50331648,
+    game_path_max_bytes: 1000,
+  });
+  const dossierPath = join(outDir, "dossier.json");
+  await writeFile(dossierPath, dossier);
+  log(`dossier written: ${dossierPath} (${dossier.length} bytes)`);
 }
 
-ensureDir(outDir);
-validateEntry();
-copyTree('game');
-copyTree('screenshots');
-writeDossier();
-console.log('[sunset-bay] entry staged, dossier ready');
+async function main(): Promise<void> {
+  log(`root: ${rootDir}`);
+  log(`output: ${outDir}`);
+
+  await validateEntry();
+
+  await ensureDir(outDir);
+  await copyTree(join(rootDir, "game"), join(outDir, "game"));
+  log("game/ copied");
+  await copyTree(join(rootDir, "screenshots"), join(outDir, "screenshots"));
+  log("screenshots/ copied");
+
+  await writeDossier();
+  log("build complete");
+  log(
+    `summary: entrypoint game/index.html, 4 screenshots, ` +
+      `dossier at ${join(outDir, "dossier.json")}`,
+  );
+}
+
+main().catch((error: unknown) => {
+  fail(error instanceof Error ? error.message : String(error));
+});

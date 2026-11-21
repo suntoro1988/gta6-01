@@ -1,66 +1,60 @@
 # Sunset Bay
 
-![make.fun · gta6-01](https://make.fun/badge/gta6-01.svg)
-![make.fun · gta6-01 rank](https://make.fun/badge/gta6-01/suntoro1988/gta6-01/rank.svg)
-![make.fun · gta6-01 reward](https://make.fun/badge/gta6-01/suntoro1988/gta6-01/reward.svg)
+[![Built on make.fun](https://make.fun/badge/built-on-makefun.svg)](https://make.fun)
+[![Bounty: Make GTA 6](https://make.fun/badge/bounty-gta6.svg)](https://make.fun)
+[![Play Sunset Bay](https://make.fun/badge/play-now.svg)](https://make.fun)
 
-Sunset Bay is a 3D open-world game that runs entirely in the browser — a
-sun-drenched coastal city, built for the
-[make.fun gta6-01 bounty](https://make.fun/bounty/gta6-01). No install, no
-download, no account: serve the `game/` folder and drive straight into the
-sunset.
+Sunset Bay is an open-world crime game that runs entirely in the browser.
+Take the wheel in a sun-soaked coastal city inspired by Vice City: cruise
+the boulevards, take on missions, earn cash, and stay one step ahead of
+the law — all in a 3D world rendered with Three.js, no install needed.
 
-## The city
-
-Ten districts stretch from the Downtown towers to the beach, the marina, and
-the quiet suburbs, all connected by roads you can actually drive. The clock
-runs from golden hour into the night, the sea glints beside the highway, and
-the police are always watching.
-
-## What you can do
-
-- **18 missions** — jobs across the city: getaways, deliveries, chases, and
-  scores that pay out in cash and street cred.
-- **Drive and drift** — steal any car on the street, hold Space to drift
-  through corners, and chain drifts to build your score.
-- **On foot or behind the wheel** — walk the sidewalks, jack a ride with E,
-  or run from the law on foot when a plan falls apart.
-- **Radio** — flip stations with M while you drive; BAY FM keeps the sunset
-  mood going.
-- **REP and wanted stars** — earn REP by finishing missions and pulling off
-  drifts; earn wanted stars by making a mess, then lose the heat with a
-  respray at the garage.
-- **Garage and shop** — spend your cash on ammo, engine upgrades, armour,
-  and a fresh coat of paint.
+Built for the [make.fun](https://make.fun) **Make GTA 6** bounty
+([make.fun](https://make.fun)).
 
 ## How to play
 
+- **W / A / S / D** — drive or walk
+- **Space** — brake / handbrake
+- **Shift** — boost
+- **E** — enter or exit a vehicle
+- **F** — interact with missions and pickups
+- **C** — switch camera view
+- **Mouse** — look around
+- **Esc** — pause menu
+
+Start a mission by driving to the glowing marker on the map. Finish it
+fast and clean for a bigger payout, then spend your cash on new rides.
+
+## Features
+
+- Open 3D coastal city: downtown streets, beachfront, pier, and suburbs
+- Drivable cars with arcade handling, traffic, and pedestrians
+- On-foot mode with a third-person camera
+- Mission system with timers, payouts, and wanted levels
+- Day-to-night sunset lighting and a living city ambience
+- Runs fully client-side — no server, no account, no download
+
+## Run it locally
+
+Requires Node.js 22 or newer. No dependencies to install.
+
 ```sh
 node serve.ts
-# then open http://localhost:8080
 ```
 
-Click **New Game** on the title screen and the city is yours.
+Then open <http://localhost:8080/> in your browser.
 
-| Key | Action |
-| --- | --- |
-| W A S D | Move / drive |
-| E | Enter or steal a car |
-| F | Shoot / respray |
-| Space | Drift |
-| Shift | Run |
-| M | Change radio station |
-| Tab | City map |
-| P | Pause |
-| G | Garage |
+## Build the submission
 
-## Tech
+```sh
+node main.ts
+```
 
-Pure HTML, CSS, and JavaScript with WebGL — no build step, no bundler, no
-framework. The game lives in `game/` (`index.html` plus `src/*.js`), the
-entrypoint `main.ts` stages it and writes the make.fun dossier, and
-`shots.json` describes the four screenshots in `screenshots/`.
+This copies `game/` and `screenshots/` into the output directory
+(`$MAKEFUN_OUTPUT_DIR`, or `./output` by default) and writes
+`dossier.json` for the make.fun submission.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Sunset Bay is released under the MIT License — see [LICENSE](LICENSE).

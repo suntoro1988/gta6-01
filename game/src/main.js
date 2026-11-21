@@ -1,453 +1,699 @@
-// Sunset Bay — main.js (v9, ditulis ulang)
-// Bootstrap: inisialisasi GL + kota, bangun mesh dunia sekali di awal,
-// layar judul, game loop (update + render), input keyboard, dan toko
-// garage. Semua mesh diproses lewat SB.GL.mesh() DI SINI (sekali),
-// sehingga render loop hanya memanggil GL.draw() dengan mesh yang
-// sudah jadi — tidak pernah dengan mesh mentah.
-// PENTING: SB.Water.draw() dipanggil setiap frame render (dermaga
-// marina harus selalu tergambar).
-(function () {
-  'use strict';
-  var SB = window.SB = window.SB || {};
+// Sunset Bay — main.js
+// Entry point game (v10, ditulis dari nol; wiring diperbaiki integrator v10).
+// Game loop (requestAnimationFrame), input keyboard WASD/panah + mouse,
+// state machine (menu, playing, paused, wasted), save/load localStorage
+// key 'sunset-bay-save-v1', overlay pause. Menghubungkan player, vehicles,
+// city, jobs, hud, audio, shots, water, meshes.
+//
+// Wiring yang diperbaiki di integrasi v10 (modul-modulnya sendiri sudah
+// benar, tapi main.js lama tidak memanggilnya dengan benar):
+//   * meshes.js + water.js di-import (SB.Meshes / SB.Water tadinya tidak
+//     pernah ada — semua build*Mesh mengembalikan null).
+//   * City.build()/render() dipanggil: kota 219 bangunan digambar.
+//   * Water.draw() dipanggil SETIAP frame; laut + dermaga + buoy digambar.
+//   * Player.update dipanggil dengan argumen benar (player, input, dt,
+//     world) — tadinya (dt, input, state) sehingga pemain tak bergerak.
+//   * Jobs.updateMission / updateTaxiJob / updateDeliveryJob per frame
+//     (Jobs.update tidak ada); misi 1 auto-start saat permainan dimulai.
+//   * Vehicles.updateVehicle (kendaraan pemain) + updateTraffic per frame
+//     (Vehicles.update tidak ada).
+//   * HUD.render(state) per frame (HUD.update tidak ada).
+//   * Shots.fire dipanggil dengan (game, origin, dir, targets) yang benar
+//     — tadinya Shots.fire(player) sehingga tembakan tak pernah terjadi.
+//   * Audio.init/startMusic/toggleMute/playShot adalah alias di audio.js.
+//   * Mesh kendaraan/pemain/heli/marker dibuat sekali (ruang lokal) lalu
+//     digambar dengan model matrix — bukan rebuild tiap frame (bocor
+//     buffer GL).
 
-  var canvas = null;
-  var pressed = {};
-  var isRunning = false;
-  var prevTime = 0;
-  var stagedShot = null;
+import { Math3 } from './math3.js';
+import { GL } from './gl.js';
+import { Game } from './game.js';
+import { Player } from './player.js';
+import { Vehicles } from './vehicles.js';
+import { City } from './city.js';
+import { Jobs } from './jobs.js';
+import { HUD } from './hud.js';
+import { Audio } from './audio.js';
+import { Shots } from './shots.js';
+import { Water } from './water.js';
+import { Meshes } from './meshes.js';
 
-  // Mesh yang sudah diproses (buffer WebGL), dibangun sekali saat start.
-  var worldMeshes = [];
-  var walkerMesh = null;
-  var boatMesh = null;
-  var treeMesh = null;
-  var groundMesh = null;
-  var seaMesh = null;
-  var carMeshes = {};
+const SB = (typeof window !== 'undefined' ? (window.SB = window.SB || {}) : (globalThis.SB = globalThis.SB || {}));
+SB.Math3 = Math3;
+SB.GL = GL;
+SB.Game = Game;
+SB.G = Game;
+SB.Player = Player;
+SB.Vehicles = Vehicles;
+SB.City = City;
+SB.Jobs = Jobs;
+SB.HUD = HUD;
+SB.Audio = Audio;
+SB.Shots = Shots;
+SB.Water = Water;
+SB.Meshes = Meshes;
 
-  function el(id) { return document.getElementById(id); }
+const SAVE_KEY = 'sunset-bay-save-v1';
+const SHOOT_COOLDOWN_SECONDS = 0.35;
+const DRIFT_REWARD = 50;
+const DRIFT_REWARD_COOLDOWN_MS = 3000;
+const RESPRAY_PRICE = 150;
 
-  function queryParam(name) {
-    var m = new RegExp('[?&]' + name + '=([^&]*)').exec(window.location.search || '');
-    return m ? decodeURIComponent(m[1]) : null;
-  }
+const Main = {
+  canvas: null,
+  gl: null,
+  running: false,
+  lastTime: 0,
+  shootCooldown: 0,
+  keys: {},
+  mouse: { x: 0, y: 0, down: false, dx: 0, dy: 0 },
+  cameraYaw: Math.PI,
+  cameraPitch: 0.32,
+  cameraDistance: 9,
+  paused: false,
+  city: null,
+  water: null,
+  vehicles: [],
+  traffic: [],
+  stats: { frames: 0, waterDraws: 0, hudRenders: 0 },
+  _carMeshes: {},
+  _boatMeshes: {},
+  _playerMesh: null,
+  _playerMeshKey: '',
+  _playerMeshAt: 0,
+  _figureMesh: null,
+  _heliMesh: null,
+  _markerMesh: null,
+  _tracerMesh: null,
+  _driftPaidAt: 0,
 
-  // ---------- toko garage ----------
-  function showGarage() {
-    var ov = el('garage');
-    if (!ov) return;
-    ov.style.display = 'flex';
-    refreshGaragePanel();
-    if (SB.Audio) SB.Audio.sfx('click');
-  }
+  init() {
+    const canvas = document.getElementById('game-canvas');
+    if (!canvas) throw new Error('Canvas #game-canvas tidak ditemukan');
+    this.canvas = canvas;
+    const created = GL.initGL(canvas);
+    this.gl = created.gl;
 
-  function hideGarage() {
-    var ov = el('garage');
-    if (ov) ov.style.display = 'none';
-  }
+    this.bindInput();
+    this.bindButtons();
+    this.loadSaveIntoHud();
 
-  function setText(id, text) {
-    var node = el(id);
-    if (node) node.textContent = text;
-  }
-
-  function refreshGaragePanel() {
-    var g = SB.G;
-    if (!g) return;
-    setText('garage-money', 'Money: $' + Math.floor(g.money || 0));
-    setText('garage-wanted', 'Wanted: ' + (g.wanted || 0) + ' stars');
-    var ammo = 0;
-    if (g.ammo && typeof g.ammo === 'object' && g.ammo.pistol != null) ammo = g.ammo.pistol;
-    else if (typeof g.ammo === 'number') ammo = g.ammo;
-    setText('garage-ammo', 'Pistol ammo: ' + ammo);
-  }
-
-  function shopBuyAmmo() {
-    if (SB.Game && SB.Game.buyAmmo) SB.Game.buyAmmo();
-    else if (SB.G && SB.G.money >= 50) {
-      SB.G.money -= 50;
-      if (SB.G.ammo && typeof SB.G.ammo === 'object') SB.G.ammo.pistol = (SB.G.ammo.pistol || 0) + 24;
-      else SB.G.ammo = { pistol: 24 };
+    // Dunia: kota (219 bangunan / 10 distrik), laut, kendaraan.
+    if (City && typeof City.build === 'function') this.city = City.build();
+    else if (City && typeof City.generateCity === 'function') this.city = City.generateCity(1337);
+    if (Water && typeof Water.createWater === 'function') this.water = Water.createWater();
+    if (Vehicles) {
+      const parked = typeof Vehicles.spawnParkedCars === 'function' && this.city
+        ? Vehicles.spawnParkedCars(this.city, 8) : [];
+      const traffic = typeof Vehicles.spawnTraffic === 'function' && this.city
+        ? Vehicles.spawnTraffic(this.city, 10) : [];
+      const boats = typeof Vehicles.spawnBoats === 'function'
+        ? Vehicles.spawnBoats(3) : [];
+      this.vehicles = [...parked, ...traffic, ...boats];
+      this.traffic = traffic;
     }
-    refreshGaragePanel();
-    if (SB.HUD) { SB.HUD.update(); SB.HUD.showMessage('Ammo +24'); }
-    if (SB.Audio) SB.Audio.sfx('pickup');
-  }
-
-  function shopRespray() {
-    var g = SB.G;
-    if (SB.Game && SB.Game.respray) { SB.Game.respray(); }
-    else if (g && g.money >= 150) { g.money -= 150; g.wanted = 0; }
-    else { if (SB.HUD) SB.HUD.showMessage('Need $150 for respray'); return; }
-    refreshGaragePanel();
-    if (SB.HUD) { SB.HUD.update(); SB.HUD.showMessage('Respray done — wanted cleared'); }
-    if (SB.Audio) SB.Audio.sfx('pickup');
-  }
-
-  function shopEngine() {
-    var g = SB.G;
-    if (!g) return;
-    if (SB.Game && SB.Game.buyEngine) { SB.Game.buyEngine(); }
-    else if (g.money >= 400) { g.money -= 400; g.engineLevel = (g.engineLevel || 0) + 1; }
-    else { if (SB.HUD) SB.HUD.showMessage('Engine upgrade needs $400'); return; }
-    refreshGaragePanel();
-    if (SB.HUD) { SB.HUD.update(); SB.HUD.showMessage('Engine upgraded'); }
-    if (SB.Audio) SB.Audio.sfx('pickup');
-  }
-
-  function shopArmour() {
-    var g = SB.G;
-    if (!g) return;
-    if (SB.Game && SB.Game.buyArmour) { SB.Game.buyArmour(); }
-    else if (g.money >= 300) { g.money -= 300; g.armour = (g.armour || 0) + 50; }
-    else { if (SB.HUD) SB.HUD.showMessage('Armour needs $300'); return; }
-    refreshGaragePanel();
-    if (SB.HUD) { SB.HUD.update(); SB.HUD.showMessage('Armour installed'); }
-    if (SB.Audio) SB.Audio.sfx('pickup');
-  }
-
-  // ---------- input ----------
-  function onKeyDown(e) {
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      if (SB.HUD) SB.HUD.toggleMap();
-      return;
+    if (Audio && typeof Audio.init === 'function') {
+      try { Audio.init(); } catch (e) { /* audio butuh gesture; mulai di Start */ }
     }
-    pressed[e.key.toLowerCase()] = true;
-    if (e.key === ' ') e.preventDefault();
-    if (e.repeat) return;
-    var k = e.key.toLowerCase();
-    if (k === 'p') { if (SB.HUD) SB.HUD.togglePause(); return; }
-    if (k === 'm') { if (SB.Audio) SB.Audio.nextStation(); return; }
-    if (k === 'g') { showGarage(); return; }
-    if (k === 'escape') { hideGarage(); return; }
-    if (k === 'e') { interact(); return; }
-    if (k === 'f') { fireOrRespray(); return; }
-  }
+    if (HUD && typeof HUD.init === 'function') HUD.init();
 
-  function onKeyUp(e) { pressed[e.key.toLowerCase()] = false; }
+    this.showMenu();
+    this.running = true;
+    this.lastTime = performance.now();
+    requestAnimationFrame((t) => this.loop(t));
+    return this;
+  },
 
-  function interact() {
-    var g = SB.G;
-    if (!g || !g.player) return;
+  bindInput() {
+    window.addEventListener('keydown', (e) => {
+      const key = e.key.toLowerCase();
+      this.keys[key] = true;
+      if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].includes(key)) e.preventDefault();
+      if (key === 'escape' || key === 'p') this.togglePause();
+      if (key === 'f') this.tryShoot();
+      if (key === 'enter' && Game.state.mode === 'menu') this.startPlaying();
+      if (key === 'enter' && Game.state.mode === 'wasted') this.respawn();
+      if (key === 'e') this.tryEnterVehicle();
+      if (key === 'r') this.respray();
+      if (key === 'q' && Audio && typeof Audio.nextStation === 'function') Audio.nextStation();
+    });
+    window.addEventListener('keyup', (e) => {
+      this.keys[e.key.toLowerCase()] = false;
+    });
+    window.addEventListener('blur', () => {
+      this.keys = {};
+      this.mouse.down = false;
+    });
 
-    // Sudah di kapal: E selalu bisa turun, di mana pun kapal berada.
-    // Sebelumnya turun hanya bisa di zona dermaga (gate di bawah), jadi
-    // pemain yang berlayar >20 unit dari dermaga TERKUNCI di kapal (E
-    // tidak melakukan apa-apa) — cacat nyata temuan QA v9.
-    if (g.player.inBoat) {
-      if (SB.Water && SB.Water.leaveBoat) { SB.Water.leaveBoat(); return; }
-    }
+    const canvas = this.canvas;
+    canvas.addEventListener('mousedown', (e) => {
+      this.mouse.down = true;
+      this.mouse.x = e.clientX;
+      this.mouse.y = e.clientY;
+      if (Game.state.mode === 'playing') this.tryShoot();
+    });
+    window.addEventListener('mouseup', () => { this.mouse.down = false; });
+    window.addEventListener('mousemove', (e) => {
+      if (!this.mouse.down) return;
+      const dx = e.clientX - this.mouse.x;
+      const dy = e.clientY - this.mouse.y;
+      this.mouse.x = e.clientX;
+      this.mouse.y = e.clientY;
+      this.cameraYaw -= dx * 0.005;
+      this.cameraPitch = Math.max(0.05, Math.min(1.1, this.cameraPitch + dy * 0.003));
+    });
+    canvas.addEventListener('touchstart', (e) => {
+      const t = e.touches[0];
+      this.mouse.down = true;
+      this.mouse.x = t.clientX;
+      this.mouse.y = t.clientY;
+    }, { passive: true });
+    canvas.addEventListener('touchmove', (e) => {
+      const t = e.touches[0];
+      const dx = t.clientX - this.mouse.x;
+      const dy = t.clientY - this.mouse.y;
+      this.mouse.x = t.clientX;
+      this.mouse.y = t.clientY;
+      this.cameraYaw -= dx * 0.006;
+      this.cameraPitch = Math.max(0.05, Math.min(1.1, this.cameraPitch + dy * 0.004));
+    }, { passive: true });
+    canvas.addEventListener('touchend', () => { this.mouse.down = false; }, { passive: true });
+  },
 
-    // Dekat dermaga marina: naik / turun speedboat. Boarding hanya
-    // diizinkan di area dermaga (x < -160, z sekitar 120); jarak
-    // pastinya dicek sendiri oleh Water.boardBoat.
-    if (SB.Water && SB.Water.boardBoat && g.player.x < -160 && Math.abs(g.player.z - 120) < 20) {
-      if (SB.Water.boardBoat()) return;
-    }
-
-    // Keluar dari mobil.
-    if (g.player.inCar) {
-      if (SB.Vehicles) SB.Vehicles.exitCar();
-      g.player.inCar = false;
-      g.player.car = null;
-      return;
-    }
-
-    // Curi mobil terdekat. stealNearest sudah memasukkan pemain ke
-    // mobil DAN menaikkan wanted sendiri — jangan dobel di sini.
-    var car = null;
-    if (SB.Vehicles) {
-      car = SB.Vehicles.stealNearest ? SB.Vehicles.stealNearest() : null;
-      if (car) return;
-      if (SB.Vehicles.nearestParked) car = SB.Vehicles.nearestParked(g.player.x, g.player.z);
-    }
-    // Jalur cadangan: mobil parkir terdekat dalam 6 unit. Jalur ini hanya
-    // tercapai bila stealNearest gagal; curi mobil tetap wanted +2 TOTAL
-    // (SPEC v8) — sama seperti stealNearest, jangan +1.
-    if (car && Math.hypot(car.x - g.player.x, car.z - g.player.z) <= 6) {
-      if (SB.Vehicles && SB.Vehicles.enterCar) SB.Vehicles.enterCar(car);
-      else { g.player.inCar = true; g.player.car = car; }
-      if (SB.Game && SB.Game.wantedUp) SB.Game.wantedUp(2);
-      else g.wanted = Math.min(5, (g.wanted || 0) + 2);
-      if (SB.HUD) SB.HUD.showMessage('Car stolen! Wanted +2');
-      if (SB.Audio) SB.Audio.sfx('pickup');
-    }
-  }
-
-  function fireOrRespray() {
-    var g = SB.G;
-    if (!g || !g.player) return;
-    // Dekat garage: F = respray (bersihkan wanted, $150).
-    if (Math.abs(g.player.x - 120) < 25 && Math.abs(g.player.z + 80) < 25) {
-      shopRespray();
-      return;
-    }
-    // Selain itu: tembak pistol.
-    if (SB.Game && SB.Game.fire) SB.Game.fire();
-    else {
-      if (SB.Audio) SB.Audio.sfx('shoot');
-      if (SB.HUD) SB.HUD.showMessage('Bang!');
-    }
-  }
-
-  // State tombol yang dibaca Player.update. Kunci panah dipetakan ke
-  // nama yang sama dengan WASD agar jalan kaki tetap jalan.
-  function readInput() {
-    return {
-      forward: !!(pressed['w'] || pressed['arrowup']),
-      back: !!(pressed['s'] || pressed['arrowdown']),
-      left: !!(pressed['a'] || pressed['arrowleft']),
-      right: !!(pressed['d'] || pressed['arrowright']),
-      up: !!(pressed['w'] || pressed['arrowup']),
-      down: !!(pressed['s'] || pressed['arrowdown']),
-      run: !!pressed['shift'],
-      drift: !!pressed[' ']
+  bindButtons() {
+    const bind = (id, fn) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('click', fn);
     };
-  }
-
-  // ---------- bangun mesh dunia (sekali saat start) ----------
-  function buildWorldMeshes() {
-    worldMeshes = [];
-    var list = (SB.City && SB.City.buildings) || [];
-    for (var i = 0; i < list.length; i++) {
-      var b = list[i];
-      // SB.Meshes.building mengembalikan data mentah {pos, col};
-      // bungkus sekali lewat GL.mesh di sini, bukan tiap frame.
-      var raw = SB.Meshes.building(b.w, b.h, b.d, i * 7 + 3);
-      worldMeshes.push({ mesh: SB.GL.mesh(raw.pos, raw.col), x: b.x, z: b.z });
-    }
-    var pm = SB.Meshes.person();
-    walkerMesh = SB.GL.mesh(pm.pos, pm.col);
-    var bm = SB.Meshes.boat();
-    boatMesh = SB.GL.mesh(bm.pos, bm.col);
-    var tm = SB.Meshes.tree();
-    treeMesh = SB.GL.mesh(tm.pos, tm.col);
-    var gm = SB.Meshes.box(560, 0.5, 560);
-    groundMesh = SB.GL.mesh(gm.pos, gm.col);
-    var sm = SB.Meshes.box(120, 0.4, 560);
-    seaMesh = SB.GL.mesh(sm.pos, sm.col);
-  }
-
-  // Mesh mobil per warna, di-cache supaya tidak dibuat ulang tiap frame.
-  function meshForCar(color) {
-    var key = Array.isArray(color) ? color.join(',') : String(color || 'red');
-    if (!carMeshes[key]) {
-      var raw = SB.Meshes.car(Array.isArray(color) ? color : [0.8, 0.2, 0.2]);
-      carMeshes[key] = SB.GL.mesh(raw.pos, raw.col);
-    }
-    return carMeshes[key];
-  }
-
-  // ---------- render ----------
-  // Warna langit mengikuti jam game: siang cerah, senja oranye,
-  // awal malam ungu, malam biru gelap.
-  function skyFor(clock) {
-    var h = clock % 24;
-    if (h >= 6 && h < 17) return [0.53, 0.81, 0.92];
-    if (h >= 17 && h < 19.5) return [0.98, 0.62, 0.35];
-    if (h >= 19.5 && h < 21) return [0.35, 0.25, 0.45];
-    return [0.05, 0.08, 0.18];
-  }
-
-  function drawWorld() {
-    var GL = SB.GL, M = SB.Math3;
-    if (!GL || !GL.alive()) return;
-    var g = SB.G;
-    var sky = skyFor(g.clock == null ? 18 : g.clock);
-    GL.clear(sky[0], sky[1], sky[2]);
-    GL.setFog(60, 320);
-
-    var p = g.player || { x: 0, z: 0, yaw: 0 };
-    var camBack = 12, camUp = 5;
-    // PENTING: Math3 memakai vektor OBJEK {x,y,z} — JANGAN array [x,y,z].
-    // Array membuat vSub/vDot di mat4LookAt menghasilkan NaN (vec() mengubah
-    // NaN jadi 0) sehingga matriks view nol total dan DUNIA TIDAK TERRENDER
-    // sama sekali (hanya warna langit). Itu bug v9 yang ditemukan QA.
-    var eye = M.v3(p.x - Math.sin(p.yaw) * camBack, camUp, p.z - Math.cos(p.yaw) * camBack);
-    var look = M.v3(p.x + Math.sin(p.yaw) * 6, 1.5, p.z + Math.cos(p.yaw) * 6);
-    GL.setCamera(eye, look);
-
-    // Tanah kota + laut (slab datar di barat/selatan).
-    if (groundMesh) GL.draw(groundMesh, M.mat4Translate(0, -0.3, 0));
-    if (seaMesh) GL.draw(seaMesh, M.mat4Translate(-300, -0.2, 0));
-
-    // Gedung-gedung.
-    for (var i = 0; i < worldMeshes.length; i++) {
-      var bm = worldMeshes[i];
-      GL.draw(bm.mesh, M.mat4Translate(bm.x, 0, bm.z));
-    }
-
-    // Pohon di sepanjang jalan (grid 8 x 5).
-    if (treeMesh) {
-      for (var t = 0; t < 40; t++) {
-        var tx = -240 + (t % 8) * 68;
-        var tz = -240 + Math.floor(t / 8) * 96;
-        GL.draw(treeMesh, M.mat4Translate(tx, 0, tz));
-      }
-    }
-
-    // Lalu lintas + mobil parkir (mobil pemain digambar terpisah di bawah).
-    if (SB.Vehicles && SB.Vehicles.cars) {
-      for (var c = 0; c < SB.Vehicles.cars.length; c++) {
-        var car = SB.Vehicles.cars[c];
-        if (g.player.inCar && g.player.car === car) continue;
-        var cm = M.mat4Mul(M.mat4Translate(car.x, 0, car.z), M.mat4RotateY(car.yaw || 0));
-        GL.draw(meshForCar(car.color), cm);
-      }
-    }
-
-    // Pemain: mobilnya bila sedang menyetir, pejalan kaki bila tidak.
-    if (g.player.inCar && g.player.car) {
-      var pc = g.player.car;
-      var pcm = M.mat4Mul(M.mat4Translate(p.x, 0, p.z), M.mat4RotateY(p.yaw));
-      GL.draw(meshForCar(pc.color), pcm);
-    } else if (walkerMesh) {
-      var wm = M.mat4Mul(M.mat4Translate(p.x, 0, p.z), M.mat4RotateY(p.yaw));
-      GL.draw(walkerMesh, wm);
-    }
-
-    // Mobil polisi.
-    if (g.police) {
-      for (var j = 0; j < g.police.length; j++) {
-        var cop = g.police[j];
-        var pom = M.mat4Mul(M.mat4Translate(cop.x, 0, cop.z), M.mat4RotateY(cop.yaw || 0));
-        GL.draw(meshForCar([0.1, 0.15, 0.5]), pom);
-      }
-    }
-
-    // Heli polisi (digambar dengan mesh pejalan kaki sebagai placeholder).
-    if (g.heli && walkerMesh) {
-      GL.draw(walkerMesh, M.mat4Translate(g.heli.x, g.heli.y || 40, g.heli.z));
-    }
-
-    // Speedboat di atas air.
-    if (boatMesh && SB.Water && SB.Water.boat) {
-      var b = SB.Water.boat;
-      var boatM = M.mat4Mul(M.mat4Translate(b.x, 0.4, b.z), M.mat4RotateY(b.yaw || 0));
-      GL.draw(boatMesh, boatM);
-    }
-
-    // Dermaga marina — HARUS digambar tiap frame.
-    if (SB.Water && SB.Water.draw) SB.Water.draw();
-  }
-
-  // ---------- game loop ----------
-  function frame(t) {
-    if (!isRunning) return;
-    requestAnimationFrame(frame);
-    var dt = Math.min(0.05, (t - prevTime) / 1000 || 0.016);
-    prevTime = t;
-    var g = SB.G;
-    var paused = SB.HUD ? SB.HUD.isPaused() : false;
-    if (!paused && g) {
-      // Jam game hanya maju di Game.update — jangan dobel di sini.
-      if (SB.Player) SB.Player.update(dt, readInput());
-      if (SB.Vehicles) SB.Vehicles.update(dt);
-      if (SB.Water) SB.Water.update(dt);
-      if (SB.Jobs) SB.Jobs.update(dt);
-      if (SB.Game) SB.Game.update(dt);
-    }
-    drawWorld();
-    if (SB.HUD) { SB.HUD.update(); SB.HUD.draw(); }
-  }
-
-  // ---------- layar judul ----------
-  function wireTitleButtons() {
-    var btnNew = el('btn-new');
-    if (btnNew) btnNew.addEventListener('click', function () {
-      if (SB.Audio) SB.Audio.init();
-      beginPlay(false);
+    bind('btn-start', () => this.startPlaying());
+    bind('btn-resume', () => this.togglePause());
+    bind('btn-restart', () => this.respawn());
+    bind('btn-respawn', () => this.respawn());
+    bind('btn-menu', () => this.showMenu());
+    bind('btn-shoot', () => this.tryShoot());
+    bind('btn-pause', () => this.togglePause());
+    bind('btn-sound', () => {
+      if (Audio && typeof Audio.toggleMute === 'function') Audio.toggleMute();
     });
-    var btnContinue = el('btn-continue');
-    if (btnContinue) btnContinue.addEventListener('click', function () {
-      if (SB.Audio) SB.Audio.init();
-      beginPlay(true);
-    });
-    // Tombol Continue hanya tampil bila ada save tersimpan.
-    var save = null;
-    try { save = localStorage.getItem('sunset-bay-save-v1'); } catch (e) { save = null; }
-    if (btnContinue) btnContinue.style.display = save ? 'block' : 'none';
-  }
+  },
 
-  function beginPlay(fromSave) {
-    var title = el('title');
-    if (title) title.style.display = 'none';
-    var hud = el('hud');
-    if (hud) hud.style.display = 'block';
-    if (fromSave && SB.Game && SB.Game.load) SB.Game.load();
-    else if (SB.Game && SB.Game.start) SB.Game.start();
-    if (SB.HUD) SB.HUD.showMessage(fromSave ? 'Welcome back to Sunset Bay' : 'Welcome to Sunset Bay');
-    if (!isRunning) {
-      isRunning = true;
-      prevTime = performance.now();
-      requestAnimationFrame(frame);
+  startPlaying() {
+    const saved = Game.load();
+    if (saved && saved.cash !== undefined && Game.state.mode === 'menu') {
+      // Lanjutkan save yang ada: kembalikan mode playing tanpa reset total.
+      Game.state.mode = 'playing';
+      Game.state.player.alive = true;
+      Game.state.health = Math.max(Game.state.health, 50);
+    } else {
+      Game.startGame();
     }
-  }
-
-  function ensureLoop() {
-    if (!isRunning) {
-      isRunning = true;
-      prevTime = performance.now();
-      requestAnimationFrame(frame);
-    }
-  }
-
-  var Main = {
-    start: function () {
-      canvas = el('game');
-      if (!canvas) return;
-
-      // Canvas mengikuti ukuran jendela.
-      var resize = function () {
-        canvas.width = window.innerWidth;
-        canvas.height = window.innerHeight;
-      };
-      window.addEventListener('resize', resize);
-      resize();
-
-      if (SB.GL) SB.GL.init(canvas);
-      if (SB.City) SB.City.build(7); // seed deterministik 7
-      buildWorldMeshes();
-      if (SB.Vehicles) SB.Vehicles.spawnTraffic();
-      if (SB.Water) SB.Water.init();
-      if (SB.Game) SB.Game.start();
-
-      window.__SB = SB; // hook untuk QA otomatis
-
-      // Tombol-tombol garage.
-      var bind = function (id, fn) { var node = el(id); if (node) node.addEventListener('click', fn); };
-      bind('btn-ammo', shopBuyAmmo);
-      bind('btn-respray', shopRespray);
-      bind('btn-engine', shopEngine);
-      bind('btn-armour', shopArmour);
-      bind('btn-garage-close', hideGarage);
-
-      // Audio WebAudio butuh gestur pengguna dulu: buka di interaksi pertama.
-      document.addEventListener('pointerdown', function () { if (SB.Audio) SB.Audio.init(); }, { once: true });
-      document.addEventListener('keydown', function () { if (SB.Audio) SB.Audio.init(); }, { once: true });
-
-      window.addEventListener('keydown', onKeyDown);
-      window.addEventListener('keyup', onKeyUp);
-      canvas.addEventListener('click', function () {
-        if (SB.Audio) SB.Audio.init();
-        fireOrRespray();
-      });
-
-      wireTitleButtons();
-
-      // Mode screenshot (?shot=nama): langsung main tanpa layar judul.
-      stagedShot = queryParam('shot');
-      if (stagedShot) {
-        beginPlay(false);
-        if (SB.Shots) SB.Shots.stage(stagedShot);
-      } else {
-        // Layar judul: kota tetap dirender di belakangnya.
-        ensureLoop();
+    // Misi 1 auto-start: tidak ada pemicu lain di dunia untuk
+    // "kunjungi Rico", jadi misi pertama dimulai saat bermain.
+    if (Jobs && typeof Jobs.startMission === 'function' && Jobs.state) {
+      if (!Jobs.state.active && !(Jobs.state.completed || []).includes(1)) {
+        Jobs.startMission(Game.state, 1);
       }
     }
-  };
+    if (Audio && typeof Audio.startMusic === 'function') Audio.startMusic();
+    this.hideOverlays();
+    this.updateHud();
+  },
 
-  SB.Main = Main;
-  document.addEventListener('DOMContentLoaded', function () { Main.start(); });
-})();
+  respawn() {
+    Game.respawn();
+    this.hideOverlays();
+    this.updateHud();
+  },
+
+  showMenu() {
+    Game.state.mode = 'menu';
+    this.setOverlay('menu-overlay', true);
+    this.setOverlay('pause-overlay', false);
+    this.setOverlay('wasted-overlay', false);
+  },
+
+  togglePause() {
+    if (Game.state.mode === 'playing') {
+      Game.pause();
+      this.setOverlay('pause-overlay', true);
+      if (Audio && typeof Audio.pauseMusic === 'function') Audio.pauseMusic();
+    } else if (Game.state.mode === 'paused') {
+      Game.resume();
+      this.setOverlay('pause-overlay', false);
+      if (Audio && typeof Audio.resumeMusic === 'function') Audio.resumeMusic();
+    }
+  },
+
+  hideOverlays() {
+    this.setOverlay('menu-overlay', false);
+    this.setOverlay('pause-overlay', false);
+    this.setOverlay('wasted-overlay', false);
+  },
+
+  setOverlay(id, visible) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.toggle('hidden', !visible);
+    el.style.display = visible ? 'flex' : 'none';
+  },
+
+  // --- kendaraan ---------------------------------------------------
+  tryEnterVehicle() {
+    if (Game.state.mode !== 'playing') return;
+    const p = Game.state.player;
+    if (p.mode === 'car' || p.mode === 'boat') {
+      // Keluar: player.js (exitBoat untuk kapal — tak pernah soft-lock).
+      if (Player && typeof Player.exitVehicle === 'function') {
+        Player.exitVehicle(p, { city: this.city, water: this.water });
+      }
+      Game.exitVehicle();
+      if (Audio && typeof Audio.playSFX === 'function') Audio.playSFX('click');
+      this.updateHud();
+      return;
+    }
+    if (p.mode !== 'foot') return;
+    if (!Player || typeof Player.tryEnterVehicle !== 'function') return;
+    const v = Player.tryEnterVehicle(p, this.vehicles);
+    if (!v) return;
+    if (v.kind === 'boat') {
+      p.mode = 'boat';
+      p.vehicle = v;
+    } else {
+      // Curi mobil: +2 wanted (Game.stealCar), REP & cash menyusul.
+      Game.stealCar(v.id);
+      p.vehicle = v;
+      p.mode = 'car';
+    }
+    if (Audio && typeof Audio.playSFX === 'function') Audio.playSFX('engineStart');
+    this.updateHud();
+  },
+
+  // Respray: ganti warna mobil yang sedang dikendarai, -$150.
+  respray() {
+    if (Game.state.mode !== 'playing') return { ok: false, reason: 'not playing' };
+    const p = Game.state.player;
+    if (!p.vehicle || p.mode !== 'car') return { ok: false, reason: 'not in a car' };
+    if (Game.state.cash < RESPRAY_PRICE) return { ok: false, reason: 'not enough cash' };
+    const colors = ['#d94f3d', '#3d7bd9', '#e8c33a', '#37b06a', '#e8e8e8', '#22222a', '#7a4fd9', '#e07a2a'];
+    let next = colors[Math.floor(Math.random() * colors.length)];
+    let guard = 0;
+    while (next === p.vehicle.color && guard++ < 8) {
+      next = colors[Math.floor(Math.random() * colors.length)];
+    }
+    p.vehicle.color = next;
+    Game.addCash(-RESPRAY_PRICE);
+    if (Audio && typeof Audio.playSFX === 'function') Audio.playSFX('cash');
+    this.updateHud();
+    return { ok: true, color: next, cash: Game.state.cash };
+  },
+
+  // --- menembak ----------------------------------------------------
+  cameraForward() {
+    const cp = Math.cos(this.cameraPitch);
+    const sp = Math.sin(this.cameraPitch);
+    // Arah pandang kamera: dari eye ke look (lihat render()).
+    return {
+      x: Math.sin(this.cameraYaw) * cp,
+      y: -sp - 0.18,
+      z: Math.cos(this.cameraYaw) * cp,
+    };
+  },
+
+  tryShoot() {
+    if (Game.state.mode !== 'playing') return null;
+    const p = Game.state.player;
+    if (p.mode !== 'foot') return null; // tak bisa menembak sambil mengemudi
+    if (this.shootCooldown > 0) return null;
+    this.shootCooldown = SHOOT_COOLDOWN_SECONDS;
+    const s = Game.state;
+    if ((s.ammo || 0) <= 0) {
+      if (Audio && typeof Audio.playSFX === 'function') Audio.playSFX('emptyClick');
+      return { fired: false, reason: 'empty' };
+    }
+    const origin = { x: p.x, y: (p.y || 0) + 1.35, z: p.z };
+    // Bidik polisi terdekat (aim assist): arah lurus ke polisi itu.
+    let targetCop = null;
+    let bestD = 60;
+    for (const cop of s.cops) {
+      if (cop.hp <= 0) continue;
+      const d = Math.hypot(cop.pos.x - p.x, cop.pos.z - p.z);
+      if (d < bestD) { bestD = d; targetCop = cop; }
+    }
+    let dir;
+    if (targetCop) {
+      const dx = targetCop.pos.x - origin.x;
+      const dy = 1.0 - origin.y;
+      const dz = targetCop.pos.z - origin.z;
+      const len = Math.hypot(dx, dy, dz) || 1;
+      dir = { x: dx / len, y: dy / len, z: dz / len };
+    } else {
+      dir = this.cameraForward();
+    }
+    const targets = s.cops
+      .filter((c) => c.hp > 0)
+      .map((c) => ({ id: c.id, type: 'police', x: c.pos.x, y: 1.0, z: c.pos.z, radius: 1.4, hp: c.hp }));
+    let res = null;
+    if (Shots && typeof Shots.fire === 'function') {
+      res = Shots.fire(s, origin, dir, targets);
+    }
+    if (res && res.fired) {
+      s.stats.shotsFired += 1;
+      if (res.hit && res.target) {
+        // Shots.fire hanya mengubah SALINAN target; terapkan damage
+        // ke polisi asli lewat Game.shootCop (34 dmg: 100 -> 66).
+        Game.shootCop(res.target.id, res.damage);
+      }
+    }
+    if (Audio && typeof Audio.playShot === 'function') Audio.playShot();
+    this.updateHud();
+    return res;
+  },
+
+  // --- input -------------------------------------------------------
+  readMoveInput() {
+    const k = this.keys;
+    const p = Game.state.player;
+    const inVehicle = p.mode === 'car' || p.mode === 'boat';
+    return {
+      forward: !!(k['w'] || k['arrowup']),
+      back: !!(k['s'] || k['arrowdown']),
+      left: !!(k['a'] || k['arrowleft']),
+      right: !!(k['d'] || k['arrowright']),
+      run: !!k['shift'],
+      jump: !inVehicle && !!k[' '],
+      shoot: false,
+      interact: false,
+      handbrake: inVehicle && !!k[' '],
+      cameraYaw: this.cameraYaw,
+    };
+  },
+
+  // --- loop --------------------------------------------------------
+  loop(now) {
+    if (!this.running) return;
+    const dt = Math.min((now - this.lastTime) / 1000, 0.1);
+    this.lastTime = now;
+    if (this.shootCooldown > 0) this.shootCooldown -= dt;
+
+    if (Game.state.mode === 'playing') {
+      const input = this.readMoveInput();
+      const p = Game.state.player;
+      const world = { city: this.city, water: this.water, vehicles: this.vehicles };
+      if ((p.mode === 'car' || p.mode === 'boat') && p.vehicle) {
+        if (Vehicles && typeof Vehicles.updateVehicle === 'function') {
+          Vehicles.updateVehicle(p.vehicle, input, dt, world);
+        }
+        // Hadiah drift: +$50 per episode drift (cooldown 3 detik).
+        const v = p.vehicle;
+        if (v.kind === 'car' && v.drift && Math.abs(v.speed) > 10) {
+          if (now - this._driftPaidAt > DRIFT_REWARD_COOLDOWN_MS) {
+            this._driftPaidAt = now;
+            Game.addCash(DRIFT_REWARD);
+            Game.state.score += DRIFT_REWARD;
+          }
+        }
+      }
+      if (Player && typeof Player.update === 'function') {
+        Player.update(p, input, dt, world);
+      }
+      if (Vehicles && typeof Vehicles.updateTraffic === 'function' && this.traffic.length) {
+        Vehicles.updateTraffic(this.traffic, dt, this.city, this.vehicles);
+      }
+      if (Jobs) {
+        if (typeof Jobs.updateMission === 'function') Jobs.updateMission(Game.state, dt);
+        if (typeof Jobs.updateTaxiJob === 'function') Jobs.updateTaxiJob(Game.state);
+        if (typeof Jobs.updateDeliveryJob === 'function') Jobs.updateDeliveryJob(Game.state, dt);
+      }
+      if (Shots && typeof Shots.update === 'function') Shots.update(dt);
+      Game.update(dt);
+    }
+
+    // WASTED overlay juga saat mode berubah di luar loop (mis. damage
+    // langsung): jangan hanya di dalam blok 'playing'.
+    if (Game.state.mode === 'wasted') {
+      this.setOverlay('wasted-overlay', true);
+      this.updateHud();
+    }
+
+    this.render();
+    this.updateHud();
+    this.stats.frames += 1;
+    requestAnimationFrame((t) => this.loop(t));
+  },
+
+  // --- mesh lokal (dibangun sekali, digambar pakai model matrix) ---
+  modelMatrix(x, y, z, yaw) {
+    const t = Math3.mat4Translate(x, y, z);
+    const r = Math3.mat4RotateY(-yaw);
+    return Math3.mat4Multiply(t, r);
+  },
+
+  localCarMesh(color) {
+    if (this._carMeshes[color]) return this._carMeshes[color];
+    const b = new Meshes.MeshBuilder();
+    b.boxAt(0, 0.35, 0, 1.9, 0.55, 4.2, color);
+    b.boxAt(0, 0.9, 0.3, 1.6, 0.5, 2.0, '#20242c');
+    for (const [lx, lz] of [[-0.85, 1.4], [0.85, 1.4], [-0.85, -1.4], [0.85, -1.4]]) {
+      b.boxAt(lx, 0.15, lz, 0.28, 0.55, 0.55, '#111114');
+    }
+    const mesh = b.build();
+    this._carMeshes[color] = mesh;
+    return mesh;
+  },
+
+  localBoatMesh(color) {
+    if (this._boatMeshes[color]) return this._boatMeshes[color];
+    const b = new Meshes.MeshBuilder();
+    b.boxAt(0, 0.25, 0, 2.2, 0.5, 5.2, color);
+    b.boxAt(0, 0.7, 0.8, 1.6, 0.45, 2.2, '#20242c');
+    b.boxAt(0, 0.9, -1.6, 0.5, 0.9, 0.3, '#d8dee6');
+    const mesh = b.build();
+    this._boatMeshes[color] = mesh;
+    return mesh;
+  },
+
+  localFigureMesh(color) {
+    if (this._figureMesh) return this._figureMesh;
+    const b = new Meshes.MeshBuilder();
+    b.boxAt(-0.16, 0, 0, 0.26, 0.8, 0.3, '#2b3440');
+    b.boxAt(0.16, 0, 0, 0.26, 0.8, 0.3, '#2b3440');
+    b.boxAt(0, 0.8, 0, 0.72, 0.62, 0.4, color);
+    b.boxAt(-0.48, 1.05, 0, 0.2, 0.55, 0.22, color);
+    b.boxAt(0.48, 1.05, 0, 0.2, 0.55, 0.22, color);
+    b.boxAt(0, 1.48, 0, 0.42, 0.4, 0.4, '#e8b98a');
+    b.boxAt(0, 1.72, 0, 0.46, 0.1, 0.46, '#1a2f5a');
+    const mesh = b.build();
+    this._figureMesh = mesh;
+    return mesh;
+  },
+
+  localHeliMesh() {
+    if (this._heliMesh) return this._heliMesh;
+    const b = new Meshes.MeshBuilder();
+    b.boxAt(0, 0, 0, 2.2, 1.0, 4.6, '#1a2f5a');
+    b.boxAt(0, 0.6, 0.6, 1.6, 0.7, 2.0, '#d8dee6');
+    b.boxAt(0, 0.1, -3.0, 0.4, 0.4, 2.4, '#1a2f5a');
+    b.boxAt(0, 1.15, 0, 5.4, 0.08, 0.3, '#22222a');
+    const mesh = b.build();
+    this._heliMesh = mesh;
+    return mesh;
+  },
+
+  localMarkerMesh() {
+    if (this._markerMesh) return this._markerMesh;
+    const b = new Meshes.MeshBuilder();
+    b.cylinder(0, 0, 0, 1.6, 0.3, '#ffe14d', 12);
+    b.pyramid(0, 0.3, 0, 1.2, 2.2, '#ffe14d');
+    const mesh = b.build();
+    this._markerMesh = mesh;
+    return mesh;
+  },
+
+  localTracerMesh() {
+    if (this._tracerMesh) return this._tracerMesh;
+    const b = new Meshes.MeshBuilder();
+    b.boxAt(0, 0, 0, 0.08, 0.08, 1.0, '#ffe14d');
+    const mesh = b.build();
+    this._tracerMesh = mesh;
+    return mesh;
+  },
+
+  // --- render ------------------------------------------------------
+  render() {
+    const gl = this.gl;
+    if (!gl) return;
+    GL.beginFrame();
+    const canvas = this.canvas;
+    const aspect = canvas.width / Math.max(1, canvas.height);
+    const proj = Math3.mat4Perspective(Math3.degToRad(62), aspect, 0.1, 500);
+    GL.setProj(proj);
+
+    // Kamera third-person mengikuti pemain; SEMUA vektor objek {x,y,z}.
+    const p = Game.state.player;
+    const eye = {
+      x: p.x - Math.sin(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
+      y: (p.y || 0) + 3 + Math.sin(this.cameraPitch) * this.cameraDistance,
+      z: p.z - Math.cos(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
+    };
+    const look = { x: p.x, y: (p.y || 0) + 1.4, z: p.z };
+    const up = { x: 0, y: 1, z: 0 };
+    const view = Math3.mat4LookAt(eye, look, up);
+    GL.setView(view);
+
+    // Warna langit senja + kecerahan mengikuti jam game.
+    const hour = Game.state.timeOfDay;
+    const dusk = hour >= 16.5 && hour <= 19.5;
+    GL.setClearColor(dusk ? 0.98 : 0.53, dusk ? 0.55 : 0.75, dusk ? 0.35 : 0.94, 1);
+    GL.setBrightness(dusk ? 0.95 : 1.0);
+    GL.setSunDir({ x: -0.4, y: 0.55, z: -0.6 });
+
+    const identity = Math3.mat4Identity();
+
+    // Kota (219 bangunan, jalan, trotoar, tanah).
+    if (City && typeof City.render === 'function') City.render(GL, Math3);
+
+    // Laut + dermaga + buoy — Water.draw() SETIAP frame, tanpa kecuali.
+    if (Water && this.water && typeof Water.draw === 'function') {
+      const w = Water.draw(this.water, Game.state.elapsed);
+      this.stats.waterDraws += 1;
+      if (w.sea) GL.drawMesh(w.sea, identity);
+      if (w.pier) GL.drawMesh(w.pier, identity);
+      if (w.buoys) GL.drawMesh(w.buoys, identity);
+    }
+
+    // Kendaraan (mesh lokal + model matrix, dibangun sekali per warna).
+    for (const v of this.vehicles) {
+      const mesh = v.kind === 'boat' ? this.localBoatMesh(v.color) : this.localCarMesh(v.color);
+      GL.drawMesh(mesh, this.modelMatrix(v.x, v.y || 0, v.z, v.yaw || 0));
+    }
+
+    // Pemain di jalan kaki (mesh animasi dari player.js; di-cache
+    // selama posisi / walkCycle tak berubah jauh).
+    if (p.mode === 'foot' || p.mode === 'swim') {
+      if (Player && typeof Player.buildPlayerMesh === 'function') {
+        const key = Math.round(p.x * 20) + ':' + Math.round(p.z * 20) + ':' +
+          Math.round((p.walkCycle || 0) * 6) + ':' + (p.mode || '');
+        // Rebuild paling cepat tiap 120 ms: mesh kecil, tapi tiap rebuild
+        // mengalokasi buffer GL baru (prepareMesh meng-cache per mesh),
+        // jadi rebuild tiap frame = bocor memori GPU saat berjalan.
+        const nowMs = performance.now();
+        if ((key !== this._playerMeshKey || !this._playerMesh) && nowMs - this._playerMeshAt > 120) {
+          const m = Player.buildPlayerMesh(p);
+          if (m) { this._playerMesh = m; this._playerMeshKey = key; this._playerMeshAt = nowMs; }
+        }
+        if (this._playerMesh) GL.drawMesh(this._playerMesh, identity);
+      }
+    }
+
+    // Polisi (figur seragam gelap).
+    for (const cop of Game.state.cops) {
+      if (cop.hp <= 0) continue;
+      GL.drawMesh(this.localFigureMesh('#1a2f5a'),
+        this.modelMatrix(cop.pos.x, cop.pos.y || 0, cop.pos.z, 0));
+    }
+
+    // Heli AIR-1.
+    const heli = Game.state.heli;
+    if (heli && heli.active) {
+      GL.drawMesh(this.localHeliMesh(),
+        this.modelMatrix(heli.pos.x, heli.pos.y, heli.pos.z, 0));
+    }
+
+    // Marker misi aktif (tujuan kuning).
+    if (Jobs && typeof Jobs.activeMarker === 'function') {
+      const marker = Jobs.activeMarker();
+      if (marker) {
+        GL.drawMesh(this.localMarkerMesh(),
+          this.modelMatrix(marker.x, 0, marker.z, 0));
+      }
+    }
+
+    // Tracer tembakan (garis kuning dari moncong ke titik kena).
+    if (Shots && typeof Shots.getTracers === 'function') {
+      for (const t of Shots.getTracers()) {
+        const mx = (t.from.x + t.to.x) / 2;
+        const my = (t.from.y + t.to.y) / 2;
+        const mz = (t.from.z + t.to.z) / 2;
+        const dx = t.to.x - t.from.x;
+        const dy = t.to.y - t.from.y;
+        const dz = t.to.z - t.from.z;
+        const len = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+        const yaw = Math.atan2(dx, dz);
+        const m = Math3.mat4Multiply(
+          Math3.mat4Multiply(
+            Math3.mat4Translate(mx, my, mz),
+            Math3.mat4RotateY(yaw)),
+          Math3.mat4Scale(1, 1, len));
+        GL.drawMesh(this.localTracerMesh(), m);
+      }
+    }
+  },
+
+  updateHud() {
+    if (!HUD || typeof HUD.render !== 'function') return;
+    const s = Game.state;
+    const p = s.player;
+    let speed = 0;
+    if (p.vehicle && typeof p.vehicle.speed === 'number') speed = Math.abs(p.vehicle.speed) * 3.6;
+    else if (p.moving) speed = p.running ? 28.8 : 15.1;
+    let radio = null;
+    if (Audio && typeof Audio.getCurrentStation === 'function') {
+      radio = Audio.getCurrentStation();
+    }
+    let objective = '';
+    if (Jobs && typeof Jobs.objectiveText === 'function') objective = Jobs.objectiveText();
+    let marker = null;
+    if (Jobs && typeof Jobs.activeMarker === 'function') marker = Jobs.activeMarker();
+    HUD.render({
+      cash: s.cash,
+      health: s.health,
+      maxHealth: 100,
+      wanted: s.wanted,
+      score: s.score,
+      rep: s.rep,
+      timeOfDay: s.timeOfDay,
+      weather: s.weather,
+      ammo: s.ammo,
+      speed,
+      speedUnit: 'km/h',
+      radio,
+      objective,
+      player: { x: p.x, z: p.z, heading: p.yaw || 0 },
+      police: s.cops.map((c) => ({ x: c.pos.x, z: c.pos.z })),
+      missionMarker: marker,
+      worldSize: 480,
+      crosshair: { visible: s.mode === 'playing' && p.mode === 'foot', spread: 6 },
+    });
+    this.stats.hudRenders += 1;
+  },
+
+  loadSaveIntoHud() {
+    const saved = Game.load();
+    if (saved) Game.state = saved;
+    this.updateHud();
+  },
+
+  saveNow() {
+    return Game.save();
+  },
+};
+
+SB.Main = Main;
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', () => {
+    try {
+      Main.init();
+    } catch (err) {
+      console.error('[Sunset Bay] gagal init:', err);
+      const el = document.getElementById('load-error');
+      if (el) {
+        el.textContent = 'Gagal memuat game: ' + err.message;
+        el.style.display = 'block';
+      }
+    }
+  });
+}
+
+export { Main, SAVE_KEY };
+export default Main;

@@ -1,135 +1,216 @@
-// Sunset Bay — math3.js (v9, ditulis ulang)
-// Matematika 3D kecil untuk WebGL: vektor 3D sebagai objek {x,y,z} dan
-// matriks 4x4 sebagai array 16 angka dalam urutan column-major (yang
-// dipakai gl.uniformMatrix4fv). Tidak ada dependensi lain.
-(function () {
-  'use strict';
-  window.SB = window.SB || {};
+// Sunset Bay — math3.js
+// Library matematika 3D murni untuk Sunset Bay (v10, ditulis dari nol).
+// Konvensi keras: SEMUA vektor adalah objek {x, y, z}, BUKAN array.
+// mat4LookAt(eye, look, up) menerima objek {x,y,z} — memakai array akan
+// menghasilkan matriks view nol dan dunia hanya terrender langit (bug v8).
+// Matriks disimpan sebagai Float32Array(16) column-major (gaya WebGL).
 
-  // ---- vektor ----
-  function vec(x, y, z) {
-    return { x: x || 0, y: y || 0, z: z || 0 };
-  }
+const SB = (typeof window !== 'undefined' ? (window.SB = window.SB || {}) : (globalThis.SB = globalThis.SB || {}));
 
-  function vAdd(a, b) {
-    return vec(a.x + b.x, a.y + b.y, a.z + b.z);
-  }
+function vec3(x = 0, y = 0, z = 0) {
+  return { x, y, z };
+}
 
-  function vSub(a, b) {
-    return vec(a.x - b.x, a.y - b.y, a.z - b.z);
-  }
+function vec3Add(a, b) {
+  return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
+}
 
-  function vScale(a, s) {
-    return vec(a.x * s, a.y * s, a.z * s);
-  }
+function vec3Sub(a, b) {
+  return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+}
 
-  function vLen(a) {
-    return Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
-  }
+function vec3Scale(a, s) {
+  return { x: a.x * s, y: a.y * s, z: a.z * s };
+}
 
-  function vNorm(a) {
-    var l = vLen(a);
-    if (l === 0) return vec(0, 0, 0);
-    return vec(a.x / l, a.y / l, a.z / l);
-  }
+function vec3Dot(a, b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
 
-  function vCross(a, b) {
-    return vec(
-      a.y * b.z - a.z * b.y,
-      a.z * b.x - a.x * b.z,
-      a.x * b.y - a.y * b.x
-    );
-  }
-
-  function vDot(a, b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-  }
-
-  // ---- matriks 4x4 (column-major) ----
-  function identity() {
-    return [1, 0, 0, 0,
-            0, 1, 0, 0,
-            0, 0, 1, 0,
-            0, 0, 0, 1];
-  }
-
-  function translate(x, y, z) {
-    var m = identity();
-    m[12] = x;
-    m[13] = y;
-    m[14] = z;
-    return m;
-  }
-
-  // Rotasi mengelilingi sumbu Y. Kolom-kolomnya:
-  // col0 = (cos, 0, -sin), col1 = (0, 1, 0), col2 = (sin, 0, cos).
-  function rotateY(angle) {
-    var c = Math.cos(angle);
-    var s = Math.sin(angle);
-    return [c, 0, -s, 0,
-            0, 1, 0, 0,
-            s, 0, c, 0,
-            0, 0, 0, 1];
-  }
-
-  // Perkalian matriks C = A * B. Elemen (baris r, kolom c) dihitung dari
-  // baris r dari A dan kolom c dari B; dalam penyimpanan column-major
-  // indeksnya adalah [kolom * 4 + baris].
-  function mul(a, b) {
-    var out = new Array(16);
-    for (var col = 0; col < 4; col++) {
-      for (var row = 0; row < 4; row++) {
-        var acc = 0;
-        for (var k = 0; k < 4; k++) {
-          acc += a[k * 4 + row] * b[col * 4 + k];
-        }
-        out[col * 4 + row] = acc;
-      }
-    }
-    return out;
-  }
-
-  // Proyeksi perspektif. fov dalam radian.
-  function perspective(fov, aspect, near, far) {
-    var f = 1 / Math.tan(fov / 2);
-    var nf = 1 / (near - far);
-    return [
-      f / aspect, 0, 0, 0,
-      0, f, 0, 0,
-      0, 0, (far + near) * nf, -1,
-      0, 0, 2 * far * near * nf, 0
-    ];
-  }
-
-  // Matriks view dari posisi kamera, titik yang dilihat, dan arah atas.
-  // Sumbu kamera: z = arah dari target ke mata (mundur), x = up x z,
-  // y = z x x; translasi = -dot(sumbu, mata).
-  function lookAt(eye, center, up) {
-    var zAxis = vNorm(vSub(eye, center));
-    var xAxis = vNorm(vCross(up, zAxis));
-    var yAxis = vCross(zAxis, xAxis);
-    return [
-      xAxis.x, yAxis.x, zAxis.x, 0,
-      xAxis.y, yAxis.y, zAxis.y, 0,
-      xAxis.z, yAxis.z, zAxis.z, 0,
-      -vDot(xAxis, eye), -vDot(yAxis, eye), -vDot(zAxis, eye), 1
-    ];
-  }
-
-  window.SB.Math3 = {
-    v3: vec,
-    add: vAdd,
-    sub: vSub,
-    scale: vScale,
-    len: vLen,
-    norm: vNorm,
-    cross: vCross,
-    dot: vDot,
-    mat4Identity: identity,
-    mat4Translate: translate,
-    mat4RotateY: rotateY,
-    mat4Mul: mul,
-    mat4Perspective: perspective,
-    mat4LookAt: lookAt
+function vec3Cross(a, b) {
+  return {
+    x: a.y * b.z - a.z * b.y,
+    y: a.z * b.x - a.x * b.z,
+    z: a.x * b.y - a.y * b.x,
   };
-})();
+}
+
+function vec3Length(a) {
+  return Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+}
+
+function vec3Normalize(a) {
+  const len = vec3Length(a);
+  if (len === 0) return { x: 0, y: 0, z: 0 };
+  return { x: a.x / len, y: a.y / len, z: a.z / len };
+}
+
+function vec3Distance(a, b) {
+  return vec3Length(vec3Sub(a, b));
+}
+
+function vec3Lerp(a, b, t) {
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    z: a.z + (b.z - a.z) * t,
+  };
+}
+
+function clamp(v, lo, hi) {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function degToRad(deg) {
+  return (deg * Math.PI) / 180;
+}
+
+function radToDeg(rad) {
+  return (rad * 180) / Math.PI;
+}
+
+// ---- mat4 (Float32Array 16, column-major) ----
+
+function mat4Identity() {
+  const m = new Float32Array(16);
+  m[0] = 1; m[5] = 1; m[10] = 1; m[15] = 1;
+  return m;
+}
+
+function mat4Multiply(a, b) {
+  // Mengembalikan a * b (column-major). out[c*4+r] = sum_k a[k*4+r] * b[c*4+k]
+  const out = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      let sum = 0;
+      for (let k = 0; k < 4; k++) {
+        sum += a[k * 4 + r] * b[c * 4 + k];
+      }
+      out[c * 4 + r] = sum;
+    }
+  }
+  return out;
+}
+
+function mat4Perspective(fovyRad, aspect, near, far) {
+  const f = 1.0 / Math.tan(fovyRad / 2);
+  const m = new Float32Array(16);
+  m[0] = f / aspect;
+  m[5] = f;
+  m[10] = (far + near) / (near - far);
+  m[11] = -1;
+  m[14] = (2 * far * near) / (near - far);
+  return m;
+}
+
+function mat4LookAt(eye, look, up) {
+  // KRITIS: eye, look, up adalah OBJEK {x,y,z}. Jangan passing array.
+  // zAxis = normalize(eye - look); xAxis = normalize(cross(up, zAxis));
+  // yAxis = cross(zAxis, xAxis). Matriks view column-major.
+  const zAxis = vec3Normalize(vec3Sub(eye, look));
+  const xAxis = vec3Normalize(vec3Cross(up, zAxis));
+  const yAxis = vec3Cross(zAxis, xAxis);
+  const m = new Float32Array(16);
+  m[0] = xAxis.x; m[1] = yAxis.x; m[2] = zAxis.x; m[3] = 0;
+  m[4] = xAxis.y; m[5] = yAxis.y; m[6] = zAxis.y; m[7] = 0;
+  m[8] = xAxis.z; m[9] = yAxis.z; m[10] = zAxis.z; m[11] = 0;
+  m[12] = -vec3Dot(xAxis, eye);
+  m[13] = -vec3Dot(yAxis, eye);
+  m[14] = -vec3Dot(zAxis, eye);
+  m[15] = 1;
+  return m;
+}
+
+function mat4Translate(x, y, z) {
+  const m = mat4Identity();
+  m[12] = x; m[13] = y; m[14] = z;
+  return m;
+}
+
+function mat4TranslateVec(v) {
+  return mat4Translate(v.x, v.y, v.z);
+}
+
+function mat4RotateY(angleRad) {
+  const c = Math.cos(angleRad);
+  const s = Math.sin(angleRad);
+  const m = mat4Identity();
+  m[0] = c; m[2] = -s;
+  m[8] = s; m[10] = c;
+  return m;
+}
+
+function mat4RotateX(angleRad) {
+  const c = Math.cos(angleRad);
+  const s = Math.sin(angleRad);
+  const m = mat4Identity();
+  m[5] = c; m[6] = s;
+  m[9] = -s; m[10] = c;
+  return m;
+}
+
+function mat4RotateZ(angleRad) {
+  const c = Math.cos(angleRad);
+  const s = Math.sin(angleRad);
+  const m = mat4Identity();
+  m[0] = c; m[1] = s;
+  m[4] = -s; m[5] = c;
+  return m;
+}
+
+function mat4Scale(x, y, z) {
+  const m = mat4Identity();
+  m[0] = x; m[5] = y; m[10] = z;
+  return m;
+}
+
+function mat4ScaleVec(v) {
+  return mat4Scale(v.x, v.y, v.z);
+}
+
+function mat4TransformPoint(m, p) {
+  // p adalah objek {x,y,z}; kembalikan objek {x,y,z} hasil m * [p,1].
+  return {
+    x: m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
+    y: m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
+    z: m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14],
+  };
+}
+
+const Math3 = {
+  vec3,
+  vec3Add,
+  vec3Sub,
+  vec3Scale,
+  vec3Dot,
+  vec3Cross,
+  vec3Length,
+  vec3Normalize,
+  vec3Distance,
+  vec3Lerp,
+  clamp,
+  lerp,
+  degToRad,
+  radToDeg,
+  mat4Identity,
+  mat4Multiply,
+  mat4Perspective,
+  mat4LookAt,
+  mat4Translate,
+  mat4TranslateVec,
+  mat4RotateY,
+  mat4RotateX,
+  mat4RotateZ,
+  mat4Scale,
+  mat4ScaleVec,
+  mat4TransformPoint,
+};
+
+SB.Math3 = Math3;
+
+export { Math3, vec3, vec3Add, vec3Sub, vec3Scale, vec3Dot, vec3Cross, vec3Length, vec3Normalize, vec3Distance, vec3Lerp, clamp, lerp, degToRad, radToDeg, mat4Identity, mat4Multiply, mat4Perspective, mat4LookAt, mat4Translate, mat4TranslateVec, mat4RotateY, mat4RotateX, mat4RotateZ, mat4Scale, mat4ScaleVec, mat4TransformPoint };
+export default Math3;

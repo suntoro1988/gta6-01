@@ -1,184 +1,284 @@
-// Sunset Bay v9 — water.js
-// Laut di sisi barat (x < -168) & selatan (z > 168) kota + dermaga kayu
-// + speedboat yang bisa dinaiki pemain.
+// Sunset Bay — water.js (v10, written from scratch)
+// Sea rendering and water logic.
 //
-// PERBAIKAN v9 (bug v8):
-// 1. Gate naik kapal TIDAK LAGI satu titik kecil yang mustahil dicapai.
-//    Sekarang: zona jalan dermaga (sepanjang papan, x -198..-166,
-//    z 110..130) ATAU radius 10 unit dari kapal. Berdiri di mana pun di
-//    dermaga lalu tekan E -> naik kapal. Zona ini berada di dalam gate
-//    main.js (x < -160, |z-120| < 20), jadi E di dermaga pasti diteruskan.
-// 2. draw() melakukan lazy-init: bila mesh laut/dermaga belum dibangun
-//    (mis. draw dipanggil sebelum init), mesh dibangun saat itu juga —
-//    laut & papan dermaga dijamin terrender tiap frame game loop memanggil
-//    Water.draw(). Papan dermaga berwarna coklat [0.45, 0.3, 0.14].
-(function () {
-  'use strict';
-  var SB = window.SB = window.SB || {};
+// The sea covers everything south of the sea line (z > 190). It is
+// a large flat quad (SB.Meshes.flatQuad — wound CCW from above, so
+// it is never culled) with animated wave vertices, plus a wooden
+// pier jutting out from the Marina Bay shore and a ring of buoys.
+//
+// DRAW() MUST BE CALLED EVERY FRAME. There is no skip flag, no
+// "only when the camera looks at the sea" early return, and no
+// visibility culling in this module: draw() always rebuilds and
+// returns the sea + pier meshes for the current time. v8 lost the
+// sea entirely because a frame skipped the water draw; this module
+// makes that impossible by construction — the caller draws whatever
+// draw() returns, unconditionally.
+//
+// SOFT-LOCK FIX (v10): pressing E on a boat must ALWAYS let the
+// player off. exitBoat() never refuses and never leaves the player
+// on the boat:
+//   * near the pier / shore -> step onto the pier or dry land;
+//   * anywhere else -> drop into the water in "swim" mode, facing
+//     the shore, so the player can swim back. A boat far from the
+//     dock is an inconvenience, never a trap.
 
-  var SHORE_X = -168, SHORE_Z = 168; // garis pantai (barat & selatan)
-  var PIER = { x: -168, z: 120 };    // pangkal dermaga di darat
-  var BOAT_HOME = { x: -182, z: 120, yaw: Math.PI / 2, speed: 0 };
-  // Zona jalan dermaga: sepanjang papan kayu, dengan margin lega.
-  var PIER_ZONE = { x0: -198, x1: -166, z0: 110, z1: 130 };
-  var BOARD_RADIUS = 10; // jarak maksimal dari kapal untuk naik
-  var PLANK_BROWN = [0.45, 0.3, 0.14]; // warna papan kayu dermaga
+const SB = (globalThis.SB = globalThis.SB || {});
 
-  var _sea = null, _planks = [], _boatMesh = null, _t = 0;
-  var _held = {};
+const SEA_LINE_Z = 190; // water starts here (matches city.seaLineZ)
+const SEA_Y = 0; // sea surface height
+const SEA_EXTENT = 420; // sea plane spans z 190 .. 610, x -210 .. +210
+const WAVE_AMP = 0.22;
+const WAVE_SPEED = 1.3;
+const PIER = { x: 0, z: 205, w: 10, d: 34, deckY: 1.2 };
+const SHORE_SWIM_MAX = 260; // swim zone extends to z = 260 + margin
 
-  window.addEventListener('keydown', function (e) { _held[e.code || e.key] = true; });
-  window.addEventListener('keyup', function (e) { _held[e.code || e.key] = false; });
+function clamp(v, min, max) {
+  return v < min ? min : v > max ? max : v;
+}
 
-  // Gabung tombol lokal + tombol global dari main (SB.G.keys) bila ada.
-  function readKeys() {
-    var shared = (SB.G && SB.G.keys) || {};
-    var out = {}, k;
-    for (k in _held) out[k] = _held[k];
-    for (k in shared) out[k] = shared[k];
-    return out;
-  }
+// Sine-wave height at (x, z) at time t (seconds). Two waves at an
+// angle so the surface never looks like a flat sheet of stripes.
+function waveHeight(x, z, t) {
+  return (
+    Math.sin(x * 0.08 + t * WAVE_SPEED) * WAVE_AMP * 0.6 +
+    Math.sin(z * 0.11 - t * WAVE_SPEED * 0.8) * WAVE_AMP * 0.4 +
+    Math.sin((x + z) * 0.05 + t * WAVE_SPEED * 0.5) * WAVE_AMP * 0.3
+  );
+}
 
-  // Satu quad datar (2 segitiga) pada ketinggian y, warna solid.
-  // WINDING: normal harus menghadap ATAS (+y) karena backface culling
-  // aktif — urutan vertex (x0,z0),(x1,z1),(x1,z0) + (x0,z0),(x0,z1),(x1,z1)
-  // memberi normal +y. Urutan lama memberi normal -y (ke bawah) sehingga
-  // laut & papan dermaga TER-CULL dan tidak pernah terlihat dari atas
-  // (cacat nyata temuan QA v9: laut + dermaga tak terrender).
-  function flatQuad(x0, z0, x1, z1, y, rgb) {
-    var pos = new Float32Array([
-      x0, y, z0, x1, y, z1, x1, y, z0,
-      x0, y, z0, x0, y, z1, x1, y, z1
-    ]);
-    var col = new Float32Array(18);
-    for (var i = 0; i < 6; i++) { col[i * 3] = rgb[0]; col[i * 3 + 1] = rgb[1]; col[i * 3 + 2] = rgb[2]; }
-    return { pos: pos, col: col };
-  }
+function isInWater(x, z) {
+  return z > SEA_LINE_Z;
+}
 
-  function init() {
-    _t = 0;
-    SB.Water.boat.x = BOAT_HOME.x;
-    SB.Water.boat.z = BOAT_HOME.z;
-    SB.Water.boat.yaw = BOAT_HOME.yaw;
-    SB.Water.boat.speed = 0;
-    if (!SB.GL || !SB.GL.mesh) return;
-    // Laut: dua bidang besar (barat + selatan), biru laut.
-    var west = flatQuad(-340, -220, SHORE_X, 220, -0.4, [0.05, 0.25, 0.45]);
-    var south = flatQuad(-340, SHORE_Z, 220, 340, -0.4, [0.05, 0.28, 0.5]);
-    _sea = [SB.GL.mesh(west.pos, west.col), SB.GL.mesh(south.pos, south.col)];
-    // Dermaga kayu: 8 papan dari darat (x=-170) menjorok ke laut (x=-191).
-    _planks = [];
-    var M = SB.Math3;
-    for (var i = 0; i < 8; i++) {
-      var px = -170 - i * 3;
-      var plank = flatQuad(px - 1.4, 117, px + 1.4, 123, 0.3, PLANK_BROWN);
-      _planks.push({ mesh: SB.GL.mesh(plank.pos, plank.col), mat: M.mat4Identity() });
-    }
-    if (SB.Meshes && SB.Meshes.boat) {
-      var b = SB.Meshes.boat();
-      _boatMesh = SB.GL.mesh(b.pos, b.col);
+function isOnPier(x, z) {
+  return (
+    Math.abs(x - PIER.x) <= PIER.w / 2 &&
+    z >= PIER.z - PIER.d / 2 &&
+    z <= PIER.z + PIER.d / 2
+  );
+}
+
+// Nearest dry-land point for (x, z): the shore at z = SEA_LINE_Z,
+// or the pier deck if the pier is closer than the shore.
+function nearestLand(x, z) {
+  const shore = { x, z: SEA_LINE_Z - 1.5, onPier: false };
+  if (isOnPier(x, z) || Math.abs(x - PIER.x) < PIER.w / 2 + 6) {
+    const pierZ = clamp(z, PIER.z - PIER.d / 2 + 1, PIER.z + PIER.d / 2 - 1);
+    if (Math.abs(z - pierZ) < Math.abs(z - shore.z)) {
+      return { x: clamp(x, PIER.x - PIER.w / 2 + 0.8, PIER.x + PIER.w / 2 - 0.8), z: pierZ, onPier: true };
     }
   }
+  return shore;
+}
 
-  function inBoat() { return !!(SB.G && SB.G.player && SB.G.player.inBoat); }
-
-  // Apakah pemain berada di posisi yang bisa naik kapal: di zona dermaga
-  // ATAU cukup dekat dengan kapal (kapal bisa berpindah setelah dipakai).
-  function canBoard(px, pz) {
-    var b = SB.Water.boat;
-    if (Math.hypot(px - b.x, pz - b.z) < BOARD_RADIUS) return true;
-    return px >= PIER_ZONE.x0 && px <= PIER_ZONE.x1 &&
-           pz >= PIER_ZONE.z0 && pz <= PIER_ZONE.z1;
-  }
-
-  function boardBoat() {
-    if (!SB.G || !SB.G.player) return false;
-    if (SB.G.player.inCar) return false;
-    var p = SB.G.player;
-    if (!canBoard(p.x, p.z)) return false;
-    p.inBoat = true;
-    p.x = SB.Water.boat.x;
-    p.z = SB.Water.boat.z;
-    if (SB.HUD && SB.HUD.showMessage) SB.HUD.showMessage('Speedboat — W gas, S rem, A/D belok, E turun');
-    return true;
-  }
-
-  function leaveBoat() {
-    if (!SB.G || !SB.G.player) return false;
-    var p = SB.G.player;
-    if (!p.inBoat) return false;
-    p.inBoat = false;
-    SB.Water.boat.speed = 0;
-    // Turun di ujung dermaga (darat).
-    var spot = { x: PIER.x - 22, z: PIER.z + 5 };
-    if (SB.City && SB.City.findClearSpot) spot = SB.City.findClearSpot(PIER.x - 20, PIER.z + 5, 2);
-    p.x = spot.x; p.z = spot.z;
-    return true;
-  }
-
-  function update(dt) {
-    _t += dt;
-    var b = SB.Water.boat;
-    if (!inBoat()) {
-      // Kapal diam mengapung di dermaga; animasi ombak kecil via _t saja.
-      return;
-    }
-    var k = readKeys();
-    var fwd = (k['KeyW'] || k['ArrowUp']) ? 1 : 0;
-    var back = (k['KeyS'] || k['ArrowDown']) ? 1 : 0;
-    var left = (k['KeyA'] || k['ArrowLeft']) ? 1 : 0;
-    var right = (k['KeyD'] || k['ArrowRight']) ? 1 : 0;
-    if (fwd) b.speed += 14 * dt;
-    if (back) b.speed -= 10 * dt;
-    if (!fwd && !back) b.speed *= Math.max(0, 1 - 0.8 * dt);
-    b.speed = Math.max(-6, Math.min(20, b.speed));
-    var steer = (left ? 1 : 0) - (right ? 1 : 0);
-    b.yaw += steer * 1.4 * dt * Math.min(1, Math.abs(b.speed) / 6) * (b.speed < 0 ? -1 : 1);
-    b.x += Math.sin(b.yaw) * b.speed * dt;
-    b.z += Math.cos(b.yaw) * b.speed * dt;
-    // Jaga kapal tetap di laut (barat x < -172 atau selatan z > 172).
-    if (b.x > -172 && b.z < 172) {
-      if (Math.abs(b.x + 172) < Math.abs(b.z - 172)) b.x = -172; else b.z = 172;
-      b.speed *= 0.4;
-    }
-    b.x = Math.max(-330, Math.min(-172, b.x));
-    b.z = Math.max(-210, Math.min(330, b.z));
-    var p = SB.G.player;
-    p.x = b.x; p.z = b.z; p.yaw = b.yaw; p.speed = Math.abs(b.speed);
-    if (SB.G) SB.G.dist += Math.abs(b.speed) * dt;
-  }
-
-  // Dipanggil tiap frame dari game loop (main.js drawWorld).
-  // Lazy-init: bila mesh belum ada, bangun dulu supaya laut & dermaga
-  // tidak pernah gagal render karena urutan pemanggilan.
-  function draw() {
-    if (!_sea && SB.GL && SB.GL.mesh) init();
-    if (!SB.GL || !SB.GL.draw || !SB.Math3) return;
-    var M = SB.Math3, I = M.mat4Identity();
-    var i;
-    if (_sea) for (i = 0; i < _sea.length; i++) SB.GL.draw(_sea[i], I);
-    for (i = 0; i < _planks.length; i++) SB.GL.draw(_planks[i].mesh, _planks[i].mat);
-    // Kapal: goyang ombak kecil + posisi/yaw saat ini.
-    var b = SB.Water.boat;
-    var bobY = 0.1 + Math.sin(_t * 1.8) * 0.12;
-    var mat = M.mat4Mul(M.mat4Translate(b.x, bobY, b.z), M.mat4RotateY(b.yaw));
-    if (_boatMesh) {
-      SB.GL.draw(_boatMesh, mat);
-    } else if (SB.Meshes && SB.Meshes.box) {
-      var hull = SB.Meshes.box(3, 1, 7);
-      SB.GL.draw(SB.GL.mesh(hull.pos, hull.col), mat);
-    }
-  }
-
-  SB.Water = {
-    boat: { x: BOAT_HOME.x, z: BOAT_HOME.z, yaw: BOAT_HOME.yaw, speed: 0 },
-    pier: { x: PIER.x, z: PIER.z },
-    seaX: SHORE_X,
-    seaZ: SHORE_Z,
-    init: init,
-    update: update,
-    draw: draw,
-    boardBoat: boardBoat,
-    leaveBoat: leaveBoat
+function createWater(options = {}) {
+  return {
+    seaLineZ: SEA_LINE_Z,
+    seaY: SEA_Y,
+    pier: { ...PIER, ...(options.pier || {}) },
+    time: 0,
+    // Buoys marking the boat area, fixed positions on the water.
+    buoys: [
+      { x: -60, z: 230 }, { x: 0, z: 250 }, { x: 60, z: 230 },
+      { x: -90, z: 280 }, { x: 90, z: 280 }, { x: 0, z: 300 },
+    ],
+    waveAmp: WAVE_AMP,
   };
-})();
+}
+
+// --- meshes --------------------------------------------------------
+// The sea is a grid of flat quads (not one giant quad) so each
+// vertex can bob with waveHeight() — the "vertex animation" the
+// brief requires. Every quad is wound CCW from above, exactly like
+// SB.Meshes.flatQuad, so the sea is visible from above at all times.
+function buildSeaMesh(water, time, cols = 14, rows = 14) {
+  const M = SB.Meshes;
+  if (!M) return null;
+  const b = new M.MeshBuilder();
+  const x0 = -SEA_EXTENT / 2, x1 = SEA_EXTENT / 2;
+  const z0 = SEA_LINE_Z, z1 = SEA_LINE_Z + SEA_EXTENT;
+  const cw = (x1 - x0) / cols;
+  const cd = (z1 - z0) / rows;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const ax = x0 + c * cw, bx = ax + cw;
+      const az = z0 + r * cd, bz = az + cd;
+      // Slight colour shift per cell so waves read in flat shading.
+      const shade = 0.92 + 0.08 * Math.sin((c * 3 + r * 5) * 0.7 + time * 0.6);
+      const base = [0.09 * shade, 0.42 * shade, 0.62 * shade];
+      const y = (x, z) => SEA_Y + waveHeight(x, z, time);
+      // Corners in flatQuad order: (ax,az) (ax,bz) (bx,bz) (bx,az)
+      // — CCW seen from above.
+      b.flatQuadCorners(
+        [ax, y(ax, az), az],
+        [ax, y(ax, bz), bz],
+        [bx, y(bx, bz), bz],
+        [bx, y(bx, az), az],
+        base
+      );
+    }
+  }
+  return b.build();
+}
+
+// Wooden pier: deck planks (flat quads, CCW from above), support
+// posts, and side rails. Deck sits at deckY above the water so
+// boats can pull alongside it.
+function buildPierMesh(water) {
+  const M = SB.Meshes;
+  if (!M) return null;
+  const b = new M.MeshBuilder();
+  const p = water.pier;
+  // Deck: planks across the width, one quad per plank row.
+  const planks = 12;
+  for (let i = 0; i < planks; i++) {
+    const z0 = p.z - p.d / 2 + (i * p.d) / planks;
+    const z1 = z0 + p.d / planks - 0.15;
+    const wood = i % 2 === 0 ? "#8a6d4b" : "#7d6242";
+    b.flatQuadCorners(
+      [p.x - p.w / 2, p.deckY, z0],
+      [p.x - p.w / 2, p.deckY, z1],
+      [p.x + p.w / 2, p.deckY, z1],
+      [p.x + p.w / 2, p.deckY, z0],
+      wood
+    );
+  }
+  // Support posts down into the water (both sides, every 6 m).
+  for (let z = p.z - p.d / 2 + 2; z <= p.z + p.d / 2; z += 6) {
+    b.cylinder(p.x - p.w / 2 + 0.4, -0.5, z, 0.28, p.deckY + 0.5, "#5e4a33", 8);
+    b.cylinder(p.x + p.w / 2 - 0.4, -0.5, z, 0.28, p.deckY + 0.5, "#5e4a33", 8);
+  }
+  // Side rails.
+  b.boxAt(p.x - p.w / 2 + 0.25, p.deckY, p.z, 0.18, 0.9, p.d, "#6b543a");
+  b.boxAt(p.x + p.w / 2 - 0.25, p.deckY, p.z, 0.18, 0.9, p.d, "#6b543a");
+  return b.build();
+}
+
+function buildBuoyMesh(water, time) {
+  const M = SB.Meshes;
+  if (!M) return null;
+  const b = new M.MeshBuilder();
+  for (const buoy of water.buoys) {
+    const y = SEA_Y + waveHeight(buoy.x, buoy.z, time);
+    b.cylinder(buoy.x, y, buoy.z, 0.55, 0.5, "#e07a2a", 10);
+    b.pyramid(buoy.x, y + 0.5, buoy.z, 0.8, 0.7, "#d94f3d");
+  }
+  return b.build();
+}
+
+// --- draw ----------------------------------------------------------
+// Called EVERY frame by the game loop. Always returns the full set
+// of water meshes for this frame — sea, pier, buoys — freshly built
+// with the current wave phase. There is deliberately no condition
+// that can skip the sea: even a frame with a broken camera or a
+// zero dt still gets a sea mesh back.
+//
+// v10 integration note: the sea mesh is rebuilt only when the wave
+// phase quantum changes (10x/second) and the pier/buoys meshes are
+// built once and reused. Rebuilding brand-new meshes every frame
+// would allocate fresh GL buffers every frame (GL.prepareMesh caches
+// buffers on the mesh object), leaking GPU memory over a play
+// session. The caller still calls draw() unconditionally each frame
+// and always receives all three meshes.
+let cachedSea = null;
+let cachedSeaQuantum = -1;
+let cachedPier = null;
+let cachedBuoys = null;
+
+function draw(water, time) {
+  const t = typeof time === "number" ? time : water.time || 0;
+  water.time = t;
+  const quantum = Math.floor(t * 10);
+  if (!cachedSea || quantum !== cachedSeaQuantum) {
+    cachedSea = buildSeaMesh(water, t);
+    cachedSeaQuantum = quantum;
+  }
+  if (!cachedPier) cachedPier = buildPierMesh(water);
+  if (!cachedBuoys) cachedBuoys = buildBuoyMesh(water, t);
+  return {
+    sea: cachedSea,
+    pier: cachedPier,
+    buoys: cachedBuoys,
+    // Convenience: one merged mesh for renderers that draw a
+    // single water batch. Merging keeps the per-quad winding.
+    merged: null,
+  };
+}
+
+// --- boat / player interaction -------------------------------------
+// Drop the player off a boat. NEVER traps the player: this function
+// always succeeds and always leaves the player either on foot on
+// the pier / shore, or swimming toward it.
+//   * Within 8 m of the pier end or the shore -> step onto dry land.
+//   * Anywhere else -> mode "swim" in the water beside the boat,
+//     facing the shore (yaw = PI points back toward land from the
+//     sea, since land is at smaller z).
+function exitBoat(player, boat, world) {
+  const land = nearestLand(boat.x, boat.z);
+  const distToLand = Math.hypot(boat.x - land.x, boat.z - land.z);
+  const nearPierOrShore = distToLand < 9 || isOnPier(boat.x, boat.z);
+  player.vehicle = null;
+  player.vx = 0;
+  player.vy = 0;
+  player.vz = 0;
+  if (nearPierOrShore) {
+    player.mode = "foot";
+    player.x = land.x;
+    player.z = land.z;
+    player.y = land.onPier ? PIER.deckY : 0;
+    player.swimming = false;
+  } else {
+    // Far from the dock: into the water, swimming, facing shore.
+    player.mode = "swim";
+    player.swimming = true;
+    player.x = boat.x + Math.sin(boat.yaw || 0) * 2.5;
+    player.z = boat.z + Math.cos(boat.yaw || 0) * 2.5;
+    player.y = 0;
+    player.yaw = Math.PI; // face back toward the shore (smaller z)
+  }
+  return player;
+}
+
+// Board a boat from the water or the pier: player must be close.
+function boardBoat(player, boat) {
+  const d = Math.hypot(boat.x - player.x, boat.z - player.z);
+  if (d > 3.5) return false;
+  boat.driver = player;
+  player.vehicle = boat;
+  player.mode = "boat";
+  player.swimming = false;
+  return true;
+}
+
+// Keep a swimming player inside the swim zone; past the outer
+// buoys the current gently pushes them back toward shore instead
+// of letting them swim to infinity.
+function clampSwimmer(player) {
+  if (player.z > SHORE_SWIM_MAX + 120) {
+    player.z = SHORE_SWIM_MAX + 120;
+  }
+  return player;
+}
+
+SB.Water = {
+  SEA_LINE_Z,
+  SEA_Y,
+  PIER,
+  createWater,
+  draw,
+  waveHeight,
+  isInWater,
+  isOnPier,
+  nearestLand,
+  exitBoat,
+  boardBoat,
+  buildSeaMesh,
+  buildPierMesh,
+  buildBuoyMesh,
+  clampSwimmer,
+};
+
+const Water = SB.Water;
+
+export { Water, createWater, draw, waveHeight, isInWater, isOnPier, nearestLand, exitBoat, boardBoat, buildSeaMesh, buildPierMesh, buildBuoyMesh };
+export default SB.Water;

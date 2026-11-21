@@ -1,9 +1,29 @@
-# Sunset Bay v9 — pola ignore untuk build & artefak lokal
+# Sunset Bay — ignore rules
+# Anything generated, local-only, or editor-specific stays out of git.
+
+# Dependencies installed locally
 node_modules/
-.DS_Store
-*.log
+
+# Build and submission outputs
 out/
 dist/
+output/
+
+# Scratch and temp files
 /tmp/
 *.tmp
+*.log
+
+# Local environment and secrets
 .env
+.env.*
+
+# macOS metadata
+.DS_Store
+
+# Test coverage reports
+coverage/
+
+# Editor settings
+.vscode/
+.idea/
