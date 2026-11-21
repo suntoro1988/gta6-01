@@ -1,277 +1,465 @@
+// Sunset Bay v8 — game.js
+// Misi (18 misi / 49 stage), wanted, polisi, heli, busted/wasted, save/load, ammo.
+// Menempel ke namespace global window.SB. State di SB.G.
 (function () {
-  "use strict";
-  var SB = window.SB = window.SB || {};
-  var SAVE_KEY = "sunset-bay-save-v1";
-  var SAFE = { x: 8, z: 8 }; // safehouse
-  var GARAGE = { x: 60, z: -40 }; // garage Downtown (respray)
-  var bustT = 0, decayT = 0;
+  'use strict';
 
-  function msg(t) {
-    if (SB.HUD && SB.HUD.showMessage) SB.HUD.showMessage(t);
+  var SAVE_KEY = 'sunset-bay-save-v1';
+  var SAFEHOUSE = { x: 0, z: 0, yaw: 0 };
+  var STAGE_ARRIVE_DIST = 6;
+  var AMMO_PRICE = 50;
+  var AMMO_AMOUNT = 24;
+  var RESPRAY_PRICE = 150;
+  var REP_PER_STAGE = 15;   // v8: tiap stage selesai +15 REP
+  var REP_PER_MISSION = 40; // v8: tiap misi selesai +40 REP
+  // Misi 1 (4 stage) = 4x15 + 40 = +100 REP.
+
+  function G() { return window.SB.G; }
+
+  function showMessage(t) {
+    if (window.SB.HUD && window.SB.HUD.showMessage) window.SB.HUD.showMessage(t);
   }
 
-  function sfx(n) {
-    if (SB.Audio && SB.Audio.sfx) SB.Audio.sfx(n);
+  function sfx(name) {
+    if (window.SB.Audio && window.SB.Audio.sfx) window.SB.Audio.sfx(name);
   }
 
-  function freshState() {
-    return {
-      money: 250, rep: 0, wanted: 0,
-      mission: 0, missionStage: 0,
-      clock: 18.0,
-      player: { x: SAFE.x, z: SAFE.z, yaw: 0, hp: 100, inCar: false, car: null, speed: 0, inBoat: false },
-      police: [], heli: null,
-      dist: 0, drifts: 0, busted: 0,
-      // Stash pickup di dunia (4 titik, diisi Game.start via initStash):
-      // [{x, z, taken}] — disimpan di SB.G agar save/load konsisten.
-      stash: null,
-      // Senjata: mulai dengan Pistol (ammo 24) agar klik/F langsung menembak;
-      // Fists selalu tersedia sebagai fallback saat ammo habis.
-      weapon: 'Pistol', ammo: { Pistol: 24 },
-      paused: false, input: {}
-    };
+  function dist2(ax, az, bx, bz) {
+    var dx = ax - bx, dz = az - bz;
+    return Math.sqrt(dx * dx + dz * dz);
   }
 
-  if (!SB.G) SB.G = freshState();
-
-  function st(text, x, z, reward, water) {
-    var s = { text: text, target: { x: x, z: z }, reward: reward };
-    if (water) s.target.water = true; // target di laut — jangan snap ke darat
-    return s;
-  }
-
-  // 18 missions, 49 stages. Stage counts: 4,3,2,3,2,3,3,2,3,3,2,3,2,3,3,2,3,3.
+  // ---------------------------------------------------------------------------
+  // 18 misi, total 49 stage. Stage counts: 4,3,3,3,3,3,3,2,3,2,3,2,3,2,3,2,3,2
+  // ---------------------------------------------------------------------------
   var MISSIONS = [
-    { name: "First Wheels", stages: [
-      st("Walk to the parked car by the safehouse", 14, 6, 0),
-      st("Take the car (press E)", 14, 6, 0),
-      st("Drive to the garage in Downtown", 60, -40, 0),
-      st("Park at the safehouse to finish", 8, 8, 150) ] },
-    { name: "Package Run", stages: [
-      st("Pick up the package at the Harbor", -120, 80, 0),
-      st("Deliver it in Old Town", -40, 120, 60),
-      st("Deliver the second box in Marina Bay", 120, 60, 120) ] },
-    { name: "Taxi Nights", stages: [
-      st("Pick up the passenger in Uptown", 90, -90, 0),
-      st("Drop them off at Beachfront", -90, -140, 90) ] },
-    { name: "Harbor Lights", stages: [
-      st("Meet the contact at the docks", -140, 60, 0),
-      st("Check the warehouse on the pier", -100, 100, 50),
-      st("Bring the crate back to the Harbor gate", -160, 20, 110) ] },
-    { name: "Hillcrest Climb", stages: [
-      st("Drive up to Hillcrest overlook", 150, -120, 0),
-      st("Reach the summit house", 170, -150, 140) ] },
-    { name: "Marina Getaway", stages: [
-      // Target air (water:true) TIDAK di-snap ke darat oleh stageTarget —
-      // kapal tidak bisa mencapai titik darat, jadi stage 2/3 harus di laut.
-      st("Board the speedboat at the marina", -282, 44, 0),
-      st("Sail to the far buoy", -420, 200, 60, true),
-      st("Return to the marina dock", -292, 50, 130, true) ] },
-    { name: "Night Shift", stages: [
-      st("Clock in at the Downtown garage", 60, -40, 0),
-      st("Tow the broken car in Southside", -60, -60, 50),
-      st("Drop it at the safehouse lot", 0, 0, 120) ] },
-    { name: "Downtown Dash", stages: [
-      st("Race to the Downtown plaza", 40, -20, 0),
-      st("Beat the clock to the north gate", 80, -60, 150) ] },
-    { name: "Beachfront Cruise", stages: [
-      st("Cruise the Beachfront strip", -90, -140, 0),
-      st("Stop at the pier cafe", -130, -120, 60),
-      st("Park at the lifeguard tower", -60, -160, 130) ] },
-    { name: "Industrial Heat", stages: [
-      st("Sneak into the Industrial yard", -160, -40, 0),
-      st("Grab the parts from the depot", -180, -80, 70),
-      st("Get out through the west gate", -140, -10, 150) ] },
-    { name: "Old Town Tour", stages: [
-      st("Visit the Old Town square", -40, 120, 0),
-      st("Photograph the old chapel", -70, 90, 130) ] },
-    { name: "Uptown Hustle", stages: [
-      st("Meet the buyer in Uptown", 90, -90, 0),
-      st("Collect the payment downtown", 110, -120, 60),
-      st("Stash the cash at the safehouse", 70, -70, 140) ] },
-    { name: "Southside Story", stages: [
-      st("Find the informant in Southside", 20, 150, 0),
-      st("Escort them to the safe street", 60, 130, 140) ] },
-    { name: "Northside Nights", stages: [
-      st("Patrol the Northside blocks", -20, -160, 0),
-      st("Check the alley behind the market", 20, -140, 60),
-      st("Report back at the corner store", -60, -180, 140) ] },
-    { name: "Sunset Chase", stages: [
-      st("Chase the rival car from the plaza", 0, 0, 0),
-      st("Cut them off near the marina road", 120, -60, 80),
-      st("Corner them at the Harbor fence", -120, 40, 160) ] },
-    { name: "Harbor Heist", stages: [
-      st("Slip into the Harbor warehouse", -140, 60, 0),
-      st("Escape with the goods to the boat", -100, 20, 180) ] },
-    { name: "Bay Finale", stages: [
-      st("One last run: marina to Hillcrest", 120, 60, 0),
-      st("Down the hill to the bay road", 150, -120, 100),
-      st("Finish at the safehouse", 8, 8, 200) ] },
-    { name: "Legend of the Bay", stages: [
-      st("Prove it at the Downtown garage", 60, -40, 0),
-      st("One final delivery in Old Town", -40, 120, 150),
-      st("Take the crown at the plaza", 0, 0, 300) ] }
+    { name: 'First Wheels', fastBonus: 50, stages: [
+      { text: 'Pergi ke mobil parkir di sudut jalan', target: { x: 20, z: -10 }, reward: 25 },
+      { text: 'Bawa mobil ke garasi di seberang kota', target: { x: 60, z: 40 }, reward: 50 },
+      { text: 'Antar mobil ke titik drop-off pelabuhan', target: { x: -60, z: 70 }, reward: 25 },
+      { text: 'Kembali ke safehouse', target: { x: 0, z: 0 }, reward: 50 }
+    ] },
+    { name: 'Package Run', stages: [
+      { text: 'Ambil paket di Downtown', target: { x: 30, z: 30 }, reward: 40 },
+      { text: 'Antar paket ke Marina Bay', target: { x: -80, z: -40 }, reward: 60 },
+      { text: 'Lapor kembali ke safehouse', target: { x: 0, z: 0 }, reward: 40 }
+    ] },
+    { name: 'Harbor Lights', stages: [
+      { text: 'Cek dermaga Harbor', target: { x: -100, z: 60 }, reward: 40 },
+      { text: 'Ambil kiriman di gudang pelabuhan', target: { x: -120, z: 20 }, reward: 60 },
+      { text: 'Antar kiriman ke Old Town', target: { x: 50, z: -60 }, reward: 50 }
+    ] },
+    { name: 'Night Shift', stages: [
+      { text: 'Mulai shift malam di Uptown', target: { x: 70, z: -80 }, reward: 40 },
+      { text: 'Jemput penumpang di Northside', target: { x: 90, z: 40 }, reward: 60 },
+      { text: 'Antar penumpang ke Beachfront', target: { x: -30, z: 110 }, reward: 50 }
+    ] },
+    { name: 'Marina Run', stages: [
+      { text: 'Ke Marina Bay', target: { x: -70, z: -70 }, reward: 40 },
+      { text: 'Ikuti rute pesisir ke selatan', target: { x: -40, z: 100 }, reward: 60 },
+      { text: 'Selesai di dermaga selatan', target: { x: -110, z: 90 }, reward: 50 }
+    ] },
+    { name: 'Hillcrest Climb', stages: [
+      { text: 'Naik ke Hillcrest', target: { x: 100, z: 90 }, reward: 50 },
+      { text: 'Turun ke titik pandang', target: { x: 60, z: 110 }, reward: 50 },
+      { text: 'Kembali ke jalan utama', target: { x: 20, z: 60 }, reward: 50 }
+    ] },
+    { name: 'Downtown Dash', stages: [
+      { text: 'Sprint melintasi Downtown', target: { x: 40, z: 10 }, reward: 50 },
+      { text: 'Lewati persimpangan Old Town', target: { x: -20, z: -50 }, reward: 50 },
+      { text: 'Finish di alun-alun', target: { x: 10, z: -20 }, reward: 50 }
+    ] },
+    { name: 'Beachfront Cruise', stages: [
+      { text: 'Cruise di Beachfront', target: { x: -10, z: 120 }, reward: 60 },
+      { text: 'Parkir di ujung pantai', target: { x: 50, z: 130 }, reward: 60 }
+    ] },
+    { name: 'Old Town Tour', stages: [
+      { text: 'Mulai tur di Old Town', target: { x: -50, z: -80 }, reward: 40 },
+      { text: 'Mampir ke pasar lama', target: { x: -30, z: -100 }, reward: 60 },
+      { text: 'Akhiri tur di gerbang kota', target: { x: -70, z: -30 }, reward: 50 }
+    ] },
+    { name: 'Industrial Haul', stages: [
+      { text: 'Ambil muatan di Industrial', target: { x: 120, z: -20 }, reward: 60 },
+      { text: 'Antar muatan ke gudang Harbor', target: { x: -100, z: 40 }, reward: 70 }
+    ] },
+    { name: 'Northside Nights', stages: [
+      { text: 'Patroli Northside', target: { x: 80, z: 60 }, reward: 50 },
+      { text: 'Cek taman utara', target: { x: 110, z: 70 }, reward: 50 },
+      { text: 'Kembali ke base', target: { x: 0, z: 0 }, reward: 50 }
+    ] },
+    { name: 'Southside Sprint', stages: [
+      { text: 'Sprint ke Southside', target: { x: -20, z: -120 }, reward: 60 },
+      { text: 'Putar balik di ujung selatan', target: { x: 40, z: -130 }, reward: 60 }
+    ] },
+    { name: 'Uptown Express', stages: [
+      { text: 'Ekspres ke Uptown', target: { x: 90, z: -60 }, reward: 50 },
+      { text: 'Ambil dokumen penting', target: { x: 120, z: -90 }, reward: 60 },
+      { text: 'Serahkan dokumen di Downtown', target: { x: 30, z: 20 }, reward: 50 }
+    ] },
+    { name: 'Sunset Delivery', stages: [
+      { text: 'Ambil pesanan saat senja', target: { x: -60, z: 30 }, reward: 50 },
+      { text: 'Antar sebelum gelap', target: { x: 70, z: 100 }, reward: 70 }
+    ] },
+    { name: 'Midnight Rider', stages: [
+      { text: 'Riding tengah malam ke Marina', target: { x: -80, z: -60 }, reward: 60 },
+      { text: 'Lewati jembatan pelabuhan', target: { x: -110, z: -10 }, reward: 60 },
+      { text: 'Parkir di dermaga', target: { x: -90, z: 50 }, reward: 60 }
+    ] },
+    { name: 'Harbor Heist', stages: [
+      { text: 'Menyusup ke gudang Harbor', target: { x: -120, z: 60 }, reward: 70 },
+      { text: 'Kabur ke Hillcrest', target: { x: 100, z: 100 }, reward: 80 }
+    ] },
+    { name: 'Bay City Legend', stages: [
+      { text: 'Buktikan diri di Downtown', target: { x: 20, z: 40 }, reward: 60 },
+      { text: 'Tantangan di Northside', target: { x: 100, z: 30 }, reward: 70 },
+      { text: 'Penutup di Beachfront', target: { x: 0, z: 120 }, reward: 70 }
+    ] },
+    { name: 'Sunset Finale', stages: [
+      { text: 'Putaran terakhir keliling kota', target: { x: -40, z: -40 }, reward: 80 },
+      { text: 'Kembali ke safehouse — legenda Sunset Bay!', target: { x: 0, z: 0 }, reward: 100 }
+    ] }
   ];
 
-  // Stash pickup: 4 titik di distrik berbeda, JAUH dari stage misi mana pun
-  // (bukan reward misi 12 stage 3 — itu $140 dan tidak diubah).
-  // Anchor di-snap ke titik bebas bangunan via City.findClearSpot.
-  var STASH_ANCHORS = [
-    { x: -120, z: 120 },  // Harbor
-    { x: 0, z: -100 },    // Uptown
-    { x: -220, z: -200 }, // Beachfront
-    { x: 220, z: 100 }    // Industrial
-  ];
-
-  function initStash() {
-    var G = SB.G;
-    G.stash = STASH_ANCHORS.map(function (a) {
-      var c = a;
-      if (SB.City && SB.City.findClearSpot) c = SB.City.findClearSpot(a.x, a.z, 2);
-      return { x: c.x, z: c.z, taken: false };
-    });
-    return G.stash;
+  function currentMission() {
+    var g = G();
+    if (!g) return null;
+    return MISSIONS[g.mission] || null;
   }
 
-  // Pemain jalan kaki melewati titik stash (radius 2) → +$100, sekali saja.
-  function checkStash() {
-    var G = SB.G;
-    if (!G || !G.stash) return;
-    if (G.player.inCar || G.player.inBoat) return;
-    for (var i = 0; i < G.stash.length; i++) {
-      var s = G.stash[i];
-      if (s.taken) continue;
-      if (Math.hypot(G.player.x - s.x, G.player.z - s.z) < 2) {
-        s.taken = true;
-        G.money += 100;
-        msg("Stash found: +$100");
-        sfx("pickup");
-      }
+  function currentStage() {
+    var m = currentMission();
+    var g = G();
+    if (!m || !g) return null;
+    return m.stages[g.missionStage] || null;
+  }
+
+  function respawn(reason) {
+    var g = G();
+    if (!g || !g.player) return;
+    var p = g.player;
+    if (p.car && window.SB.Vehicles && window.SB.Vehicles.exitCar) {
+      window.SB.Vehicles.exitCar();
     }
-  }
-
-  function curMission() { return MISSIONS[SB.G.mission] || null; }
-  function curStage() {
-    var m = curMission();
-    return m ? (m.stages[SB.G.missionStage] || null) : null;
-  }
-
-  function stageTarget(s) {
-    if (!s) return null;
-    var t = s.target;
-    // Target air (misi kapal) tidak boleh di-snap ke darat: findClearSpot
-    // hanya mengembalikan titik darat, kapal takkan pernah sampai.
-    if (t.water) return { x: t.x, z: t.z };
-    if (SB.City && SB.City.findClearSpot) {
-      var c = SB.City.findClearSpot(t.x, t.z, 4);
-      if (c) return { x: c.x, z: c.z };
+    p.x = SAFEHOUSE.x;
+    p.z = SAFEHOUSE.z;
+    p.yaw = SAFEHOUSE.yaw;
+    p.hp = 100;
+    p.inCar = false;
+    p.car = null;
+    p.speed = 0;
+    g.police = [];
+    g.heli = null;
+    g.wanted = 0;
+    g._bustTimer = 0;
+    if (reason === 'busted') {
+      var lost = Math.floor((g.money || 0) * 0.10);
+      g.money = (g.money || 0) - lost;
+      g.busted = (g.busted || 0) + 1;
+      showMessage('BUSTED! Polisi menyita $' + lost + ' (-10%)');
+    } else if (reason === 'wasted') {
+      showMessage('WASTED! Kamu bangun di safehouse.');
     }
-    return { x: t.x, z: t.z };
+    sfx('busted');
   }
 
-  function respawn() {
-    var p = SB.G.player;
-    p.x = SAFE.x; p.z = SAFE.z; p.yaw = 0;
-    p.hp = 100; p.inCar = false; p.car = null; p.speed = 0; p.inBoat = false;
-    SB.G.police = []; SB.G.heli = null; SB.G.wanted = 0;
-  }
-
-  function loseCut(label) {
-    var lost = Math.floor(SB.G.money * 0.10);
-    SB.G.money -= lost;
-    msg(label + " You lost $" + lost + ".");
-    return lost;
-  }
-
-  SB.Game = {
+  var Game = {
     MISSIONS: MISSIONS,
     SAVE_KEY: SAVE_KEY,
-    safehouse: SAFE,
+    _missionStart: 0,
+    _bustTimer: 0,
 
     start: function () {
-      SB.G = freshState();
-      bustT = 0; decayT = 0;
-      initStash();
-      msg("Welcome to Sunset Bay. Mission 1: First Wheels.");
-      sfx("mission");
+      // SB.G belum pernah dibuat modul mana pun: buat state awal di sini
+      // (tanpa ini Game.start() return dini dan game tak punya state).
+      var g = G();
+      if (!g) {
+        g = window.SB.G = {
+          money: 250, rep: 0, wanted: 0, mission: 0, missionStage: 0,
+          clock: 18.0,
+          player: { x: SAFEHOUSE.x, z: SAFEHOUSE.z, yaw: SAFEHOUSE.yaw, hp: 100, inCar: false, car: null, speed: 0 },
+          police: [], heli: null, dist: 0, drifts: 0, busted: 0,
+          ammo: { pistol: 48 }, weapon: 'pistol'
+        };
+      }
+      g.money = 250;
+      g.rep = 0;
+      g.wanted = 0;
+      g.mission = 0;
+      g.missionStage = 0;
+      g.clock = 18.0;
+      g.player = { x: SAFEHOUSE.x, z: SAFEHOUSE.z, yaw: SAFEHOUSE.yaw, hp: 100, inCar: false, car: null, speed: 0 };
+      g.police = [];
+      g.heli = null;
+      g.dist = 0;
+      g.drifts = 0;
+      g.busted = 0;
+      g.ammo = { pistol: 48 };
+      g.weapon = 'pistol';
+      this._missionStart = Date.now();
+      this._bustTimer = 0;
+      if (window.SB.Jobs) {
+        window.SB.Jobs.taxi.active = false;
+        window.SB.Jobs.package.active = false;
+      }
+      showMessage('Misi 1: First Wheels — pergi ke mobil parkir!');
     },
-
-    // Daftar titik stash (untuk QA/debug; init bila belum ada).
-    stashSpots: function () {
-      if (!SB.G.stash) initStash();
-      return SB.G.stash;
-    },
-
-    missionTarget: function () { return stageTarget(curStage()); },
 
     update: function (dt) {
-      var G = SB.G;
-      if (!G) return;
-      // Day/night clock: 1 game hour per 50 seconds.
-      G.clock = (G.clock + dt * 0.02) % 24;
-      // WASTED: hp hit zero.
-      if (G.player.hp <= 0) {
-        loseCut("WASTED!");
-        G.busted = (G.busted || 0) + 1;
-        respawn();
-        sfx("busted");
-        return;
+      var g = G();
+      if (!g || !g.player) return;
+
+      // Siklus siang-malam: 1 jam game per ~50 detik nyata.
+      g.clock = (g.clock + dt * 0.02) % 24;
+
+      // Cek penyelesaian stage aktif (kedekatan dengan target).
+      var stage = currentStage();
+      if (stage && stage.target) {
+        var d = dist2(g.player.x, g.player.z, stage.target.x, stage.target.z);
+        if (d < STAGE_ARRIVE_DIST) this.completeStage();
       }
-      // Mission progress: reach the stage marker.
-      var s = curStage();
-      if (s) {
-        var t = stageTarget(s);
-        var d = Math.hypot(G.player.x - t.x, G.player.z - t.z);
-        if (d < 5) SB.Game.completeStage();
+
+      if (window.SB.Jobs) window.SB.Jobs.update(dt);
+      this.updatePolice(dt);
+      this.bustCheck(dt);
+
+      // WASTED: HP habis -> respawn di safehouse.
+      if (g.player.hp <= 0) respawn('wasted');
+
+      // Heli mengikuti pemain saat aktif.
+      if (g.heli) {
+        g.heli.x = g.player.x;
+        g.heli.z = g.player.z;
+        g.heli.y = 60;
       }
-      // Stash pickup (jalan kaki, +$100 per titik, sekali saja).
-      if (!G.stash) initStash();
-      checkStash();
-      SB.Game.updatePolice(dt);
-      SB.Game.bustCheck(dt);
-      // Wanted slowly cools off when the player stays clean.
-      if (G.wanted > 0) {
-        decayT += dt;
-        if (decayT > 90) { decayT = 0; SB.Game.wantedDown(); }
-      } else decayT = 0;
     },
 
     completeStage: function () {
-      var G = SB.G;
-      var m = curMission(), s = curStage();
-      if (!m || !s) return;
-      if (s.reward) {
-        G.money += s.reward;
-        msg("Stage complete: +$" + s.reward);
-      } else {
-        msg("Stage complete.");
-      }
-      sfx("mission");
-      G.missionStage++;
-      if (G.missionStage >= m.stages.length) {
-        // SATU misi yang selesai = total REP +100 (konsisten di semua misi,
-        // berapa pun jumlah stage-nya; tidak ada REP per stage).
-        G.rep = (G.rep || 0) + 100;
-        msg("Mission complete: " + m.name + "! +100 REP");
-        G.mission++;
-        G.missionStage = 0;
-        if (G.mission >= MISSIONS.length) {
-          msg("All missions complete. You are a legend of the Bay!");
+      var g = G();
+      var m = currentMission();
+      var stage = currentStage();
+      if (!g || !m || !stage) return;
+      g.money = (g.money || 0) + (stage.reward || 0);
+      g.rep = (g.rep || 0) + REP_PER_STAGE; // v8: +15 REP per stage
+      sfx('mission');
+      var lastStage = g.missionStage >= m.stages.length - 1;
+      if (lastStage) {
+        g.rep = (g.rep || 0) + REP_PER_MISSION; // v8: +40 REP per misi selesai
+        var bonusMsg = '';
+        if (m.fastBonus) {
+          var elapsed = (Date.now() - this._missionStart) / 1000;
+          if (elapsed < 300) {
+            g.money = (g.money || 0) + m.fastBonus;
+            bonusMsg = ' Fast bonus +$' + m.fastBonus + '!';
+          }
+        }
+        showMessage('Misi selesai: ' + m.name + '! +$' + (stage.reward || 0) +
+          ' (+15 REP stage, +40 REP misi).' + bonusMsg);
+        g.mission++;
+        g.missionStage = 0;
+        this._missionStart = Date.now();
+        if (g.mission >= MISSIONS.length) {
+          showMessage('SEMUA MISI SELESAI! Kamu legenda Sunset Bay!');
         } else {
-          var next = MISSIONS[G.mission];
-          msg("New mission: " + next.name + " — " + next.stages[0].text);
+          showMessage('Misi ' + (g.mission + 1) + ': ' + MISSIONS[g.mission].name);
+        }
+      } else {
+        showMessage('Stage selesai! +$' + (stage.reward || 0) + ' (+15 REP)');
+        g.missionStage++;
+      }
+      this.save();
+    },
+
+    // --- Wanted ---
+    wantedUp: function (n) {
+      var g = G();
+      if (!g) return;
+      g.wanted = Math.max(0, Math.min(5, (g.wanted || 0) + (n || 1)));
+      if (g.wanted >= 3) this.spawnHeli();
+    },
+
+    wantedDown: function (n) {
+      var g = G();
+      if (!g) return;
+      g.wanted = Math.max(0, (g.wanted || 0) - (n || 1));
+      if (g.wanted < 3) g.heli = null;
+    },
+
+    // Respray di garage (F): bersihkan wanted ke 0, biaya $150.
+    respray: function () {
+      var g = G();
+      if (!g) return false;
+      if ((g.money || 0) < RESPRAY_PRICE) {
+        showMessage('Respray butuh $' + RESPRAY_PRICE + '!');
+        return false;
+      }
+      if ((g.wanted || 0) === 0) {
+        showMessage('Tidak ada wanted untuk dibersihkan.');
+        return false;
+      }
+      g.money -= RESPRAY_PRICE;
+      g.wanted = 0;
+      g.police = [];
+      g.heli = null;
+      showMessage('Respray selesai! Wanted bersih. -$' + RESPRAY_PRICE);
+      sfx('pickup');
+      return true;
+    },
+
+    // --- Heli ---
+    spawnHeli: function () {
+      var g = G();
+      if (!g || !g.player) return;
+      if (!g.heli) {
+        g.heli = { x: g.player.x, y: 60, z: g.player.z };
+        showMessage('AIR-1 di udara! Heli polisi mengawasimu.');
+      }
+    },
+
+    // --- Polisi ---
+    updatePolice: function (dt) {
+      var g = G();
+      if (!g || !g.player) return;
+      var wanted = g.wanted || 0;
+      if (wanted <= 0) {
+        if (g.police.length > 0) g.police = [];
+        return;
+      }
+      // Jumlah polisi aktif mengikuti level wanted (maks 5).
+      var want = Math.min(wanted, 5);
+      while (g.police.length < want) {
+        var a = Math.random() * Math.PI * 2;
+        g.police.push({
+          x: g.player.x + Math.cos(a) * 40,
+          z: g.player.z + Math.sin(a) * 40,
+          hp: 100
+        });
+      }
+      while (g.police.length > want) g.police.pop();
+
+      // Polisi mengejar pemain.
+      var speed = 7 + wanted * 1.5;
+      for (var i = 0; i < g.police.length; i++) {
+        var cop = g.police[i];
+        var dx = g.player.x - cop.x, dz = g.player.z - cop.z;
+        var d = Math.sqrt(dx * dx + dz * dz) || 1;
+        cop.x += (dx / d) * speed * dt;
+        cop.z += (dz / d) * speed * dt;
+        // Polisi menembak bila dekat: kurangi HP pemain perlahan.
+        if (d < 25 && wanted >= 2) {
+          g.player.hp = Math.max(0, g.player.hp - 2 * dt);
         }
       }
     },
 
-    save: function () {
-      try {
-        var s = JSON.parse(JSON.stringify(SB.G));
-        s.player.car = null; // never persist a live car reference
-        s.player.inCar = false;
-        localStorage.setItem(SAVE_KEY, JSON.stringify(s));
+    // Tembak polisi: kurangi HP-nya; menembak polisi → wanted +1 (SPEC).
+    // Bila mati, pesan tumbang (total tetap +1, bukan +2).
+    damagePolice: function (index, dmg) {
+      var g = G();
+      if (!g || !g.police || !g.police[index]) return false;
+      var cop = g.police[index];
+      cop.hp -= (dmg || 25);
+      this.wantedUp(1);
+      if (cop.hp <= 0) {
+        g.police.splice(index, 1);
+        showMessage('Polisi tumbang! Wanted +1');
         return true;
-      } catch (e) { return false; }
+      }
+      return false;
+    },
+
+    // Tembak polisi terdekat dalam jangkauan (dipakai combat klik/F).
+    shootNearestPolice: function (range, dmg) {
+      var g = G();
+      if (!g || !g.player || !g.police || g.police.length === 0) return false;
+      var best = -1, bestD = range || 40;
+      for (var i = 0; i < g.police.length; i++) {
+        var d = dist2(g.player.x, g.player.z, g.police[i].x, g.police[i].z);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      if (best < 0) return false;
+      return this.damagePolice(best, dmg || 25);
+    },
+
+    // Tembak (F / klik): habiskan 1 ammo Pistol, kenai polisi terdekat.
+    // Dipanggil main.js doFireOrRespray — tanpa ini tembakan hanya bunyi.
+    fire: function () {
+      var g = G();
+      if (!g || !g.player) return false;
+      if (!g.ammo) g.ammo = { pistol: 0 };
+      if ((g.ammo.pistol || 0) <= 0) {
+        showMessage('Pistol kehabisan ammo! Beli di garage (G) — $50/+24.');
+        sfx('click');
+        return false;
+      }
+      g.ammo.pistol--;
+      sfx('shoot');
+      this.shootNearestPolice(40, 34);
+      return true;
+    },
+
+    // Busted: polisi menangkap bila sangat dekat dan pemain lambat/tidak lari.
+    bustCheck: function (dt) {
+      var g = G();
+      if (!g || !g.player) return;
+      if ((g.wanted || 0) <= 0 || !g.police || g.police.length === 0) {
+        this._bustTimer = 0;
+        return;
+      }
+      var near = false;
+      for (var i = 0; i < g.police.length; i++) {
+        var d = dist2(g.player.x, g.player.z, g.police[i].x, g.police[i].z);
+        if (d < 3) { near = true; break; }
+      }
+      var playerSpeed = g.player.speed || 0;
+      if (near && playerSpeed < 4 && !g.player.inCar) {
+        this._bustTimer += dt;
+        if (this._bustTimer > 3) {
+          this._bustTimer = 0;
+          respawn('busted');
+        }
+      } else {
+        this._bustTimer = Math.max(0, this._bustTimer - dt * 2);
+      }
+    },
+
+    // --- Ammo (baru v8): $50 untuk +24 ammo Pistol ---
+    buyAmmo: function () {
+      var g = G();
+      if (!g) return false;
+      if ((g.weapon || 'pistol') !== 'pistol') {
+        showMessage('Isi ulang ammo hanya untuk Pistol!');
+        return false;
+      }
+      if ((g.money || 0) < AMMO_PRICE) {
+        showMessage('Beli ammo butuh $' + AMMO_PRICE + '!');
+        return false;
+      }
+      if (!g.ammo) g.ammo = { pistol: 0 };
+      if (typeof g.ammo.pistol !== 'number') g.ammo.pistol = 0;
+      g.money -= AMMO_PRICE;
+      g.ammo.pistol += AMMO_AMOUNT;
+      showMessage('Ammo Pistol +24! -$' + AMMO_PRICE + ' (total ' + g.ammo.pistol + ')');
+      sfx('pickup');
+      return true;
+    },
+
+    // --- Save / Load ---
+    save: function () {
+      var g = G();
+      if (!g) return;
+      try {
+        var s = {
+          money: g.money, rep: g.rep, wanted: g.wanted,
+          mission: g.mission, missionStage: g.missionStage, clock: g.clock,
+          player: {
+            x: g.player.x, z: g.player.z, yaw: g.player.yaw,
+            hp: g.player.hp, inCar: false, car: null, speed: 0
+          },
+          dist: g.dist, drifts: g.drifts, busted: g.busted,
+          ammo: g.ammo, weapon: g.weapon
+        };
+        localStorage.setItem(SAVE_KEY, JSON.stringify(s));
+      } catch (e) { /* storage tidak tersedia: abaikan */ }
     },
 
     load: function () {
@@ -279,185 +467,50 @@
         var raw = localStorage.getItem(SAVE_KEY);
         if (!raw) return null;
         var s = JSON.parse(raw);
-        if (!s || typeof s.money !== "number") return null;
+        this.applySave(s);
         return s;
-      } catch (e) { return null; }
+      } catch (e) {
+        return null;
+      }
     },
 
     applySave: function (s) {
-      if (!s) return false;
-      var G = SB.G;
-      G.money = s.money; G.rep = s.rep || 0; G.wanted = s.wanted || 0;
-      G.mission = s.mission || 0; G.missionStage = s.missionStage || 0;
-      G.clock = (typeof s.clock === "number") ? s.clock : 18.0;
+      var g = G();
+      if (!s) return;
+      if (!g) {
+        g = window.SB.G = {
+          money: 250, rep: 0, wanted: 0, mission: 0, missionStage: 0,
+          clock: 18.0,
+          player: { x: 0, z: 0, yaw: 0, hp: 100, inCar: false, car: null, speed: 0 },
+          police: [], heli: null, dist: 0, drifts: 0, busted: 0,
+          ammo: { pistol: 48 }, weapon: 'pistol'
+        };
+      }
+      g.money = (typeof s.money === 'number') ? s.money : 250;
+      g.rep = s.rep || 0;
+      g.wanted = s.wanted || 0;
+      g.mission = s.mission || 0;
+      g.missionStage = s.missionStage || 0;
+      g.clock = (typeof s.clock === 'number') ? s.clock : 18.0;
       if (s.player) {
-        G.player.x = s.player.x || SAFE.x;
-        G.player.z = s.player.z || SAFE.z;
-        G.player.yaw = s.player.yaw || 0;
-        G.player.hp = s.player.hp || 100;
+        g.player = {
+          x: s.player.x || 0, z: s.player.z || 0, yaw: s.player.yaw || 0,
+          hp: (typeof s.player.hp === 'number') ? s.player.hp : 100,
+          inCar: false, car: null, speed: 0
+        };
       }
-      G.player.inCar = false; G.player.car = null;
-      G.player.inBoat = false;
-      G.dist = s.dist || 0; G.drifts = s.drifts || 0; G.busted = s.busted || 0;
-      // Pulihkan titik stash yang sudah diambil (save/load konsisten);
-      // save lama tanpa stash → init titik baru (belum diambil).
-      if (s.stash && s.stash.length) G.stash = s.stash;
-      else initStash();
-      G.police = []; G.heli = null;
-      // Pulihkan senjata; pastikan field runtime main.js selalu ada
-      // (Game.start() mengganti objek SB.G, jadi default ini penting).
-      G.weapon = s.weapon || 'Pistol';
-      G.ammo = s.ammo || { Pistol: 24 };
-      if (typeof G.paused !== 'boolean') G.paused = false;
-      if (!G.input) G.input = {};
-      return true;
-    },
-
-    wantedUp: function (n) {
-      var G = SB.G;
-      G.wanted = Math.min(5, (G.wanted || 0) + (n || 1));
-      decayT = 0;
-      if (G.wanted >= 3) SB.Game.spawnHeli();
-    },
-
-    wantedDown: function () {
-      SB.G.wanted = Math.max(0, (SB.G.wanted || 0) - 1);
-      if (SB.G.wanted < 3) SB.G.heli = null;
-    },
-
-    spawnHeli: function () {
-      var G = SB.G;
-      if (!G.heli) {
-        G.heli = { x: G.player.x + 50, y: 55, z: G.player.z + 50 };
-        msg("AIR-1 helicopter is on you!");
-      }
-    },
-
-    updatePolice: function (dt) {
-      var G = SB.G;
-      var want = G.wanted | 0;
-      if (want <= 0) {
-        if (G.police.length) G.police = [];
-        if (G.heli) G.heli = null;
-        return;
-      }
-      var wantCount = Math.min(want * 2, 8);
-      while (G.police.length < wantCount) {
-        var a = Math.random() * Math.PI * 2;
-        var r = 30 + Math.random() * 20;
-        G.police.push({ x: G.player.x + Math.cos(a) * r, z: G.player.z + Math.sin(a) * r, hp: 100 });
-      }
-      while (G.police.length > wantCount) G.police.pop();
-      var sp = 6.5 + want * 0.4;
-      for (var i = 0; i < G.police.length; i++) {
-        var p = G.police[i];
-        var dx = G.player.x - p.x, dz = G.player.z - p.z;
-        var d = Math.hypot(dx, dz) || 1;
-        p.x += dx / d * sp * dt;
-        p.z += dz / d * sp * dt;
-      }
-      G.police = G.police.filter(function (p) { return p.hp > 0; });
-      if (want >= 3) {
-        SB.Game.spawnHeli();
-        if (G.heli) {
-          G.heli.x += (G.player.x - G.heli.x) * dt * 0.8;
-          G.heli.z += (G.player.z - G.heli.z) * dt * 0.8;
-          G.heli.y = 55;
-        }
-      } else if (G.heli) G.heli = null;
-    },
-
-    bustCheck: function (dt) {
-      var G = SB.G;
-      if (!G.wanted || G.player.inCar) { bustT = 0; return; }
-      var near = false;
-      for (var i = 0; i < G.police.length; i++) {
-        var p = G.police[i];
-        if (Math.hypot(G.player.x - p.x, G.player.z - p.z) < 3.5) { near = true; break; }
-      }
-      // Running away (speed > 6) breaks the bust timer.
-      if (near && G.player.speed <= 6) bustT += dt;
-      else bustT = Math.max(0, bustT - dt * 2);
-      if (bustT > 3) {
-        bustT = 0;
-        loseCut("BUSTED! The police caught you.");
-        G.busted = (G.busted || 0) + 1;
-        respawn();
-        sfx("busted");
-      }
-    },
-
-    // Garage respray: $150 clears the wanted level.
-    respray: function () {
-      var G = SB.G;
-      if (G.wanted <= 0) { msg("No heat to clear."); return false; }
-      if (G.money < 150) { msg("Respray costs $150. Not enough cash."); return false; }
-      G.money -= 150;
-      G.wanted = 0; G.police = []; G.heli = null;
-      msg("Respray done. Heat cleared.");
-      sfx("pickup");
-      return true;
-    },
-
-    // True bila pemain berada di area garage (respray, radius 10).
-    // Dipakai main.js (tombol F) sebelum menembak.
-    atGarage: function () {
-      var p = SB.G && SB.G.player;
-      if (!p) return false;
-      return Math.hypot(p.x - GARAGE.x, p.z - GARAGE.z) < 10;
-    },
-
-    // Polisi terdekat dalam radius r dari pemain (atau null).
-    _nearestPolice: function (r) {
-      var G = SB.G;
-      var best = null, bestD = r * r;
-      for (var i = 0; i < G.police.length; i++) {
-        var p = G.police[i];
-        var d = (p.x - G.player.x) * (p.x - G.player.x) +
-                (p.z - G.player.z) * (p.z - G.player.z);
-        if (d < bestD) { bestD = d; best = p; }
-      }
-      return best;
-    },
-
-    // Tembak (klik / F saat bersenjata): polisi terdekat dalam 40 unit
-    // kena 34 damage, ammo -1, wanted +1 (SPEC: tembak polisi naik wanted).
-    // Tanpa senjata api / ammo habis → fallback ke punch().
-    shoot: function () {
-      var G = SB.G;
-      if (!G) return false;
-      if (G.player.inCar || G.player.inBoat) return false;
-      var w = G.weapon || 'Fists';
-      var ammo = (G.ammo && G.ammo[w]) || 0;
-      if (w === 'Fists' || ammo <= 0) {
-        if (w !== 'Fists' && ammo <= 0) msg("No ammo — punching instead.");
-        return SB.Game.punch();
-      }
-      G.ammo[w] = ammo - 1;
-      sfx("shoot");
-      var target = SB.Game._nearestPolice(40);
-      if (target) {
-        target.hp -= 34;
-        SB.Game.wantedUp(1);
-        if (target.hp <= 0) msg("Officer down.");
-      }
-      return true;
-    },
-
-    // Pukul (F saat Fists): polisi terdekat dalam 3 unit kena 20 damage.
-    punch: function () {
-      var G = SB.G;
-      if (!G) return false;
-      if (G.player.inCar || G.player.inBoat) return false;
-      sfx("punch");
-      var target = SB.Game._nearestPolice(3);
-      if (target) {
-        target.hp -= 20;
-        SB.Game.wantedUp(1);
-        if (target.hp <= 0) msg("Officer down.");
-        return true;
-      }
-      return false;
+      g.dist = s.dist || 0;
+      g.drifts = s.drifts || 0;
+      g.busted = s.busted || 0;
+      g.ammo = s.ammo || { pistol: 48 };
+      g.weapon = s.weapon || 'pistol';
+      g.police = [];
+      g.heli = null;
+      if (g.wanted >= 3) this.spawnHeli();
+      this._missionStart = Date.now();
+      this._bustTimer = 0;
     }
   };
+
+  window.SB.Game = Game;
 })();

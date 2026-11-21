@@ -4,55 +4,63 @@
 [![make.fun · gta6-01 rank](https://make.fun/badge/gta6-01/suntoro1988/gta6-01/rank.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
 [![make.fun · gta6-01 reward](https://make.fun/badge/gta6-01/suntoro1988/gta6-01/reward.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
 
-Sunset Bay adalah game open-world 3D yang berjalan sepenuhnya di browser — tanpa instalasi, tanpa server, tanpa koneksi internet. Jelajahi kota pesisir dengan 10 distrik, dari Downtown yang padat sampai Marina Bay dan Hillcrest di tepi laut. Curi mobil, antar penumpang taksi, selesaikan 18 misi dalam 49 stage, kabur dari kejaran polisi dan helikopter, lalu bersantai di speedboat saat matahari terbenam.
+**Sunset Bay** is an open-world 3D game that runs entirely in the browser. No installs, no
+external requests — just open `game/index.html` (or serve the `game/` folder) and drive.
 
-Game ini dibangun dengan WebGL mentah (tanpa engine dan tanpa dependensi eksternal). Kota dibuat prosedural dengan seed deterministik, jadi tata kotanya identik setiap kali dimuat. Ada siklus siang-malam, radio dengan 5 stasiun musik synth, sistem wanted 0–5 bintang, garasi untuk upgrade dan respray, safehouse, dan penyimpanan otomatis di browser.
+You wake up in a coastal sunset city with $250, no reputation, and a whole map of trouble
+to get into. Steal cars, drift through corners for cash, take taxi fares, run 18 story
+missions across 10 districts, dodge the police as your wanted level climbs, and escape by
+speedboat from the marina when the heat gets too high. The city lives on a day/night cycle,
+the radio has five synth stations, and your progress is saved so you can pick up where you
+left off.
 
-## Cara main
+## Features
 
-1. Jalankan server lokal: `npx tsx serve.ts` (atau sajikan folder `game/` dengan server statis apa pun), lalu buka `http://localhost:8080`.
-2. Di layar judul pilih **New Game** untuk mulai dari awal, atau **Continue** untuk melanjutkan simpanan terakhir.
-3. Ikuti penanda misi di peta dan minimap. Selesaikan stage demi stage untuk membuka misi berikutnya dan mendapat hadiah uang.
-4. Uang dipakai untuk upgrade mesin di garasi, beli amunisi dan armour, atau respray mobil untuk menghapus level wanted.
-5. Progres tersimpan otomatis di browser (localStorage), jadi kamu bisa lanjut kapan saja.
+- Open world: ~220 buildings across 10 districts (Downtown, Old Town, Harbor, Marina Bay,
+  Hillcrest, Northside, Southside, Beachfront, Uptown, Industrial), deterministic city
+  (same layout every load, seed 7)
+- 18 missions / 49 stages with REP rewards (+15 per stage, +40 per mission)
+- Driving: steal cars, drift with Space (+$50 per drift), traffic AI, pedestrians
+- Wanted system 0–5 stars, police chases, helicopter at 3+ stars, busted / wasted respawns
+- Combat: pistol with ammo (buy +24 for $50 at the garage), police have health
+- Speedboat at the marina (board with E) and a wooden pier on the water
+- Taxi jobs and package side jobs for extra cash
+- Garage & shop: ammo, respray ($150, clears wanted), engine upgrades, armour
+- Fullscreen map (Tab) with mission list and stats, live minimap, day/night cycle
+- Five synth radio stations (WebAudio, no audio files) and synthesized sound effects
+- Save / Continue via localStorage, pause, title screen
 
-## Kontrol
+## How to play
 
-| Tombol | Aksi |
+Serve the `game/` folder (any static server, e.g. `python3 -m http.server` inside
+`game/`) and open it in a browser, or open `game/index.html` directly. The game is raw
+WebGL with zero dependencies and works offline.
+
+Start a New Game, follow the mission marker (yellow) on the minimap, and earn money and
+REP. Getting busted costs 10% of your cash; getting wasted sends you back to the
+safehouse. Save often — progress is stored in your browser.
+
+## Controls
+
+| Key | Action |
 | --- | --- |
-| W / A / S / D | Jalan / mengemudi (A/D belok saat di mobil) |
-| Shift | Lari |
-| E | Curi / masuk mobil terdekat, naik-turun speedboat di dermaga |
-| F | Pukul / tembak (saat bersenjata), respray di garasi |
-| Spasi | Drift saat mengemudi |
-| Klik mouse | Tembak (saat bersenjata) |
-| 1–4 | Ganti slot senjata |
-| M | Ganti stasiun radio |
-| Tab | Peta fullscreen (POI, daftar misi, statistik) |
-| P | Pause / lanjut |
-| Esc | Tutup peta / pause |
+| W / A / S / D | Move / drive / steer |
+| Shift | Run (on foot) |
+| E | Steal / enter car, board or leave boat |
+| F | Shoot pistol (respray when at the garage) |
+| Space | Drift while driving (hold + steer, speed > 8) |
+| M | Next radio station |
+| Tab | Fullscreen map |
+| P | Pause |
+| G | Garage & shop |
+| Mouse click | Shoot pistol |
 
-## Fitur
+## Tech
 
-- 18 misi / 49 stage di 10 distrik bernama
-- Speedboat yang bisa dikendarai di laut barat dan selatan kota
-- Job taksi dan antar paket
-- Lalu lintas AI, pejalan kaki, polisi dengan HP, dan helikopter AIR-1 di wanted 3+
-- Sistem wanted 0–5, busted dan wasted dengan respawn di safehouse
-- Garasi dan toko: upgrade mesin, respray $150, amunisi, armour
-- Radio 5 stasiun (BAY FM, SUNSET DRIVE, PALM COURT, NIGHT WAVE, TIDE FM)
-- Siklus siang-malam dan efek kabut
-- Peta fullscreen + minimap
-- Save otomatis + Continue
-- Sepenuhnya offline, tanpa request eksternal
+Raw WebGL, plain scripts (no build step, no framework, no external assets). All modules
+attach to the global `window.SB` namespace; game state lives in `SB.G`. Screenshots are
+staged with `?shot=start|play|foot|end`.
 
-## Teknologi
+## License
 
-- WebGL mentah, JavaScript biasa (bukan ES module), tanpa dependensi
-- Kota prosedural deterministik (seed 7)
-- WebAudio synth untuk SFX dan musik radio
-- Node 22 stdlib saja untuk tooling (`main.ts`, `serve.ts`)
-
-## Lisensi
-
-Lihat file `LICENSE`.
+MIT — see `LICENSE`.

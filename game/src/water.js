@@ -1,140 +1,156 @@
-// Sunset Bay — water module (v7, written fresh from SPEC)
-// Sea west (x < -280) and south (z > 280) of the city, with a drivable
-// speedboat moored at the Marina Bay pier.
+// Sunset Bay v8 — water.js (ditulis fresh dari SPEC-v8)
+// Laut di sisi barat (x < -168) & selatan (z > 168) kota + dermaga kayu + speedboat.
 (function () {
   var SB = window.SB = window.SB || {};
+  var SEA_X = -168, SEA_Z = 168; // garis pantai
+  var PIER = { x: -168, z: 120 }; // ujung dermaga di darat
+  var BOAT_START = { x: -182, z: 120, yaw: Math.PI / 2, speed: 0 };
 
-  var SEA_X = -280, SEA_Z = 280;          // shoreline
-  var DOCK = { x: -278, z: 40 };          // land end of the pier
-  var PIER = { x0: -296, z0: 36, x1: -278, z1: 44 };
-  var BOAT_HOME = { x: -292, z: 50, yaw: Math.PI / 2 };
+  var _seaMesh = null, _pierMeshes = [], _boatMesh = null, _t = 0;
+  var _keys = {};
 
-  var keys = {};
-  if (typeof window !== "undefined") {
-    window.addEventListener("keydown", function (e) { keys[e.key.toLowerCase()] = true; });
-    window.addEventListener("keyup", function (e) { keys[e.key.toLowerCase()] = false; });
+  window.addEventListener("keydown", function (e) { _keys[e.code || e.key] = true; });
+  window.addEventListener("keyup", function (e) { _keys[e.code || e.key] = false; });
+
+  function keys() {
+    // Gabung input lokal + input global dari main (SB.G.keys) bila ada.
+    var g = (SB.G && SB.G.keys) || {};
+    var out = {};
+    var k;
+    for (k in _keys) out[k] = _keys[k];
+    for (k in g) out[k] = g[k];
+    return out;
   }
 
-  function quad(x0, z0, x1, z1, y, cr, cg, cb) {
+  // Satu quad datar (2 segitiga) pada y tertentu, warna solid.
+  function flatQuad(x0, z0, x1, z1, y, rgb) {
     var pos = new Float32Array([
       x0, y, z0, x1, y, z0, x1, y, z1,
       x0, y, z0, x1, y, z1, x0, y, z1
     ]);
     var col = new Float32Array(18);
-    var v;
-    for (v = 0; v < 6; v++) { col[v * 3] = cr; col[v * 3 + 1] = cg; col[v * 3 + 2] = cb; }
-    return SB.GL.mesh(pos, col);
+    for (var i = 0; i < 6; i++) { col[i * 3] = rgb[0]; col[i * 3 + 1] = rgb[1]; col[i * 3 + 2] = rgb[2]; }
+    return { pos: pos, col: col };
   }
 
-  function inWater(x, z) {
-    return x < SEA_X + 2 || z > SEA_Z - 2;
-  }
-
-  var Water = {
-    boat: { x: BOAT_HOME.x, z: BOAT_HOME.z, yaw: BOAT_HOME.yaw, speed: 0 },
-    _seaMeshes: null,
-    _pierMesh: null,
-    _boatMesh: null,
-    _time: 0,
-
-    init: function () {
-      this.boat = { x: BOAT_HOME.x, z: BOAT_HOME.z, yaw: BOAT_HOME.yaw, speed: 0 };
-      this._seaMeshes = null;
-      this._pierMesh = null;
-      this._boatMesh = null;
-      this._time = 0;
-    },
-
-    // Board the speedboat when the player stands close to it.
-    boardBoat: function () {
-      var p = SB.G && SB.G.player;
-      if (!p || p.inCar || p.inBoat) return false;
-      var dx = p.x - this.boat.x, dz = p.z - this.boat.z;
-      if (dx * dx + dz * dz > 49) return false; // within 7 units
-      p.inBoat = true;
-      p.inCar = false;
-      p.car = null;
-      if (SB.HUD) SB.HUD.showMessage("Speedboat — W gas, S rem, A/D belok, E turun");
-      return true;
-    },
-
-    // Step off the boat onto the pier / shore.
-    leaveBoat: function () {
-      var p = SB.G && SB.G.player;
-      if (!p || !p.inBoat) return false;
-      p.inBoat = false;
-      this.boat.speed = 0;
-      // Drop the player on the pier if close, else on the nearest shore.
-      if (Math.abs(this.boat.z - 40) < 30 && this.boat.x > -310) {
-        p.x = DOCK.x; p.z = DOCK.z;
-      } else if (this.boat.x < SEA_X) {
-        p.x = SEA_X + 4; p.z = Math.max(-276, Math.min(276, this.boat.z));
-      } else {
-        p.x = Math.max(-276, Math.min(276, this.boat.x)); p.z = SEA_Z - 4;
-      }
-      p.speed = 0;
-      return true;
-    },
-
-    update: function (dt) {
-      this._time += dt;
-      var p = SB.G && SB.G.player;
-      if (!p || !p.inBoat) return;
-      var b = this.boat;
-      // Throttle / brake.
-      if (keys["w"] || keys["arrowup"]) b.speed += 14 * dt;
-      else if (keys["s"] || keys["arrowdown"]) b.speed -= 18 * dt;
-      else b.speed -= Math.sign(b.speed) * 6 * dt;
-      if (b.speed > 26) b.speed = 26;
-      if (b.speed < -6) b.speed = -6;
-      if (Math.abs(b.speed) < 0.2 && !keys["w"] && !keys["s"]) b.speed = 0;
-      // Steering scales with speed.
-      var steer = 0;
-      if (keys["a"] || keys["arrowleft"]) steer += 1;
-      if (keys["d"] || keys["arrowright"]) steer -= 1;
-      b.yaw += steer * 1.5 * dt * Math.min(1, Math.abs(b.speed) / 8);
-      var nx = b.x + Math.sin(b.yaw) * b.speed * dt;
-      var nz = b.z + Math.cos(b.yaw) * b.speed * dt;
-      // Stay in the water: reject moves that beach the boat on land.
-      if (inWater(nx, nz)) { b.x = nx; b.z = nz; }
-      else { b.speed *= 0.4; }
-      // Soft bounds so the boat cannot sail forever.
-      if (b.x < -680) { b.x = -680; b.speed *= 0.5; }
-      if (b.x > SEA_X + 2 && b.z < SEA_Z - 2) { b.x = SEA_X + 2; b.speed *= 0.5; }
-      if (b.z > 680) { b.z = 680; b.speed *= 0.5; }
-      p.x = b.x; p.z = b.z; p.yaw = b.yaw; p.speed = b.speed;
-    },
-
-    draw: function () {
-      if (!SB.GL || !SB.GL.draw) return;
-      if (!this._seaMeshes) {
-        this._seaMeshes = [
-          quad(-700, -700, SEA_X - 2, 700, 0.25, 0.05, 0.32, 0.55),
-          quad(SEA_X - 2, SEA_Z + 2, 700, 700, 0.25, 0.05, 0.32, 0.55),
-          quad(-700, SEA_Z + 2, SEA_X - 2, 700, 0.25, 0.05, 0.32, 0.55)
-        ];
-      }
-      var I = SB.Math3.mat4Identity();
-      var i;
-      for (i = 0; i < this._seaMeshes.length; i++) SB.GL.draw(this._seaMeshes[i], I);
-      // Wooden pier from the Marina Bay shore out to the boat.
-      if (!this._pierMesh) {
-        this._pierMesh = quad(PIER.x0, PIER.z0, PIER.x1, PIER.z1, 0.6, 0.45, 0.32, 0.18);
-      }
-      SB.GL.draw(this._pierMesh, I);
-      // Speedboat, bobbing gently.
-      if (SB.Meshes && SB.Meshes.boat) {
-        if (!this._boatMesh) this._boatMesh = SB.Meshes.boat();
-        var bob = Math.sin(this._time * 1.6) * 0.12;
-        var m = SB.Math3.mat4Mul(
-          // Lambung kapal mulai y=0.1; alas 0.1 menaruhnya pas di air (y=0.25).
-          SB.Math3.mat4Translate(this.boat.x, 0.1 + bob, this.boat.z),
-          SB.Math3.mat4RotateY(this.boat.yaw)
-        );
-        SB.GL.draw(this._boatMesh, m);
-      }
+  function init() {
+    _t = 0;
+    SB.Water.boat.x = BOAT_START.x;
+    SB.Water.boat.z = BOAT_START.z;
+    SB.Water.boat.yaw = BOAT_START.yaw;
+    SB.Water.boat.speed = 0;
+    if (!SB.GL || !SB.GL.mesh) return;
+    // Laut: dua bidang besar (barat + selatan), biru laut.
+    var west = flatQuad(-340, -220, SEA_X, 220, -0.4, [0.05, 0.25, 0.45]);
+    var south = flatQuad(-340, SEA_Z, 220, 340, -0.4, [0.05, 0.28, 0.5]);
+    _seaMesh = [SB.GL.mesh(west.pos, west.col), SB.GL.mesh(south.pos, south.col)];
+    // Dermaga kayu: papan-papan dari darat (x=-168) menjorok ke laut (x=-192).
+    _pierMeshes = [];
+    var M = SB.Math3;
+    for (var i = 0; i < 8; i++) {
+      var px = -170 - i * 3;
+      var plank = flatQuad(px - 1.4, 117, px + 1.4, 123, 0.3, [0.45, 0.3, 0.14]);
+      _pierMeshes.push({ mesh: SB.GL.mesh(plank.pos, plank.col), mat: M.mat4Identity() });
     }
-  };
+    if (SB.Meshes && SB.Meshes.boat) {
+      var b = SB.Meshes.boat();
+      _boatMesh = SB.GL.mesh(b.pos, b.col);
+    }
+  }
 
-  SB.Water = Water;
+  function inBoat() { return !!(SB.G && SB.G.player && SB.G.player.inBoat); }
+
+  function nearBoatOrPier(px, pz) {
+    var b = SB.Water.boat;
+    var dBoat = Math.hypot(px - b.x, pz - b.z);
+    var dPier = Math.hypot(px - (PIER.x - 22), pz - PIER.z);
+    return Math.min(dBoat, dPier) < 7;
+  }
+
+  function boardBoat() {
+    if (!SB.G || !SB.G.player) return false;
+    if (SB.G.player.inCar) return false;
+    var p = SB.G.player;
+    if (!nearBoatOrPier(p.x, p.z)) return false;
+    p.inBoat = true;
+    p.x = SB.Water.boat.x;
+    p.z = SB.Water.boat.z;
+    if (SB.HUD && SB.HUD.showMessage) SB.HUD.showMessage("Speedboat — W gas, S rem, A/D belok, E turun");
+    return true;
+  }
+
+  function leaveBoat() {
+    if (!SB.G || !SB.G.player) return false;
+    var p = SB.G.player;
+    if (!p.inBoat) return false;
+    p.inBoat = false;
+    SB.Water.boat.speed = 0;
+    // Turun di ujung dermaga (darat).
+    var spot = { x: PIER.x - 22, z: PIER.z + 5 };
+    if (SB.City && SB.City.findClearSpot) spot = SB.City.findClearSpot(PIER.x - 20, PIER.z + 5, 2);
+    p.x = spot.x; p.z = spot.z;
+    return true;
+  }
+
+  function update(dt) {
+    _t += dt;
+    var b = SB.Water.boat;
+    if (!inBoat()) {
+      // Kapal diam mengapung di dermaga; animasi ombak kecil via _t saja.
+      return;
+    }
+    var k = keys();
+    var fwd = (k["KeyW"] || k["ArrowUp"]) ? 1 : 0;
+    var back = (k["KeyS"] || k["ArrowDown"]) ? 1 : 0;
+    var left = (k["KeyA"] || k["ArrowLeft"]) ? 1 : 0;
+    var right = (k["KeyD"] || k["ArrowRight"]) ? 1 : 0;
+    if (fwd) b.speed += 14 * dt;
+    if (back) b.speed -= 10 * dt;
+    if (!fwd && !back) b.speed *= Math.max(0, 1 - 0.8 * dt);
+    b.speed = Math.max(-6, Math.min(20, b.speed));
+    var steer = (left ? 1 : 0) - (right ? 1 : 0);
+    b.yaw += steer * 1.4 * dt * Math.min(1, Math.abs(b.speed) / 6) * (b.speed < 0 ? -1 : 1);
+    b.x += Math.sin(b.yaw) * b.speed * dt;
+    b.z += Math.cos(b.yaw) * b.speed * dt;
+    // Jaga kapal tetap di laut (barat x<-170 atau selatan z>170), jangan naik darat.
+    if (b.x > -172 && b.z < 172) {
+      if (Math.abs(b.x + 172) < Math.abs(b.z - 172)) b.x = -172; else b.z = 172;
+      b.speed *= 0.4;
+    }
+    b.x = Math.max(-330, Math.min(-172, b.x));
+    b.z = Math.max(-210, Math.min(330, b.z));
+    var p = SB.G.player;
+    p.x = b.x; p.z = b.z; p.yaw = b.yaw; p.speed = Math.abs(b.speed);
+    if (SB.G) SB.G.dist += Math.abs(b.speed) * dt;
+  }
+
+  function draw() {
+    if (!SB.GL || !SB.GL.draw || !SB.Math3) return;
+    var M = SB.Math3, I = M.mat4Identity();
+    var i;
+    if (_seaMesh) for (i = 0; i < _seaMesh.length; i++) SB.GL.draw(_seaMesh[i], I);
+    for (i = 0; i < _pierMeshes.length; i++) SB.GL.draw(_pierMeshes[i].mesh, _pierMeshes[i].mat);
+    // Kapal: goyang ombak kecil + posisi/yaw saat ini.
+    var b = SB.Water.boat;
+    var bobY = 0.1 + Math.sin(_t * 1.8) * 0.12;
+    var mat = M.mat4Mul(M.mat4Translate(b.x, bobY, b.z), M.mat4RotateY(b.yaw));
+    if (_boatMesh) {
+      SB.GL.draw(_boatMesh, mat);
+    } else if (SB.Meshes && SB.Meshes.box) {
+      var hull = SB.Meshes.box(3, 1, 7);
+      SB.GL.draw(SB.GL.mesh(hull.pos, hull.col), mat);
+    }
+  }
+
+  SB.Water = {
+    boat: { x: BOAT_START.x, z: BOAT_START.z, yaw: BOAT_START.yaw, speed: 0 },
+    pier: { x: PIER.x, z: PIER.z },
+    seaX: SEA_X,
+    seaZ: SEA_Z,
+    init: init,
+    update: update,
+    draw: draw,
+    boardBoat: boardBoat,
+    leaveBoat: leaveBoat
+  };
 })();

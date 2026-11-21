@@ -1,62 +1,92 @@
+// Sunset Bay v8 — player.js
+// Gerakan pemain jalan kaki: W/A/S/D, lari Shift (12 u/s), putar A/D (yaw).
+// Menempel ke namespace global window.SB. State di SB.G.
 (function () {
-  "use strict";
-  var SB = window.SB = window.SB || {};
-  var WALK = 4, RUN = 12, TURN = 2.8, RADIUS = 0.7;
+  'use strict';
 
-  function G() { return SB.G; }
+  var WALK_SPEED = 5;    // unit/detik jalan biasa
+  var RUN_SPEED = 12;    // unit/detik lari (Shift)
+  var TURN_SPEED = 2.6;  // radian/detik putar A/D
+  var PLAYER_RADIUS = 0.6; // margin tabrakan dengan bangunan
 
-  function key(input, names) {
-    if (!input) return false;
-    for (var i = 0; i < names.length; i++) {
-      if (input[names[i]]) return true;
+  function G() { return window.SB.G; }
+
+  // Cek apakah titik (x,z) bertabrakan dengan bangunan (dengan margin).
+  function hitsBuilding(x, z) {
+    var city = window.SB.City;
+    if (!city || !city.buildings) return false;
+    var blds = city.buildings;
+    for (var i = 0; i < blds.length; i++) {
+      var b = blds[i];
+      var hw = (b.w || 10) / 2 + PLAYER_RADIUS;
+      var hd = (b.d || 10) / 2 + PLAYER_RADIUS;
+      if (Math.abs(x - b.x) < hw && Math.abs(z - b.z) < hd) return true;
     }
     return false;
   }
 
-  // True when point (x,z) would clip a building (AABB + player radius).
-  function blocked(x, z) {
-    var C = SB.City;
-    if (!C || !C.buildings) return false;
-    var b = C.buildings;
-    for (var i = 0; i < b.length; i++) {
-      var hw = (b[i].w || 10) / 2 + RADIUS;
-      var hd = (b[i].d || 10) / 2 + RADIUS;
-      if (Math.abs(x - b[i].x) < hw && Math.abs(z - b[i].z) < hd) return true;
+  // Coba pindah ke (nx, nz); bila tertabrak, coba geser per sumbu (slide).
+  function tryMove(p, nx, nz) {
+    if (!hitsBuilding(nx, nz)) {
+      p.x = nx; p.z = nz;
+      return true;
+    }
+    if (!hitsBuilding(nx, p.z)) {
+      p.x = nx;
+      return true;
+    }
+    if (!hitsBuilding(p.x, nz)) {
+      p.z = nz;
+      return true;
     }
     return false;
   }
 
-  SB.Player = {
-    // input: booleans under any of these aliases:
-    // forward: up/w/forward | back: down/s/back
-    // turn: left/a/turnLeft | right/d/turnRight | run: run/shift
+  window.SB.Player = {
     update: function (dt, input) {
       var g = G();
       if (!g || !g.player) return;
       var p = g.player;
-      if (p.inCar) { p.speed = 0; return; }
-      // Naik speedboat: flag-nya SB.G.player.inBoat (dipakai Water);
-      // SB.Water.riding tidak pernah ada — cek itu membuat pemain tetap
-      // jalan kaki selagi di kapal.
-      if (p.inBoat) { p.speed = 0; return; }
-      var fwd = key(input, ["up", "w", "forward", "W"]);
-      var back = key(input, ["down", "s", "back", "S"]);
-      var left = key(input, ["left", "a", "turnLeft", "A"]);
-      var right = key(input, ["right", "d", "turnRight", "D"]);
-      var run = key(input, ["run", "shift", "Shift"]);
-      if (left) p.yaw += TURN * dt;
-      if (right) p.yaw -= TURN * dt;
-      var sp = 0;
-      if (fwd) sp = run ? RUN : WALK;
-      else if (back) sp = -(run ? RUN : WALK) * 0.6;
-      var nx = p.x + Math.sin(p.yaw) * sp * dt;
-      var nz = p.z + Math.cos(p.yaw) * sp * dt;
-      // Move axis by axis so the player slides along walls instead of sticking.
-      if (!blocked(nx, p.z)) p.x = nx;
-      if (!blocked(p.x, nz)) p.z = nz;
-      p.speed = Math.abs(sp);
-      if (sp !== 0) g.dist = (g.dist || 0) + Math.abs(sp) * dt;
+      if (p.inCar) return; // sedang menyetir: kendaraan yang menggerakkan pemain
+      if (!input) input = {};
+
+      // Putar dengan A / D (yaw).
+      if (input.left) p.yaw += TURN_SPEED * dt;
+      if (input.right) p.yaw -= TURN_SPEED * dt;
+
+      var speed = input.run ? RUN_SPEED : WALK_SPEED;
+      var mx = 0, mz = 0;
+      // Maju/mundur relatif terhadap arah hadap (yaw).
+      var fx = Math.sin(p.yaw), fz = Math.cos(p.yaw);
+      if (input.forward) { mx += fx; mz += fz; }
+      if (input.back) { mx -= fx; mz -= fz; }
+      // Strafe kiri/kanan (bila input menyediakan).
+      if (input.strafeLeft) { mx += fz; mz -= fx; }
+      if (input.strafeRight) { mx -= fz; mz += fx; }
+
+      var len = Math.sqrt(mx * mx + mz * mz);
+      if (len > 0) {
+        mx /= len; mz /= len;
+        var nx = p.x + mx * speed * dt;
+        var nz = p.z + mz * speed * dt;
+        var ox = p.x, oz = p.z;
+        tryMove(p, nx, nz);
+        // Jarak jalan kaki total (untuk statistik).
+        var moved = Math.sqrt((p.x - ox) * (p.x - ox) + (p.z - oz) * (p.z - oz));
+        g.dist = (g.dist || 0) + moved;
+        p.speed = moved / Math.max(dt, 0.0001);
+      } else {
+        p.speed = 0;
+      }
+
+      // Jaga pemain tetap di dalam batas kota (radius aman 260 unit).
+      var r = Math.sqrt(p.x * p.x + p.z * p.z);
+      if (r > 260) {
+        p.x *= 260 / r;
+        p.z *= 260 / r;
+      }
     },
+
     pos: function () {
       var g = G();
       if (!g || !g.player) return { x: 0, z: 0 };

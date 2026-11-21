@@ -1,102 +1,21 @@
-// Sunset Bay — HUD (ditulis fresh untuk v7, dari SPEC)
-// SB.HUD: uang, bintang wanted, jam, kecepatan, nama kendaraan, radio,
-// misi aktif, minimap canvas 2D, peta fullscreen (Tab), pause (P),
-// crosshair saat senjata Pistol.
+// Sunset Bay — HUD (v8, written fresh from SPEC-v8)
+// window.SB.HUD: { update, draw, showMessage }
+// DOM HUD + minimap (canvas 2D) + fullscreen map (Tab) + pause (P) + crosshair.
 (function () {
   'use strict';
   var SB = window.SB = window.SB || {};
+  var G = function () { return SB.G; };
 
-  var root = null, moneyEl, wantedEl, clockEl, speedEl, vehEl, radioEl,
-      missionEl, mini, mctx, mapOv, mapCanvas, pauseOv, cross, toastEl,
-      toastTimer = null;
+  var msgTimer = null;
   var mapOpen = false;
-  var WORLD = 340; // setengah lebar dunia untuk skala peta
+  var paused = false;
 
   function $(id) { return document.getElementById(id); }
 
-  function mk(tag, id, parent, css) {
-    var e = document.createElement(tag);
-    if (id) e.id = id;
-    if (css) e.style.cssText = css;
-    if (parent) parent.appendChild(e);
-    return e;
-  }
-
-  function ensure() {
-    if (root) return;
-    root = mk('div', 'hud', document.body,
-      'position:fixed;inset:0;pointer-events:none;z-index:20;' +
-      'font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#fff;');
-    var tl = mk('div', null, root,
-      'position:absolute;top:10px;left:12px;text-shadow:0 1px 3px #000;');
-    moneyEl = mk('div', 'hud-money', tl,
-      'font-size:22px;font-weight:700;color:#7CFC9A;');
-    wantedEl = mk('div', 'hud-wanted', tl,
-      'font-size:18px;letter-spacing:2px;color:#FFD23F;margin-top:2px;');
-    clockEl = mk('div', 'hud-clock', tl, 'font-size:14px;opacity:.92;');
-    var tr = mk('div', null, root,
-      'position:absolute;top:10px;right:12px;text-align:right;' +
-      'text-shadow:0 1px 3px #000;');
-    speedEl = mk('div', 'hud-speed', tr, 'font-size:26px;font-weight:700;');
-    vehEl = mk('div', 'hud-veh', tr, 'font-size:13px;opacity:.92;');
-    radioEl = mk('div', 'hud-radio', tr, 'font-size:13px;color:#8FD3FF;');
-    var bl = mk('div', null, root,
-      'position:absolute;left:12px;bottom:12px;max-width:48vw;' +
-      'text-shadow:0 1px 3px #000;');
-    missionEl = mk('div', 'hud-mission', bl,
-      'font-size:14px;background:rgba(0,0,0,.45);padding:6px 9px;' +
-      'border-radius:6px;border-left:3px solid #FFD23F;');
-    mini = mk('canvas', 'minimap', root,
-      'position:absolute;right:12px;bottom:12px;width:150px;height:150px;' +
-      'border:2px solid rgba(255,255,255,.5);border-radius:8px;' +
-      'background:rgba(10,20,30,.85);');
-    mini.width = 150; mini.height = 150;
-    mctx = mini.getContext('2d');
-    cross = mk('div', 'crosshair', root,
-      'position:absolute;left:50%;top:50%;width:22px;height:22px;' +
-      'margin:-11px 0 0 -11px;display:none;');
-    cross.innerHTML =
-      '<div style="position:absolute;left:10px;top:0;width:2px;height:22px;' +
-      'background:#fff;box-shadow:0 0 2px #000"></div>' +
-      '<div style="position:absolute;top:10px;left:0;width:22px;height:2px;' +
-      'background:#fff;box-shadow:0 0 2px #000"></div>';
-    toastEl = mk('div', 'hud-toast', root,
-      'position:absolute;left:50%;top:18%;transform:translateX(-50%);' +
-      'background:rgba(0,0,0,.65);padding:8px 16px;border-radius:20px;' +
-      'font-size:15px;display:none;white-space:nowrap;');
-    pauseOv = mk('div', 'pause-overlay', document.body,
-      'position:fixed;inset:0;display:none;align-items:center;' +
-      'justify-content:center;background:rgba(0,0,0,.55);color:#fff;' +
-      'font-size:32px;font-weight:700;z-index:40;' +
-      'font-family:system-ui,sans-serif;text-align:center;');
-    pauseOv.textContent = 'PAUSED — tekan P untuk lanjut';
-    mapOv = mk('div', 'map-overlay', document.body,
-      'position:fixed;inset:0;display:none;background:rgba(5,12,20,.94);' +
-      'color:#fff;z-index:30;font-family:system-ui,sans-serif;overflow:auto;');
-    mapOv.innerHTML =
-      '<div style="max-width:920px;margin:24px auto;padding:0 16px;">' +
-      '<h2 style="margin:0 0 4px">PETA SUNSET BAY ' +
-      '<span style="font-size:13px;color:#8FD3FF">— Tab untuk menutup</span></h2>' +
-      '<div style="display:flex;gap:16px;flex-wrap:wrap">' +
-      '<canvas id="bigmap" width="560" height="560" ' +
-      'style="border:2px solid #445;background:#0A1420;border-radius:8px">' +
-      '</canvas>' +
-      '<div style="flex:1;min-width:250px">' +
-      '<h3 style="margin:6px 0">Legenda POI</h3>' +
-      '<div id="map-legend" style="font-size:14px;line-height:1.9"></div>' +
-      '<h3 style="margin:14px 0 6px">Misi</h3>' +
-      '<div id="map-missions" style="font-size:13px;line-height:1.7"></div>' +
-      '<h3 style="margin:14px 0 6px">Statistik</h3>' +
-      '<div id="map-stats" style="font-size:13px;line-height:1.7"></div>' +
-      '</div></div></div>';
-    mapCanvas = $('bigmap');
-  }
-
   function fmtClock(h) {
     var hh = Math.floor(h) % 24;
-    var mm = Math.floor((h % 1) * 60);
-    return (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm +
-      (hh >= 6 && hh < 18 ? ' ☀' : ' ☾');
+    var mm = Math.floor((h - Math.floor(h)) * 60);
+    return (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm;
   }
 
   function stars(n) {
@@ -105,219 +24,243 @@
     return s;
   }
 
-  function missionInfo() {
-    var G = SB.G;
-    var ms = SB.Game && SB.Game.MISSIONS;
-    if (!ms || !ms[G.mission]) return { name: '—', text: 'Tidak ada misi aktif' };
-    var m = ms[G.mission];
-    var st = m.stages[G.missionStage] || m.stages[0];
-    return { name: m.name, text: st ? st.text : '' };
+  function missionText() {
+    var g = G();
+    var M = SB.Game && SB.Game.MISSIONS;
+    if (!M || !M[g.mission]) return 'Free roam';
+    var m = M[g.mission];
+    var st = m.stages && m.stages[g.missionStage];
+    return m.name + (st ? ' — ' + st.text : '');
   }
 
-  function drawMapInto(ctx, size) {
-    var G = SB.G;
-    var sc = size / (WORLD * 2);
-    function X(x) { return (x + WORLD) * sc; }
-    function Z(z) { return (z + WORLD) * sc; }
-    ctx.clearRect(0, 0, size, size);
-    // laut di barat + selatan
-    ctx.fillStyle = '#0B2A4A';
-    ctx.fillRect(0, 0, size, size);
-    // daratan
-    ctx.fillStyle = '#1E3325';
-    ctx.fillRect(X(-WORLD), Z(-WORLD), size, size * 0.92);
-    ctx.fillStyle = '#274A33';
-    ctx.fillRect(X(-WORLD), Z(-WORLD), size, size * 0.92);
-    // jalan utama (grid)
-    ctx.strokeStyle = '#3A3A3A';
-    ctx.lineWidth = Math.max(2, size / 90);
-    var roads = (SB.City && SB.City.roads) || [];
-    for (var i = 0; i < roads.length; i++) {
-      var r = roads[i];
-      ctx.beginPath();
-      ctx.moveTo(X(r.x1 !== undefined ? r.x1 : r.x), Z(r.z1 !== undefined ? r.z1 : r.z));
-      ctx.lineTo(X(r.x2 !== undefined ? r.x2 : r.x), Z(r.z2 !== undefined ? r.z2 : r.z));
-      ctx.stroke();
-    }
-    if (!roads.length) {
-      for (var g = -300; g <= 300; g += 60) {
-        ctx.beginPath(); ctx.moveTo(X(g), Z(-300)); ctx.lineTo(X(g), Z(300)); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(X(-300), Z(g)); ctx.lineTo(X(300), Z(g)); ctx.stroke();
-      }
-    }
-    // bangunan
-    var bs = (SB.City && SB.City.buildings) || [];
-    ctx.fillStyle = '#8A93A3';
-    for (var b = 0; b < bs.length; b++) {
-      var bd = bs[b];
-      ctx.fillRect(X(bd.x - bd.w / 2), Z(bd.z - bd.d / 2),
-        Math.max(1, bd.w * sc), Math.max(1, bd.d * sc));
-    }
-    // dermaga / marina (barat)
-    ctx.fillStyle = '#C9A227';
-    ctx.fillRect(X(-WORLD), Z(-40), 10 * sc + 6, 80 * sc);
-    // safehouse
-    ctx.fillStyle = '#7CFC9A';
-    ctx.beginPath(); ctx.arc(X(0), Z(0), 5, 0, 6.2832); ctx.fill();
-    // target misi aktif
-    var mi = missionInfo();
-    var ms = SB.Game && SB.Game.MISSIONS;
-    if (ms && ms[G.mission]) {
-      var st = ms[G.mission].stages[G.missionStage];
-      if (st && st.target) {
-        ctx.fillStyle = '#FFD23F';
-        ctx.beginPath(); ctx.arc(X(st.target.x), Z(st.target.z), 7, 0, 6.2832); ctx.fill();
-        ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke();
-      }
-    }
-    // polisi
-    ctx.fillStyle = '#FF4444';
-    var pol = G.police || [];
-    for (var p = 0; p < pol.length; p++) {
-      ctx.beginPath(); ctx.arc(X(pol[p].x), Z(pol[p].z), 3.5, 0, 6.2832); ctx.fill();
-    }
-    // heli
-    if (G.heli) {
-      ctx.fillStyle = '#FF8888';
-      ctx.beginPath(); ctx.arc(X(G.heli.x), Z(G.heli.z), 5, 0, 6.2832); ctx.fill();
-    }
-    // pemain (panah)
-    var px = X(G.player.x), pz = Z(G.player.z);
-    ctx.save();
-    ctx.translate(px, pz);
-    ctx.rotate(-G.player.yaw);
-    ctx.fillStyle = '#FFFFFF';
-    ctx.beginPath();
-    ctx.moveTo(0, -8); ctx.lineTo(6, 6); ctx.lineTo(-6, 6); ctx.closePath(); ctx.fill();
-    ctx.restore();
-    return mi;
+  function vehicleName() {
+    var g = G();
+    if (!g.player) return '';
+    if (g.player.inCar && g.player.car) return g.player.car.name || 'Car';
+    if (g.player.inBoat) return 'Speedboat';
+    return 'On foot';
   }
 
-  function fillMapPanel() {
-    var G = SB.G;
-    var lg = $('map-legend');
-    if (lg) {
-      lg.innerHTML =
-        '<span style="color:#fff">▲</span> Kamu &nbsp; ' +
-        '<span style="color:#FFD23F">●</span> Target misi &nbsp; ' +
-        '<span style="color:#FF4444">●</span> Polisi<br>' +
-        '<span style="color:#7CFC9A">●</span> Safehouse &nbsp; ' +
-        '<span style="color:#C9A227">■</span> Dermaga / Marina &nbsp; ' +
-        '<span style="color:#FF8888">●</span> Heli AIR-1<br>' +
-        '<span style="color:#8A93A3">■</span> Bangunan &nbsp; ' +
-        '<span style="color:#3A3A3A">—</span> Jalan';
-    }
-    var mm = $('map-missions');
-    var ms = SB.Game && SB.Game.MISSIONS;
-    if (mm && ms) {
-      var html = '';
-      for (var i = 0; i < ms.length; i++) {
-        var mark = i < G.mission ? '✓' : (i === G.mission ? '▶' : '·');
-        var col = i < G.mission ? '#7CFC9A' : (i === G.mission ? '#FFD23F' : '#AAA');
-        html += '<div style="color:' + col + '">' + mark + ' ' + (i + 1) +
-          '. ' + ms[i].name + '</div>';
-      }
-      mm.innerHTML = html;
-    }
-    var st = $('map-stats');
-    if (st) {
-      var dist = SB.City && SB.City.districtAt ?
-        SB.City.districtAt(G.player.x, G.player.z) : '—';
-      st.innerHTML =
-        'Uang: $' + G.money + '<br>' +
-        'Reputasi: ' + G.rep + '<br>' +
-        'Wanted: ' + stars(G.wanted) + '<br>' +
-        'Jam: ' + fmtClock(G.clock) + '<br>' +
-        'Distrik: ' + dist + '<br>' +
-        'Jarak jalan kaki: ' + Math.round(G.dist) + ' m<br>' +
-        'Drift: ' + G.drifts + ' &nbsp; Busted: ' + G.busted + '<br>' +
-        'Misi: ' + (G.mission + 1) + ' / ' + (ms ? ms.length : 18);
-    }
+  function currentWeapon() {
+    var g = G();
+    return g.weapon || g.currentWeapon ||
+      (g.weapons && g.weapons[g.weaponSlot || 0] && g.weapons[g.weaponSlot || 0].name) || '';
   }
 
-  SB.HUD = {
+  var HUD = {
     mapOpen: false,
+    paused: false,
 
     update: function () {
-      ensure();
-      var G = SB.G;
-      if (!G) return;
-      moneyEl.textContent = '$' + G.money;
-      wantedEl.textContent = stars(G.wanted);
-      clockEl.textContent = fmtClock(G.clock) +
-        '  ·  ' + (SB.City && SB.City.districtAt ?
-          SB.City.districtAt(G.player.x, G.player.z) : '');
-      var kmh = Math.round((G.player.speed || 0) * 3.6);
-      speedEl.textContent = (G.player.inCar || G.player.inBoat) ? kmh + ' km/h' : '';
-      var car = G.player.car;
-      vehEl.textContent = G.player.inBoat ? 'Speedboat' :
-        (G.player.inCar ? (car && (car.name || car.model) || 'Mobil') : 'Jalan kaki');
-      radioEl.textContent = '♪ ' + (SB.Audio ? SB.Audio.stationName() : '—');
-      var mi = missionInfo();
-      missionEl.innerHTML = '<b>Misi ' + (G.mission + 1) + ': ' + mi.name + '</b><br>' + mi.text;
-      // crosshair hanya saat Pistol
-      var w = G.weapon || (SB.Game && SB.Game.weapon);
-      cross.style.display = (w === 'Pistol' && !G.player.inCar) ? 'block' : 'none';
-      if (mapOpen) fillMapPanel();
+      var g = G();
+      if (!g) return;
+      var set = function (id, txt) { var el = $(id); if (el) el.textContent = txt; };
+      set('hud-money', '$' + Math.floor(g.money || 0));
+      set('hud-rep', 'REP ' + Math.floor(g.rep || 0));
+      set('hud-drifts', 'Drifts ' + (g.drifts || 0));
+      set('hud-wanted', stars(g.wanted || 0));
+      set('hud-clock', fmtClock(g.clock == null ? 18 : g.clock));
+      var spd = g.player ? Math.round(Math.abs(g.player.speed || 0) * 3.6) : 0;
+      set('hud-speed', spd + ' km/h');
+      set('hud-vehicle', vehicleName());
+      set('hud-mission', missionText());
+      var st = SB.Audio && SB.Audio.stations ? SB.Audio.stations[SB.Audio.station || 0] : '';
+      set('hud-radio', st ? '♪ ' + st : '');
+      var dist = g.district || (SB.City && SB.City.districtAt && g.player
+        ? SB.City.districtAt(g.player.x, g.player.z) : '');
+      set('hud-district', dist || '');
+      // crosshair only when Pistol equipped (weapon disimpan lowercase 'pistol')
+      var ch = $('crosshair');
+      if (ch) {
+        var w = currentWeapon();
+        ch.style.display = (w === 'Pistol' || w === 'pistol') ? 'block' : 'none';
+      }
+      // pause overlay
+      var pv = $('pause');
+      if (pv) pv.style.display = paused ? 'flex' : 'none';
+      var mv = $('map');
+      if (mv) mv.style.display = mapOpen ? 'flex' : 'none';
+      if (mapOpen) HUD.drawMap();
     },
 
     draw: function () {
-      ensure();
-      var G = SB.G;
-      if (!G || !mctx) return;
-      drawMapInto(mctx, 150);
-      if (mapOpen && mapCanvas) {
-        var c2 = mapCanvas.getContext('2d');
-        if (c2) drawMapInto(c2, 560);
+      // minimap (small 2D canvas)
+      var cv = $('minimap');
+      if (!cv) return;
+      var ctx = cv.getContext('2d');
+      if (!ctx) return;
+      var W = cv.width, H = cv.height;
+      var g = G();
+      ctx.fillStyle = '#0d2733';
+      ctx.fillRect(0, 0, W, H);
+      var range = 220; // world units visible
+      var px = g.player ? g.player.x : 0;
+      var pz = g.player ? g.player.z : 0;
+      function toMap(x, z) {
+        return [W / 2 + (x - px) / range * W / 2, H / 2 + (z - pz) / range * H / 2];
+      }
+      // water (west + south edges)
+      ctx.fillStyle = '#14506e';
+      ctx.fillRect(0, 0, W * 0.08, H);
+      ctx.fillRect(0, H * 0.92, W, H * 0.08);
+      // buildings
+      if (SB.City && SB.City.buildings) {
+        ctx.fillStyle = '#3a4a55';
+        for (var i = 0; i < SB.City.buildings.length; i++) {
+          var b = SB.City.buildings[i];
+          var p = toMap(b.x, b.z);
+          if (p[0] < -4 || p[0] > W + 4 || p[1] < -4 || p[1] > H + 4) continue;
+          ctx.fillRect(p[0] - 1.5, p[1] - 1.5, 3, 3);
+        }
+      }
+      // mission target
+      var M = SB.Game && SB.Game.MISSIONS;
+      if (M && M[g.mission] && M[g.mission].stages && M[g.mission].stages[g.missionStage]) {
+        var t = M[g.mission].stages[g.missionStage].target;
+        if (t) {
+          var tp = toMap(t.x, t.z);
+          ctx.fillStyle = '#ffd23f';
+          ctx.beginPath(); ctx.arc(tp[0], tp[1], 5, 0, Math.PI * 2); ctx.fill();
+          ctx.strokeStyle = '#000'; ctx.stroke();
+        }
+      }
+      // police
+      if (g.police) {
+        ctx.fillStyle = '#ff4757';
+        for (var j = 0; j < g.police.length; j++) {
+          var pp = toMap(g.police[j].x, g.police[j].z);
+          ctx.beginPath(); ctx.arc(pp[0], pp[1], 3, 0, Math.PI * 2); ctx.fill();
+        }
+      }
+      // player arrow
+      ctx.save();
+      ctx.translate(W / 2, H / 2);
+      ctx.rotate(-(g.player ? g.player.yaw || 0 : 0));
+      ctx.fillStyle = '#2ed573';
+      ctx.beginPath(); ctx.moveTo(0, -6); ctx.lineTo(4, 5); ctx.lineTo(-4, 5); ctx.closePath(); ctx.fill();
+      ctx.restore();
+      // north marker
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 10px sans-serif'; ctx.fillText('N', W - 12, 12);
+    },
+
+    drawMap: function () {
+      var cv = $('mapCanvas');
+      if (!cv) return;
+      var ctx = cv.getContext('2d');
+      if (!ctx) return;
+      var W = cv.width, H = cv.height;
+      var g = G();
+      ctx.fillStyle = '#0a1a24';
+      ctx.fillRect(0, 0, W, H);
+      // water west + south
+      ctx.fillStyle = '#14506e';
+      ctx.fillRect(0, 0, W * 0.10, H);
+      ctx.fillRect(0, H * 0.90, W, H * 0.10);
+      // city bounds: assume world ~ -260..260
+      function toMap(x, z) {
+        return [(x + 260) / 520 * W, (z + 260) / 520 * H];
+      }
+      // district labels
+      var names = (SB.City && SB.City.districts) || [];
+      ctx.fillStyle = 'rgba(255,255,255,0.55)';
+      ctx.font = '11px sans-serif';
+      for (var d = 0; d < names.length; d++) {
+        var gx = (d % 5) * (W / 5) + 10;
+        var gy = Math.floor(d / 5) * (H / 2) + 20;
+        ctx.fillText(names[d], gx, gy);
+      }
+      // buildings
+      if (SB.City && SB.City.buildings) {
+        ctx.fillStyle = '#5a7180';
+        for (var i = 0; i < SB.City.buildings.length; i++) {
+          var b = SB.City.buildings[i];
+          var p = toMap(b.x, b.z);
+          ctx.fillRect(p[0] - 2, p[1] - 2, 4, 4);
+        }
+      }
+      // POI markers: safehouse, garage, marina, beach
+      var pois = [
+        { x: 0, z: 0, label: 'Safehouse', color: '#2ed573' },
+        { x: 120, z: -80, label: 'Garage', color: '#ffa502' },
+        { x: -240, z: 60, label: 'Marina', color: '#70a1ff' },
+        { x: -180, z: 220, label: 'Beach', color: '#eccc68' }
+      ];
+      ctx.font = 'bold 12px sans-serif';
+      for (var k = 0; k < pois.length; k++) {
+        var q = toMap(pois[k].x, pois[k].z);
+        ctx.fillStyle = pois[k].color;
+        ctx.beginPath(); ctx.arc(q[0], q[1], 6, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.fillText(pois[k].label, q[0] + 9, q[1] + 4);
+      }
+      // mission target
+      var M = SB.Game && SB.Game.MISSIONS;
+      if (M && M[g.mission] && M[g.mission].stages && M[g.mission].stages[g.missionStage]) {
+        var t = M[g.mission].stages[g.missionStage].target;
+        if (t) {
+          var tp = toMap(t.x, t.z);
+          ctx.fillStyle = '#ffd23f';
+          ctx.beginPath(); ctx.arc(tp[0], tp[1], 9, 0, Math.PI * 2); ctx.fill();
+          ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke(); ctx.lineWidth = 1;
+        }
+      }
+      // player
+      if (g.player) {
+        var pp = toMap(g.player.x, g.player.z);
+        ctx.fillStyle = '#2ed573';
+        ctx.beginPath(); ctx.arc(pp[0], pp[1], 6, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.stroke();
+      }
+      // mission list (DOM)
+      var ml = $('map-missions');
+      if (ml && M) {
+        var html = '';
+        for (var m = 0; m < M.length; m++) {
+          var done = m < g.mission;
+          var cur = m === g.mission;
+          html += '<div style="color:' + (cur ? '#ffd23f' : done ? '#2ed573' : '#aaa') + '">' +
+            (cur ? '▶ ' : done ? '✓ ' : '') + (m + 1) + '. ' + M[m].name + '</div>';
+        }
+        ml.innerHTML = html;
+      }
+      var st = $('map-stats');
+      if (st) {
+        st.textContent = 'Money $' + Math.floor(g.money || 0) +
+          '  •  REP ' + Math.floor(g.rep || 0) +
+          '  •  Drifts ' + (g.drifts || 0) +
+          '  •  Wanted ' + (g.wanted || 0) + '★' +
+          '  •  Walked ' + Math.floor(g.dist || 0) + ' m' +
+          '  •  Busted ' + (g.busted || 0) + '×' +
+          '  •  Time ' + fmtClock(g.clock == null ? 18 : g.clock);
       }
     },
 
-    showMessage: function (t) {
-      ensure();
-      toastEl.textContent = t;
-      toastEl.style.display = 'block';
-      if (toastTimer) clearTimeout(toastTimer);
-      toastTimer = setTimeout(function () { toastEl.style.display = 'none'; }, 3200);
-    },
-
     toggleMap: function () {
-      ensure();
       mapOpen = !mapOpen;
-      SB.HUD.mapOpen = mapOpen;
-      mapOv.style.display = mapOpen ? 'block' : 'none';
-      if (mapOpen) { fillMapPanel(); SB.HUD.draw(); }
-    },
-
-    openMap: function () {
-      ensure();
-      mapOpen = true;
-      SB.HUD.mapOpen = true;
-      mapOv.style.display = 'block';
-      fillMapPanel();
-      SB.HUD.draw();
-    },
-
-    closeMap: function () {
-      ensure();
-      mapOpen = false;
-      SB.HUD.mapOpen = false;
-      mapOv.style.display = 'none';
+      HUD.mapOpen = mapOpen;
+      HUD.update();
     },
 
     togglePause: function () {
-      ensure();
-      var G = SB.G;
-      if (!G) return;
-      G.paused = !G.paused; // P membekukan clock (loop utama cek flag ini)
-      pauseOv.style.display = G.paused ? 'flex' : 'none';
+      paused = !paused;
+      HUD.paused = paused;
+      var g = G();
+      if (g) g.paused = paused;
+      HUD.update();
     },
 
-    setPaused: function (b) {
-      ensure();
-      var G = SB.G;
-      if (!G) return;
-      G.paused = !!b;
-      pauseOv.style.display = G.paused ? 'flex' : 'none';
+    isPaused: function () { return paused; },
+    isMapOpen: function () { return mapOpen; },
+
+    showMessage: function (t) {
+      var el = $('hud-message');
+      if (!el) return;
+      el.textContent = t;
+      el.style.opacity = '1';
+      if (msgTimer) clearTimeout(msgTimer);
+      msgTimer = setTimeout(function () { el.style.opacity = '0'; }, 2600);
     }
   };
+
+  SB.HUD = HUD;
 })();

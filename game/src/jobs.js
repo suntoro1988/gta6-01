@@ -1,110 +1,141 @@
+// Sunset Bay v8 — jobs.js
+// Side jobs: taksi (antar penumpang) + antar paket.
+// Menempel ke namespace global window.SB. State di SB.G.
 (function () {
-  "use strict";
-  var SB = window.SB = window.SB || {};
+  'use strict';
 
-  function G() { return SB.G; }
+  var ARRIVE_DIST = 6; // jarak dianggap sampai di tujuan
 
-  function msg(t) {
-    if (SB.HUD && SB.HUD.showMessage) SB.HUD.showMessage(t);
+  function G() { return window.SB.G; }
+
+  function showMessage(t) {
+    if (window.SB.HUD && window.SB.HUD.showMessage) window.SB.HUD.showMessage(t);
   }
 
-  function sfx(n) {
-    if (SB.Audio && SB.Audio.sfx) SB.Audio.sfx(n);
+  function distTo(x, z) {
+    var p = window.SB.Player ? window.SB.Player.pos() : { x: 0, z: 0 };
+    var dx = x - p.x, dz = z - p.z;
+    return Math.sqrt(dx * dx + dz * dz);
   }
 
-  // Snap a point to a collision-free spot when City can help.
-  function spot(x, z) {
-    if (SB.City && SB.City.findClearSpot) {
-      var s = SB.City.findClearSpot(x, z, 4);
-      if (s) return { x: s.x, z: s.z };
+  // Titik tujuan acak yang bebas tabrakan (pakai City bila ada).
+  function randomDest() {
+    var city = window.SB.City;
+    var x = (Math.random() * 2 - 1) * 140;
+    var z = (Math.random() * 2 - 1) * 140;
+    if (city && city.findClearSpot) {
+      var spot = city.findClearSpot(x, z, 4);
+      if (spot) { x = spot.x; z = spot.z; }
     }
-    return { x: x, z: z };
+    return { x: Math.round(x), z: Math.round(z) };
   }
 
-  function rndSpot() {
-    return spot((Math.random() * 320) - 160, (Math.random() * 320) - 160);
+  function fareFor(a, b) {
+    var d = Math.sqrt((b.x - a.x) * (b.x - a.x) + (b.z - a.z) * (b.z - a.z));
+    return Math.max(20, Math.round(d * 0.6));
   }
 
-  function distTo(p) {
-    var g = G();
-    if (!g || !p) return 1e9;
-    return Math.hypot(g.player.x - p.x, g.player.z - p.z);
-  }
+  window.SB.Jobs = {
+    // Job taksi aktif: { active, phase: 'pickup'|'dropoff', fare, dest, pickup }
+    taxi: { active: false, phase: 'pickup', fare: 0, dest: null, pickup: null },
 
-  function pay(amount, label) {
-    var g = G();
-    if (!g) return;
-    g.money += amount;
-    g.rep = (g.rep || 0) + 2;
-    msg(label + ": +$" + amount);
-    sfx("mission");
-  }
-
-  SB.Jobs = {
-    // Taxi job: pick a passenger up, then drop them at the destination.
-    taxi: { active: false, phase: "", fare: 0, pickup: null, dest: null },
-    // Side job: carry a package to a drop point.
-    packageJob: { active: false, dest: null, reward: 0 },
+    // Side job antar paket: { active, dest, reward }
+    package: { active: false, dest: null, reward: 0 },
 
     startTaxi: function () {
       var g = G();
       if (!g) return false;
-      var t = SB.Jobs.taxi;
-      if (t.active) { msg("Taxi job already running."); return false; }
-      var px = g.player.x + (Math.random() * 60 - 30);
-      var pz = g.player.z + (Math.random() * 60 - 30);
-      t.pickup = spot(px, pz);
-      t.dest = rndSpot();
-      var d = Math.hypot(t.dest.x - t.pickup.x, t.dest.z - t.pickup.z);
-      t.fare = 50 + Math.round(d * 0.4);
-      t.phase = "pickup";
-      t.active = true;
-      msg("Taxi job: pick up the passenger at the marker.");
+      if (this.taxi.active) return false;
+      var pickup = randomDest();
+      // Titik jemput tidak boleh terlalu dekat dengan pemain.
+      var tries = 0;
+      while (distTo(pickup.x, pickup.z) < 20 && tries < 8) {
+        pickup = randomDest();
+        tries++;
+      }
+      this.taxi.active = true;
+      this.taxi.phase = 'pickup';
+      this.taxi.pickup = pickup;
+      this.taxi.dest = pickup;
+      this.taxi.fare = 0;
+      showMessage('Taxi job: jemput penumpang di titik kuning!');
       return true;
     },
 
     startPackage: function () {
       var g = G();
       if (!g) return false;
-      var j = SB.Jobs.packageJob;
-      if (j.active) { msg("Package job already running."); return false; }
-      j.dest = rndSpot();
-      j.reward = 60 + Math.floor(Math.random() * 60);
-      j.active = true;
-      msg("Package job: deliver the package to the marker ($" + j.reward + ").");
+      if (this.package.active) return false;
+      var dest = randomDest();
+      var p = window.SB.Player ? window.SB.Player.pos() : { x: 0, z: 0 };
+      this.package.active = true;
+      this.package.dest = dest;
+      this.package.reward = fareFor(p, dest) + 15;
+      showMessage('Side job: antar paket ke titik hijau! Bayaran $' + this.package.reward);
       return true;
     },
 
     cancelTaxi: function () {
-      var t = SB.Jobs.taxi;
-      t.active = false; t.phase = ""; t.pickup = null; t.dest = null; t.fare = 0;
+      this.taxi.active = false;
+      this.taxi.phase = 'pickup';
+      this.taxi.dest = null;
+      this.taxi.pickup = null;
+      this.taxi.fare = 0;
     },
 
     cancelPackage: function () {
-      var j = SB.Jobs.packageJob;
-      j.active = false; j.dest = null; j.reward = 0;
+      this.package.active = false;
+      this.package.dest = null;
+      this.package.reward = 0;
     },
 
     update: function (dt) {
       var g = G();
       if (!g) return;
-      var t = SB.Jobs.taxi;
-      if (t.active) {
-        if (t.phase === "pickup" && t.pickup && distTo(t.pickup) < 5) {
-          t.phase = "dropoff";
-          msg("Passenger aboard. Drive to the destination.");
-          sfx("pickup");
-        } else if (t.phase === "dropoff" && t.dest && distTo(t.dest) < 5) {
-          var fare = t.fare;
-          SB.Jobs.cancelTaxi();
-          pay(fare, "Taxi fare paid");
+
+      // --- Taksi ---
+      if (this.taxi.active && this.taxi.dest) {
+        if (distTo(this.taxi.dest.x, this.taxi.dest.z) < ARRIVE_DIST) {
+          if (this.taxi.phase === 'pickup') {
+            // Penumpang naik: tentukan tujuan antar + fare.
+            var drop = randomDest();
+            var tries = 0;
+            while (distTo(drop.x, drop.z) < 30 && tries < 8) {
+              drop = randomDest();
+              tries++;
+            }
+            this.taxi.phase = 'dropoff';
+            this.taxi.dest = drop;
+            this.taxi.fare = fareFor(this.taxi.pickup, drop);
+            showMessage('Penumpang naik! Antar ke tujuan — fare $' + this.taxi.fare);
+          } else {
+            // Sampai tujuan: bayar fare (+ tip bila cepat / tanpa tabrakan).
+            var pay = this.taxi.fare;
+            g.money = (g.money || 0) + pay;
+            g.rep = (g.rep || 0) + 5;
+            showMessage('Taxi selesai! +$' + pay + ' (+5 REP)');
+            if (window.SB.Audio) window.SB.Audio.sfx('pickup');
+            this.taxi.active = false;
+            this.taxi.phase = 'pickup';
+            this.taxi.dest = null;
+            this.taxi.pickup = null;
+            this.taxi.fare = 0;
+          }
         }
       }
-      var j = SB.Jobs.packageJob;
-      if (j.active && j.dest && distTo(j.dest) < 5) {
-        var rw = j.reward;
-        SB.Jobs.cancelPackage();
-        pay(rw, "Package delivered");
+
+      // --- Antar paket ---
+      if (this.package.active && this.package.dest) {
+        if (distTo(this.package.dest.x, this.package.dest.z) < ARRIVE_DIST) {
+          var reward = this.package.reward;
+          g.money = (g.money || 0) + reward;
+          g.rep = (g.rep || 0) + 5;
+          showMessage('Paket terkirim! +$' + reward + ' (+5 REP)');
+          if (window.SB.Audio) window.SB.Audio.sfx('pickup');
+          this.package.active = false;
+          this.package.dest = null;
+          this.package.reward = 0;
+        }
       }
     }
   };

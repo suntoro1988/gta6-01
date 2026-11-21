@@ -1,6 +1,16 @@
-// Sunset Bay — gl: wrapper WebGL minimal (shader warna + fog linear vec2).
+// Sunset Bay v8 — gl.js
+// Lapisan WebGL tipis: shader warna-per-vertex + fog linear (uniform vec2).
 (function () {
-  var SB = window.SB = window.SB || {};
+  'use strict';
+  window.SB = window.SB || {};
+
+  var gl = null;
+  var prog = null;
+  var loc = {};
+  var proj = null;   // matriks proyeksi (array 16)
+  var view = null;   // matriks view (array 16)
+  var fogNear = 60, fogFar = 220;
+  var clearCol = [0.10, 0.12, 0.22];
 
   var VS =
     'attribute vec3 aPos;\n' +
@@ -8,7 +18,7 @@
     'uniform mat4 uMVP;\n' +
     'varying vec3 vCol;\n' +
     'varying float vDepth;\n' +
-    'void main(){\n' +
+    'void main() {\n' +
     '  vec4 p = uMVP * vec4(aPos, 1.0);\n' +
     '  gl_Position = p;\n' +
     '  vCol = aCol;\n' +
@@ -19,129 +29,109 @@
     'precision mediump float;\n' +
     'varying vec3 vCol;\n' +
     'varying float vDepth;\n' +
-    'uniform vec2 uFog;\n' +   // uFog.x = near, uFog.y = far (vec2, bukan vec3)
-    'uniform vec3 uFogCol;\n' +
-    'void main(){\n' +
-    '  float f = clamp((vDepth - uFog.x) / max(uFog.y - uFog.x, 0.001), 0.0, 1.0);\n' +
-    '  gl_FragColor = vec4(mix(vCol, uFogCol, f), 1.0);\n' +
+    'uniform vec2 uFog;\n' +
+    'void main() {\n' +
+    '  float f = clamp((vDepth - uFog.x) / (uFog.y - uFog.x), 0.0, 1.0);\n' +
+    '  vec3 fogCol = vec3(0.55, 0.62, 0.75);\n' +
+    '  gl_FragColor = vec4(mix(vCol, fogCol, f), 1.0);\n' +
     '}\n';
-
-  var gl = null, prog = null;
-  var uMVP = null, uFog = null, uFogCol = null;
-  var proj = null, view = null;
-  var fogNear = 60, fogFar = 260;
-  var fogColor = [0.55, 0.62, 0.75];
-  var canvas = null;
 
   function compile(type, src) {
     var sh = gl.createShader(type);
     gl.shaderSource(sh, src);
     gl.compileShader(sh);
     if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-      throw new Error('shader: ' + gl.getShaderInfoLog(sh));
+      throw new Error('shader compile: ' + gl.getShaderInfoLog(sh));
     }
     return sh;
   }
 
-  function init(cv) {
-    canvas = cv;
-    gl = cv.getContext('webgl', { antialias: true }) ||
-         cv.getContext('experimental-webgl');
+  function init(canvas) {
+    gl = canvas.getContext('webgl', { antialias: true }) ||
+         canvas.getContext('experimental-webgl');
     if (!gl) throw new Error('WebGL tidak tersedia');
-    var vs = compile(gl.VERTEX_SHADER, VS);
-    var fs = compile(gl.FRAGMENT_SHADER, FS);
+    var M = window.SB.Math3;
     prog = gl.createProgram();
-    gl.attachShader(prog, vs);
-    gl.attachShader(prog, fs);
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
     gl.linkProgram(prog);
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-      throw new Error('link: ' + gl.getProgramInfoLog(prog));
+      throw new Error('program link: ' + gl.getProgramInfoLog(prog));
     }
     gl.useProgram(prog);
-    uMVP = gl.getUniformLocation(prog, 'uMVP');
-    uFog = gl.getUniformLocation(prog, 'uFog');
-    uFogCol = gl.getUniformLocation(prog, 'uFogCol');
+    loc.aPos = gl.getAttribLocation(prog, 'aPos');
+    loc.aCol = gl.getAttribLocation(prog, 'aCol');
+    loc.uMVP = gl.getUniformLocation(prog, 'uMVP');
+    loc.uFog = gl.getUniformLocation(prog, 'uFog');
     gl.enable(gl.DEPTH_TEST);
     gl.enable(gl.CULL_FACE);
     gl.cullFace(gl.BACK);
-    // fog default via vec2
-    gl.uniform2f(uFog, fogNear, fogFar);
-    gl.uniform3f(uFogCol, fogColor[0], fogColor[1], fogColor[2]);
-    resize();
+    resize(canvas);
+    view = M.mat4Identity();
+    setFog(fogNear, fogFar);
     return gl;
   }
 
-  function resize() {
-    if (!canvas) return;
+  function resize(canvas) {
+    var M = window.SB.Math3;
     var w = canvas.clientWidth || canvas.width;
     var h = canvas.clientHeight || canvas.height;
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w; canvas.height = h;
     }
     gl.viewport(0, 0, canvas.width, canvas.height);
-    var M = SB.Math3;
-    proj = M.mat4Perspective(1.15, canvas.width / canvas.height, 0.1, 600);
+    proj = M.mat4Perspective(1.05, canvas.width / canvas.height, 0.1, 600);
+  }
+
+  function clear(r, g, b) {
+    clearCol = [r, g, b];
+    gl.clearColor(r, g, b, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  }
+
+  // positions/colors: Float32Array (atau array angka). Kembalikan mesh buffer.
+  function mesh(positions, colors) {
+    var posBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+    var colBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, colBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colors), gl.STATIC_DRAW);
+    var count = (positions.length / 3) | 0;
+    return { posBuf: posBuf, colBuf: colBuf, count: count, _pos: positions, _col: colors };
+  }
+
+  // matrix: matriks model (array 16). opts: {wireframe?} (diabaikan, reserved)
+  function draw(m, matrix) {
+    var M = window.SB.Math3;
+    var mvp = M.mat4Mul(proj, M.mat4Mul(view, matrix || M.mat4Identity()));
+    gl.uniformMatrix4fv(loc.uMVP, false, new Float32Array(mvp));
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf);
+    gl.enableVertexAttribArray(loc.aPos);
+    gl.vertexAttribPointer(loc.aPos, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.colBuf);
+    gl.enableVertexAttribArray(loc.aCol);
+    gl.vertexAttribPointer(loc.aCol, 3, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, m.count);
+  }
+
+  function setCamera(eye, center) {
+    var M = window.SB.Math3;
+    view = M.mat4LookAt(eye, center, M.v3(0, 1, 0));
+  }
+
+  function setFog(near, far) {
+    fogNear = near; fogFar = far;
+    if (gl && loc.uFog) gl.uniform2f(loc.uFog, near, far);
   }
 
   function alive() {
     return !!gl && !gl.isContextLost();
   }
 
-  function clear(r, g, b) {
-    resize();
-    gl.clearColor(r, g, b, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    // warna kabut mengikuti warna langit (siang/malam diatur pemanggil via setFogColor)
-    gl.uniform3f(uFogCol, fogColor[0], fogColor[1], fogColor[2]);
-  }
-
-  function mesh(positions, colors) {
-    var pos = positions instanceof Float32Array ? positions : new Float32Array(positions);
-    var col = colors instanceof Float32Array ? colors : new Float32Array(colors);
-    var pb = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, pb);
-    gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
-    var cb = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, cb);
-    gl.bufferData(gl.ARRAY_BUFFER, col, gl.STATIC_DRAW);
-    return { posBuf: pb, colBuf: cb, count: pos.length / 3 };
-  }
-
-  function setCamera(eye, center) {
-    var M = SB.Math3;
-    view = M.mat4LookAt(eye, center, [0, 1, 0]);
-  }
-
-  function setFog(near, far) {
-    fogNear = near; fogFar = far;
-    if (gl) gl.uniform2f(uFog, near, far);   // fog = vec2 (near, far)
-  }
-
-  function setFogColor(r, g, b) {
-    fogColor = [r, g, b];
-    if (gl) gl.uniform3f(uFogCol, r, g, b);
-  }
-
-  function draw(m, matrix, opts) {
-    if (!m || !m.posBuf || !proj || !view) return;
-    var M = SB.Math3;
-    var mvp = M.mat4Mul(proj, M.mat4Mul(view, matrix));
-    gl.uniformMatrix4fv(uMVP, false, new Float32Array(mvp));
-    gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf);
-    var aPos = gl.getAttribLocation(prog, 'aPos');
-    gl.enableVertexAttribArray(aPos);
-    gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, m.colBuf);
-    var aCol = gl.getAttribLocation(prog, 'aCol');
-    gl.enableVertexAttribArray(aCol);
-    gl.vertexAttribPointer(aCol, 3, gl.FLOAT, false, 0, 0);
-    gl.drawArrays(gl.TRIANGLES, 0, m.count);
-  }
-
-  SB.GL = {
+  window.SB.GL = {
     init: init, clear: clear, mesh: mesh, draw: draw,
-    setCamera: setCamera, setFog: setFog, setFogColor: setFogColor,
-    alive: alive,
+    setCamera: setCamera, setFog: setFog, alive: alive,
     get ctx() { return gl; }
   };
 })();

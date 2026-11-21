@@ -1,87 +1,109 @@
-// Sunset Bay — Shots (ditulis fresh untuk v7, dari SPEC)
-// SB.Shots.stage(name): atur kamera/posisi untuk 4 shot staging:
-// "start" (title), "play" (gameplay jalan), "foot" (jalan kaki),
-// "end" (peta / malam). Dipakai saat URL mengandung ?shot=<name>.
+// Sunset Bay — Screenshot staging (v8, written fresh from SPEC-v8)
+// window.SB.Shots: { stage }
+// Stages camera/state for the 4 dossier screenshots (?shot=<name>).
 (function () {
   'use strict';
   var SB = window.SB = window.SB || {};
 
-  function setPlayer(x, z, yaw) {
-    var G = SB.G;
-    if (!G || !G.player) return;
-    var p = G.player;
-    p.x = x; p.z = z; p.yaw = yaw;
-    p.inCar = false; p.car = null; p.speed = 0; p.hp = 100;
-    p.inBoat = false; // flag kapal ada di player (G.inBoat top-level tidak dipakai)
-    G.inBoat = false;
+  function showTitle() {
+    var t = document.getElementById('title');
+    if (t) t.style.display = 'flex';
+    var h = document.getElementById('hud');
+    if (h) h.style.display = 'none';
+  }
+  function hideTitle() {
+    var t = document.getElementById('title');
+    if (t) t.style.display = 'none';
+    var h = document.getElementById('hud');
+    if (h) h.style.display = 'block';
   }
 
-  // Mobil parkir terdekat dari titik (x,z) — tanpa batas radius 12
-  // (nearestParked gagal bila tidak ada mobil parkir di dekat titik).
-  function nearestParkedAnywhere(x, z) {
-    if (!SB.Vehicles || !SB.Vehicles.cars) return null;
-    var best = null, bestD = Infinity;
-    for (var i = 0; i < SB.Vehicles.cars.length; i++) {
-      var c = SB.Vehicles.cars[i];
-      if (!c.parked) continue;
-      var d = (c.x - x) * (c.x - x) + (c.z - z) * (c.z - z);
-      if (d < bestD) { bestD = d; best = c; }
+  function putInCar() {
+    var g = SB.G;
+    if (!g || !g.player) return;
+    var car = null;
+    if (SB.Vehicles && SB.Vehicles.cars) {
+      for (var i = 0; i < SB.Vehicles.cars.length; i++) {
+        if (SB.Vehicles.cars[i].parked) { car = SB.Vehicles.cars[i]; break; }
+      }
+      if (!car && SB.Vehicles.cars.length) car = SB.Vehicles.cars[0];
     }
-    return best;
+    if (car) {
+      g.player.inCar = true;
+      g.player.car = car;
+      g.player.x = car.x; g.player.z = car.z;
+      g.player.yaw = car.yaw || 0;
+      g.player.speed = 14;
+    }
   }
 
-  SB.Shots = {
-    // mode kamera yang dibaca loop render di SB.Main:
-    // 'orbit' | 'chase' | 'follow' | 'high'
-    cam: { mode: 'chase' },
+  function spawnPoliceNear(n) {
+    var g = SB.G;
+    if (!g || !g.player) return;
+    g.police = g.police || [];
+    for (var i = 0; i < n; i++) {
+      var a = (i / n) * Math.PI * 2;
+      g.police.push({
+        x: g.player.x + Math.cos(a) * 14,
+        z: g.player.z + Math.sin(a) * 14,
+        hp: 100, yaw: a
+      });
+    }
+  }
 
+  var Shots = {
     stage: function (name) {
-      var G = SB.G;
-      if (!G) return;
+      var g = SB.G;
+      if (!g) return;
+      hideTitle();
+      if (SB.HUD && SB.HUD.mapOpen) SB.HUD.toggleMap();
       if (name === 'start') {
-        // Shot title: kota saat senja, kamera orbit, title screen tampil.
-        G.clock = 18.0;
-        G.wanted = 0;
-        setPlayer(0, 40, 0);
-        SB.Shots.cam = { mode: 'orbit' };
+        // Title screen, dusk, city behind.
+        showTitle();
+        g.clock = 18.0;
+        g.wanted = 0;
+        g.mission = 0; g.missionStage = 0;
+        if (g.player) { g.player.x = 0; g.player.z = 0; g.player.yaw = 0.6; g.player.inCar = false; g.player.car = null; }
         return;
       }
       if (name === 'play') {
-        // Gameplay berkendara: siang sore, pemain di dalam mobil di jalan.
-        G.clock = 17.5;
-        G.wanted = 1;
-        var car = nearestParkedAnywhere(20, 40);
-        if (car) {
-          // Berdiri di samping mobil parkir itu lalu naik — jadi shot
-          // benar-benar menampilkan pemain di dalam mobil, bukan jalan kaki.
-          setPlayer(car.x + 3, car.z + 2, car.yaw);
-          if (SB.Vehicles.enterCar) SB.Vehicles.enterCar(car);
-          G.player.speed = 12;
-        } else {
-          setPlayer(20, 40, Math.PI);
-        }
-        SB.Shots.cam = { mode: 'chase' };
+        // Gameplay chase: wanted >= 2 + police visible + minimap + active mission.
+        g.clock = 18.5;
+        g.mission = 0; g.missionStage = 0;
+        g.wanted = 2;
+        putInCar();
+        spawnPoliceNear(3);
+        if (SB.HUD) { SB.HUD.update(); SB.HUD.draw(); }
         return;
       }
       if (name === 'foot') {
-        // Jalan kaki di trotoar, pagi terang.
-        G.clock = 10.0;
-        G.wanted = 0;
-        setPlayer(-30, 60, Math.PI / 2);
-        SB.Shots.cam = { mode: 'follow' };
+        // On foot, daytime, on land near the marina pier.
+        g.clock = 10.0;
+        g.wanted = 0;
+        g.police = [];
+        g.mission = 1; g.missionStage = 0;
+        if (g.player) {
+          g.player.inCar = false; g.player.car = null;
+          g.player.x = -160; g.player.z = 110; g.player.yaw = 1.2; g.player.speed = 0;
+        }
+        if (SB.HUD) { SB.HUD.update(); SB.HUD.draw(); }
         return;
       }
       if (name === 'end') {
-        // Malam + peta fullscreen terbuka.
-        G.clock = 21.5;
-        G.wanted = 2;
-        setPlayer(0, -20, 0);
-        SB.Shots.cam = { mode: 'high' };
-        if (SB.HUD && SB.HUD.openMap) SB.HUD.openMap();
+        // Fullscreen map at night.
+        g.clock = 22.0;
+        g.wanted = 0;
+        g.mission = 2; g.missionStage = 0;
+        if (g.player) { g.player.inCar = false; g.player.car = null; g.player.x = 40; g.player.z = -60; }
+        if (SB.HUD && !SB.HUD.mapOpen) SB.HUD.toggleMap();
+        if (SB.HUD) SB.HUD.update();
         return;
       }
-      // Nama tak dikenal: fallback gameplay berkendara.
-      SB.Shots.cam = { mode: 'chase' };
+      // unknown shot name: plain gameplay
+      g.mission = 0; g.missionStage = 0;
+      if (SB.HUD) SB.HUD.update();
     }
   };
+
+  SB.Shots = Shots;
 })();
