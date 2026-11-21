@@ -1,122 +1,194 @@
-// Sunset Bay — seeded random number generator.
-// Written from scratch for v10. Deterministic: the same seed always
-// produces the same sequence, so replays and recordings stay stable.
-// No dependencies.
+// rng.js — Sunset Bay (v11)
+// Seeded deterministic random numbers for Sunset Bay.
+// Written from scratch for v11. No dependencies, no external data.
+// Every procedural choice in the game (traffic, pedestrians, weather,
+// loot, radio chatter timing) can draw from one seeded stream so a
+// replay with the same seed reproduces the same bay.
 
-const SB = (globalThis.SB = globalThis.SB || {});
+'use strict';
 
-/** Hash any seed (number or string) down to a uint32. */
-function hashSeed(seed) {
-  if (typeof seed === "number" && Number.isFinite(seed)) {
-    return seed >>> 0;
-  }
-  const text = String(seed ?? "sunset-bay");
+// mulberry32: small, fast, well-distributed 32-bit PRNG.
+export function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// splitmix32: a second stream, useful when a subsystem needs an
+// independent sequence derived from the same master seed.
+export function splitmix32(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a = (a + 0x9E3779B9) >>> 0;
+    let z = a;
+    z = Math.imul(z ^ (z >>> 16), 0x21F0AAAD);
+    z = Math.imul(z ^ (z >>> 15), 0x735A2D97);
+    return ((z ^ (z >>> 15)) >>> 0) / 4294967296;
+  };
+}
+
+// Turn any short string ("sunset-bay-day-4", a player name, a mission
+// id) into a stable 32-bit seed so named content is reproducible.
+export function seedFromString(text) {
+  const s = String(text == null ? '' : text);
   let h = 2166136261 >>> 0; // FNV-1a offset basis
-  for (let i = 0; i < text.length; i++) {
-    h ^= text.charCodeAt(i);
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
     h = Math.imul(h, 16777619);
   }
+  // Final avalanche so similar strings diverge fast.
+  h ^= h >>> 15;
+  h = Math.imul(h, 2246822507);
+  h ^= h >>> 13;
   return h >>> 0;
 }
 
-/** mulberry32: small, fast, good-quality 32-bit PRNG. */
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function nextUint32() {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0);
-  };
+// A forkable RNG object: one master stream plus named sub-streams
+// ("traffic", "pedestrians", "weather", "loot") that stay independent
+// even when they are consumed at different rates.
+export class SeededRng {
+  constructor(seed) {
+    if (typeof seed === 'string') seed = seedFromString(seed);
+    if (seed == null || !Number.isFinite(seed)) seed = (Date.now() % 2147483647) >>> 0;
+    this.seed = seed >>> 0;
+    this.next = mulberry32(this.seed);
+    this._streams = new Map();
+  }
+
+  // Raw float in [0, 1).
+  float() { return this.next(); }
+
+  // Float in [min, max).
+  range(min, max) {
+    if (max === undefined) { max = min; min = 0; }
+    return min + this.float() * (max - min);
+  }
+
+  // Integer in [min, max] inclusive.
+  int(min, max) {
+    if (max === undefined) { max = min; min = 0; }
+    return Math.floor(this.range(min, max + 1));
+  }
+
+  // True with probability p (0..1).
+  chance(p) { return this.float() < p; }
+
+  // One element of a non-empty array, uniformly.
+  pick(list) {
+    if (!list || list.length === 0) return undefined;
+    return list[Math.floor(this.float() * list.length)];
+  }
+
+  // One element weighted by `weight` (default 1) on each entry.
+  // Entries look like { value, weight } or { weight } with any payload.
+  weightedPick(entries) {
+    if (!entries || entries.length === 0) return undefined;
+    let total = 0;
+    for (const e of entries) total += (e && e.weight != null ? e.weight : 1);
+    if (total <= 0) return this.pick(entries);
+    let roll = this.float() * total;
+    for (const e of entries) {
+      roll -= (e && e.weight != null ? e.weight : 1);
+      if (roll <= 0) return e;
+    }
+    return entries[entries.length - 1];
+  }
+
+  // Fisher-Yates shuffle. Returns a NEW array; the input is untouched.
+  shuffle(list) {
+    const out = Array.isArray(list) ? list.slice() : [];
+    for (let i = out.length - 1; i > 0; i--) {
+      const j = Math.floor(this.float() * (i + 1));
+      const tmp = out[i]; out[i] = out[j]; out[j] = tmp;
+    }
+    return out;
+  }
+
+  // Sample k distinct elements without replacement.
+  sample(list, k) {
+    return this.shuffle(list).slice(0, Math.max(0, Math.min(k, list.length)));
+  }
+
+  // Approximately normal value (mean 0, stddev 1) via Box-Muller.
+  gaussian() {
+    let u = 0, v = 0;
+    while (u === 0) u = this.float();
+    while (v === 0) v = this.float();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+  }
+
+  // Gaussian clamped to [min, max] around a centre.
+  gaussianRange(min, max, centre) {
+    const c = centre == null ? (min + max) / 2 : centre;
+    const spread = (max - min) / 6;
+    const v = c + this.gaussian() * spread;
+    return Math.max(min, Math.min(max, v));
+  }
+
+  // Random point inside a circle of radius r around (x, z).
+  pointInCircle(x, z, r) {
+    const a = this.float() * Math.PI * 2;
+    const d = Math.sqrt(this.float()) * r;
+    return { x: x + Math.cos(a) * d, z: z + Math.sin(a) * d };
+  }
+
+  // Random bearing in degrees, 0..360.
+  bearing() { return this.float() * 360; }
+
+  // A short id made of unambiguous characters (no 0/O, 1/l).
+  id(length) {
+    const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    let out = '';
+    for (let i = 0; i < (length || 8); i++) out += chars[this.int(0, chars.length - 1)];
+    return out;
+  }
+
+  // Named sub-stream, derived deterministically from the master seed
+  // plus the stream name. Two systems can each own a stream and never
+  // disturb each other's sequence.
+  stream(name) {
+    if (!this._streams.has(name)) {
+      this._streams.set(name, new SeededRng(seedFromString(String(this.seed) + ':' + name)));
+    }
+    return this._streams.get(name);
+  }
+
+  // Snapshot / restore so a mission can rewind its own rolls.
+  getState() { return { seed: this.seed }; }
+  reseed(seed) {
+    if (typeof seed === 'string') seed = seedFromString(seed);
+    this.seed = seed >>> 0;
+    this.next = mulberry32(this.seed);
+    this._streams.clear();
+    return this;
+  }
 }
 
-/**
- * Create a seeded RNG.
- *   const r = rng(1337);
- *   r.next()          -> float in [0, 1)
- *   r.range(10, 20)   -> float in [10, 20)
- *   r.int(1, 6)       -> integer in [1, 6]
- *   r.pick(['a','b']) -> one element
- *   r.chance(0.25)    -> true 25% of the time
- *   r.shuffle(arr)    -> new shuffled copy
- */
-function rng(seed) {
-  const nextUint32 = mulberry32(hashSeed(seed));
-  let calls = 0;
+// The game's default shared stream. Systems that do not need their own
+// seed should use this one (or a named stream off it) so gameplay
+// stays varied run to run while remaining debuggable.
+export const rng = new SeededRng(20261121);
 
-  const api = {
-    seed: hashSeed(seed),
-    get calls() {
-      return calls;
-    },
+// Convenience one-liners over the shared stream.
+export const randomRange = (min, max) => rng.range(min, max);
+export const randomInt = (min, max) => rng.int(min, max);
+export const randomPick = (list) => rng.pick(list);
+export const randomShuffle = (list) => rng.shuffle(list);
+export const randomChance = (p) => rng.chance(p);
 
-    next() {
-      calls++;
-      return nextUint32() / 4294967296;
-    },
+export function createRng(seed) { return new SeededRng(seed); }
 
-    range(min, max) {
-      if (max === undefined) {
-        max = min;
-        min = 0;
-      }
-      return min + api.next() * (max - min);
-    },
-
-    int(min, max) {
-      // Inclusive on both ends.
-      return Math.floor(api.range(min, max + 1));
-    },
-
-    pick(array) {
-      if (!array || array.length === 0) return undefined;
-      return array[Math.floor(api.next() * array.length)];
-    },
-
-    chance(p) {
-      return api.next() < p;
-    },
-
-    shuffle(array) {
-      const copy = array.slice();
-      for (let i = copy.length - 1; i > 0; i--) {
-        const j = Math.floor(api.next() * (i + 1));
-        const tmp = copy[i];
-        copy[i] = copy[j];
-        copy[j] = tmp;
-      }
-      return copy;
-    },
-
-    /** Gaussian-ish value via the average of three uniforms. */
-    normal(mean, spread) {
-      const m = mean === undefined ? 0 : mean;
-      const s = spread === undefined ? 1 : spread;
-      return m + ((api.next() + api.next() + api.next()) / 3 - 0.5) * 2 * s;
-    },
-
-    /** Fresh independent stream derived from this one. */
-    fork() {
-      return rng(nextUint32());
-    },
-  };
-  return api;
+if (typeof window !== 'undefined') {
+  window.SunsetRng = window.SunsetRng || {};
+  window.SunsetRng.SeededRng = SeededRng;
+  window.SunsetRng.mulberry32 = mulberry32;
+  window.SunsetRng.splitmix32 = splitmix32;
+  window.SunsetRng.seedFromString = seedFromString;
+  window.SunsetRng.rng = rng;
+  window.SunsetRng.createRng = createRng;
 }
-
-/** One shared instance for quick one-off rolls (seeded per session). */
-let shared = null;
-function sharedRng(seed) {
-  if (!shared || seed !== undefined) shared = rng(seed === undefined ? Date.now() : seed);
-  return shared;
-}
-
-SB.RNG = {
-  rng,
-  create: rng,
-  hashSeed,
-  mulberry32,
-  shared: sharedRng,
-};
-
-export { rng, hashSeed, mulberry32, sharedRng };
-export default rng;

@@ -1,29 +1,54 @@
-# Sunset Bay — ignore rules
-# Anything generated, local-only, or editor-specific stays out of git.
+# Sunset Bay v11 — ignore rules for the repository.
+#
+# Anything generated, local-only, or machine-specific stays out of git.
+# The game itself (game/), its screenshots, and the entry-point sources
+# are tracked; everything a tool or a run produces is not.
 
-# Dependencies installed locally
-node_modules/
+# ---- build and submission output -----------------------------------
+/output
+dist
+build
+out
+*.tgz
+*.zip
 
-# Build and submission outputs
-out/
-dist/
-output/
+# ---- dependencies and package-manager state ------------------------
+node_modules
+.pnp
+.pnp.*
+.yarn/cache
+.yarn/install-state.gz
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
 
-# Scratch and temp files
-/tmp/
-*.tmp
+# ---- logs, caches, and coverage ------------------------------------
 *.log
+*.tmp
+*.temp
+.cache
+.parcel-cache
+coverage
+.nyc_output
 
-# Local environment and secrets
+# ---- operating-system and editor droppings -------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+.idea
+.vscode
+*.code-workspace
+
+# ---- environment and secrets ---------------------------------------
 .env
 .env.*
+!.env.example
+*.pem
+*.key
 
-# macOS metadata
-.DS_Store
-
-# Test coverage reports
-coverage/
-
-# Editor settings
-.vscode/
-.idea/
+# ---- test and QA scratch -------------------------------------------
+/tmp-qa
+qa-output

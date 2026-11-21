@@ -1,444 +1,359 @@
-// Sunset Bay — city.js (v10, written from scratch)
-// Procedural city generation for Sunset Bay.
-//
-// The city is a 480 x 480 metre grid centred on (0, 0). Streets run
-// on a regular grid every 40 m, leaving 32 m blocks between them.
-// Ten districts tile the map; the sea lies to the south (z > +190),
-// so the southern districts face the waterfront and the Marina Bay
-// district sits right on the pier. Exactly 219 buildings are placed
-// across the ten districts — the per-district quotas below sum to 219
-// and generateCity asserts that, so a miscount can never ship silently.
-// Generation is fully deterministic: the same seed always rebuilds
-// the same city (mulberry32 PRNG, no Math.random, no Date.now).
-//
-// A building is a plain record:
-//   { id, district, x, z, w, d, h, floors, type, color, roof,
-//     rotY }   (x, z = centre; w, d = footprint; h = height;
-//     rotY is 0 or PI/2 — buildings stay axis-aligned so the
-//     vehicle collision test in vehicles.js stays a cheap AABB test.)
+// city.js — Kota "Sunset Bay" v11
+// Kota pantai kompak: 10 distrik original, 219+ gedung, jalan utama,
+// jalan pantai, pelabuhan kecil + dermaga, 2-3 interior yang bisa dimasuki.
+// Semua nama original. Raw WebGL, tanpa library eksternal.
+// Modul data + logika kota; rendering dilakukan lewat mesh yang diekspor
+// (lihat meshes.js) dan renderer yang disuntikkan lewat City.attachRenderer().
 
-const SB = (globalThis.SB = globalThis.SB || {});
+(function (global) {
+  'use strict';
 
-const CITY_HALF = 240; // city spans -240 .. +240 on x and z
-const STREET_STEP = 40; // distance between street centrelines
-const STREET_WIDTH = 8; // drivable asphalt width
-const SIDEWALK_WIDTH = 2;
-
-// Ten districts. quota = buildings in that district; the ten quotas
-// sum to exactly 219. bounds are [x0, z0, x1, z1] (inclusive-ish).
-const DISTRICTS = [
-  { name: "Downtown",        quota: 34, bounds: [-120, -120,   40,   40], palette: ["#8a94a6", "#6f7f96", "#a8b0c0", "#5d6b82"], types: ["office", "office", "shop"] },
-  { name: "Old Town",        quota: 26, bounds: [-240, -120, -120,   40], palette: ["#b08968", "#9c7a54", "#c2a27a", "#8a6d4b"], types: ["house", "shop", "house"] },
-  { name: "Market Quarter",  quota: 24, bounds: [   40, -120,  120,   40], palette: ["#c98a4b", "#b5773a", "#d9a05b", "#a86f45"], types: ["shop", "shop", "house"] },
-  { name: "University",      quota: 22, bounds: [-240,   40, -120,  160], palette: ["#7d8aa0", "#9aa5b8", "#6b7a90", "#b0bac8"], types: ["civic", "house", "office"] },
-  { name: "Harborfront",     quota: 20, bounds: [-120,   40,    0,  120], palette: ["#5f7d8c", "#7a99a8", "#4e6b78", "#93b0bd"], types: ["shop", "house", "office"] },
-  { name: "Industrial",      quota: 18, bounds: [    0,   40,  120,  120], palette: ["#7a7a72", "#8c8c82", "#66665e", "#9a9a8e"], types: ["warehouse", "warehouse", "office"] },
-  { name: "Residential North", quota: 20, bounds: [  120, -120,  240,  -40], palette: ["#c2b49a", "#b3a284", "#d4c7ab", "#a3906f"], types: ["house", "house", "house"] },
-  { name: "Riverside",       quota: 16, bounds: [  120,  -40,  240,   80], palette: ["#a8b5a0", "#94a48c", "#bcc8b4", "#86967e"], types: ["house", "house", "shop"] },
-  { name: "Marina Bay",      quota: 19, bounds: [-120,  120,  120,  190], palette: ["#6fa8b8", "#8fc0cc", "#5b8fa0", "#a5d0dc"], types: ["shop", "house", "house"] },
-  { name: "Hillcrest",       quota: 20, bounds: [  120,   80,  240,  190], palette: ["#b5a88f", "#c9bda1", "#a3937a", "#d8cdb4"], types: ["house", "house", "house"] },
-];
-
-const TOTAL_BUILDINGS = DISTRICTS.reduce((s, d) => s + d.quota, 0); // 219
-
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function next() {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function pick(rng, arr) {
-  return arr[Math.floor(rng() * arr.length)];
-}
-
-function range(rng, min, max) {
-  return min + rng() * (max - min);
-}
-
-// True when the point sits on a street (within half the street
-// width of a street centreline) rather than inside a block.
-function isOnStreet(x, z) {
-  const fx = ((x + CITY_HALF) % STREET_STEP + STREET_STEP) % STREET_STEP;
-  const fz = ((z + CITY_HALF) % STREET_STEP + STREET_STEP) % STREET_STEP;
-  const nearX = fx < STREET_WIDTH / 2 + 1 || fx > STREET_STEP - STREET_WIDTH / 2 - 1;
-  const nearZ = fz < STREET_WIDTH / 2 + 1 || fz > STREET_STEP - STREET_WIDTH / 2 - 1;
-  return nearX || nearZ;
-}
-
-// Street centrelines, for traffic AI and the minimap.
-function buildRoads() {
-  const roads = [];
-  for (let c = -CITY_HALF + STREET_STEP; c < CITY_HALF; c += STREET_STEP) {
-    roads.push({ axis: "x", at: c, from: -CITY_HALF, to: CITY_HALF, width: STREET_WIDTH });
-    roads.push({ axis: "z", at: c, from: -CITY_HALF, to: CITY_HALF, width: STREET_WIDTH });
-  }
-  return roads;
-}
-
-function buildIntersections(roads) {
-  const points = [];
-  const verticals = roads.filter((r) => r.axis === "x").map((r) => r.at);
-  const horizontals = roads.filter((r) => r.axis === "z").map((r) => r.at);
-  for (const x of verticals) {
-    for (const z of horizontals) points.push({ x, z });
-  }
-  return points;
-}
-
-// Traffic lights only at the busiest crossings: every second
-// intersection inside the central area, so traffic AI has real
-// stop/go points without a light on every corner.
-function buildTrafficLights(rng, intersections) {
-  const lights = [];
-  for (const p of intersections) {
-    const central = Math.abs(p.x) <= 120 && Math.abs(p.z) <= 120;
-    const onGrid = (Math.round(p.x / STREET_STEP) + Math.round(p.z / STREET_STEP)) % 2 === 0;
-    if (central && onGrid) {
-      lights.push({
-        x: p.x,
-        z: p.z,
-        state: rng() < 0.5 ? "green" : "red",
-        timer: range(rng, 1, 5),
-        greenTime: 5,
-        redTime: 5,
-      });
-    }
-  }
-  return lights;
-}
-
-// Lamp posts line both sides of every street, one per block.
-function buildStreetLights() {
-  const lights = [];
-  for (let c = -CITY_HALF + STREET_STEP; c < CITY_HALF; c += STREET_STEP) {
-    for (let t = -CITY_HALF + STREET_STEP / 2; t < CITY_HALF; t += STREET_STEP) {
-      lights.push({ x: c - STREET_WIDTH / 2 - SIDEWALK_WIDTH / 2, z: t, side: "west" });
-      lights.push({ x: c + STREET_WIDTH / 2 + SIDEWALK_WIDTH / 2, z: t, side: "east" });
-    }
-  }
-  return lights;
-}
-
-// Sidewalk strips run alongside every street; kept as a list of
-// thin rectangles the renderer can draw as flat quads.
-function buildSidewalks() {
-  const walks = [];
-  for (let c = -CITY_HALF + STREET_STEP; c < CITY_HALF; c += STREET_STEP) {
-    walks.push({ x: c, z: 0, w: STREET_WIDTH + SIDEWALK_WIDTH * 2, d: CITY_HALF * 2, axis: "x" });
-    walks.push({ x: 0, z: c, w: CITY_HALF * 2, d: STREET_WIDTH + SIDEWALK_WIDTH * 2, axis: "z" });
-  }
-  return walks;
-}
-
-function buildingHeightFor(type, rng) {
-  switch (type) {
-    case "office": return range(rng, 14, 42);
-    case "warehouse": return range(rng, 7, 12);
-    case "civic": return range(rng, 10, 18);
-    case "shop": return range(rng, 6, 12);
-    case "house":
-    default: return range(rng, 5, 11);
-  }
-}
-
-function footprintFor(type, rng) {
-  switch (type) {
-    case "office": return [range(rng, 14, 22), range(rng, 14, 22)];
-    case "warehouse": return [range(rng, 20, 30), range(rng, 16, 24)];
-    case "civic": return [range(rng, 18, 26), range(rng, 14, 20)];
-    case "shop": return [range(rng, 10, 16), range(rng, 8, 14)];
-    case "house":
-    default: return [range(rng, 8, 14), range(rng, 8, 12)];
-  }
-}
-
-function generateCity(seed = 1337) {
-  const rng = mulberry32(seed);
-  const buildings = [];
-  const byDistrict = {};
-  let nextId = 0;
-
-  // Placement is block-based, not pure random rejection: each
-  // district is walked block by block (blocks are the 32 m squares
-  // between streets, centred on the -220 + 40k grid) and 1-4
-  // buildings are slotted into each block. Pure random sampling
-  // under-filled dense districts (179/219 in the first pass) because
-  // a large footprint rarely lands wholly inside one block. Slot
-  // layouts keep every footprint inside its block and off the
-  // streets, so the quota is reachable in every district.
-  const PIER_RECT = { x0: -7, z0: 186, x1: 7, z1: 224 };
-  function slotLayout(n, horizontal) {
-    if (n <= 1) return [{ dx: 0, dz: 0, mw: 26, md: 26 }];
-    if (n === 2) {
-      return horizontal
-        ? [{ dx: -7.5, dz: 0, mw: 13, md: 26 }, { dx: 7.5, dz: 0, mw: 13, md: 26 }]
-        : [{ dx: 0, dz: -7.5, mw: 26, md: 13 }, { dx: 0, dz: 7.5, mw: 26, md: 13 }];
-    }
-    if (n === 3) {
-      return [
-        { dx: -7.5, dz: -7.5, mw: 13, md: 13 },
-        { dx: 7.5, dz: -7.5, mw: 13, md: 13 },
-        { dx: 0, dz: 7.5, mw: 13, md: 13 },
-      ];
-    }
-    return [
-      { dx: -7.5, dz: -7.5, mw: 13, md: 13 },
-      { dx: 7.5, dz: -7.5, mw: 13, md: 13 },
-      { dx: -7.5, dz: 7.5, mw: 13, md: 13 },
-      { dx: 7.5, dz: 7.5, mw: 13, md: 13 },
-    ];
-  }
-  function tryPlace(placed, all, district, x, z, mw, md) {
-    const type = pick(rng, district.types);
-    let [w, d] = footprintFor(type, rng);
-    w = Math.min(w, mw);
-    d = Math.min(d, md);
-    if (w < 6 || d < 6) return false;
-    // Never into the sea, never onto the pier.
-    if (z + d / 2 > 189.5) return false;
-    if (x + w / 2 > PIER_RECT.x0 && x - w / 2 < PIER_RECT.x1 && z + d / 2 > PIER_RECT.z0 && z - d / 2 < PIER_RECT.z1) return false;
-    if (isOnStreet(x - w / 2, z) || isOnStreet(x + w / 2, z)) return false;
-    if (isOnStreet(x, z - d / 2) || isOnStreet(x, z + d / 2)) return false;
-    for (const b of all) {
-      if (Math.abs(b.x - x) < (b.w + w) / 2 + 1.5 && Math.abs(b.z - z) < (b.d + d) / 2 + 1.5) return false;
-    }
-    const h = buildingHeightFor(type, rng);
-    const roof = type === "house" ? pick(rng, ["gable", "pyramid", "flat"]) : "flat";
-    const rec = {
-      id: nextId++,
-      district: district.name,
-      x: Math.round(x * 10) / 10,
-      z: Math.round(z * 10) / 10,
-      w: Math.round(w * 10) / 10,
-      d: Math.round(d * 10) / 10,
-      h: Math.round(h * 10) / 10,
-      floors: Math.max(1, Math.round(h / 3.2)),
-      type,
-      color: pick(rng, district.palette),
-      roof,
-      rotY: rng() < 0.5 ? 0 : Math.PI / 2,
+  // ---------- util ----------
+  function mulberry32(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
-    placed.push(rec);
-    all.push(rec);
-    return true;
   }
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
 
-  for (const district of DISTRICTS) {
-    const [x0, z0, x1, z1] = district.bounds;
-    const placed = [];
-    // Blocks whose centre sits inside this district.
-    const blocks = [];
-    for (let bx = -CITY_HALF + STREET_STEP / 2; bx < CITY_HALF; bx += STREET_STEP) {
-      for (let bz = -CITY_HALF + STREET_STEP / 2; bz < CITY_HALF; bz += STREET_STEP) {
-        if (bx >= x0 + 10 && bx <= x1 - 10 && bz >= z0 + 10 && bz <= z1 - 10) {
-          blocks.push({ x: bx, z: bz });
+  // ---------- distrik ----------
+  // 10 distrik original. Tiap distrik: pusat (x,z), radius, karakter,
+  // palet warna gedung, densitas pejalan kaki siang/malam.
+  const DISTRICTS = [
+    { id: 'pantai-senja', name: 'Pantai Senja', cx: 0,    cz: -150, r: 95,  kind: 'beach',
+      palette: [[0.98, 0.85, 0.62], [0.95, 0.75, 0.55], [1.0, 0.9, 0.7]],
+      walkDay: 0.9, walkNight: 0.35, note: 'Pasir, warung pantai, dermaga kayu.' },
+    { id: 'dermaga', name: 'Dermaga Tua', cx: -120, cz: -110, r: 70, kind: 'harbor',
+      palette: [[0.55, 0.5, 0.45], [0.45, 0.42, 0.4], [0.6, 0.55, 0.5]],
+      walkDay: 0.45, walkNight: 0.15, note: 'Pelabuhan kecil, gudang, perahu nelayan.' },
+    { id: 'pasar-pagi', name: 'Pasar Pagi', cx: -60,  cz: -20,  r: 80, kind: 'market',
+      palette: [[0.85, 0.6, 0.35], [0.9, 0.7, 0.4], [0.75, 0.5, 0.3]],
+      walkDay: 1.0, walkNight: 0.1, note: 'Kios sayur, ikan, kain; ramai pagi hari.' },
+    { id: 'bukit-melati', name: 'Bukit Melati', cx: 110, cz: -90,  r: 85, kind: 'residential',
+      palette: [[0.9, 0.85, 0.8], [0.85, 0.8, 0.72], [0.95, 0.9, 0.85]],
+      walkDay: 0.5, walkNight: 0.3, note: 'Perumahan tenang di bukit, taman kecil.' },
+    { id: 'alun-alun', name: 'Alun-Alun Merdeka', cx: 0,   cz: 10,   r: 75, kind: 'civic',
+      palette: [[0.8, 0.78, 0.72], [0.7, 0.68, 0.62], [0.88, 0.85, 0.8]],
+      walkDay: 0.8, walkNight: 0.4, note: 'Balai kota, taman, air mancur.' },
+    { id: 'jalan-kenanga', name: 'Jalan Kenanga', cx: 90,  cz: 40,   r: 80, kind: 'commercial',
+      palette: [[0.75, 0.7, 0.85], [0.85, 0.75, 0.6], [0.65, 0.7, 0.8]],
+      walkDay: 0.85, walkNight: 0.55, note: 'Toko, kafe, butik; jalan belanja utama.' },
+    { id: 'kampung-nelayan', name: 'Kampung Nelayan', cx: -140, cz: 40,  r: 70, kind: 'village',
+      palette: [[0.7, 0.6, 0.5], [0.6, 0.55, 0.48], [0.8, 0.7, 0.55]],
+      walkDay: 0.6, walkNight: 0.25, note: 'Rumah kayu, jaring, jemuran ikan.' },
+    { id: 'neon-senja', name: 'Neon Senja', cx: 60,  cz: 120,  r: 80, kind: 'nightlife',
+      palette: [[0.35, 0.3, 0.45], [0.45, 0.35, 0.5], [0.3, 0.3, 0.4]],
+      walkDay: 0.3, walkNight: 1.0, note: 'Klub, bar, neon; hidup setelah gelap.' },
+    { id: 'taman-anggrek', name: 'Taman Anggrek', cx: -70, cz: 120,  r: 75, kind: 'park',
+      palette: [[0.6, 0.7, 0.55], [0.7, 0.75, 0.6], [0.55, 0.65, 0.5]],
+      walkDay: 0.7, walkNight: 0.2, note: 'Taman kota, kolam, jalur jogging.' },
+    { id: 'terminal-selatan', name: 'Terminal Selatan', cx: 140, cz: 130, r: 70, kind: 'transit',
+      palette: [[0.65, 0.62, 0.58], [0.55, 0.55, 0.52], [0.7, 0.68, 0.65]],
+      walkDay: 0.75, walkNight: 0.3, note: 'Terminal bus, bengkel, gudang.' },
+  ];
+
+  // ---------- poster original ----------
+  const POSTERS = [
+    'FESTIVAL LAYANG-LAYANG — PANTAI SENJA',
+    'KOPI PAGI Rp8rb — WARUNG BU SITI',
+    'TURNAMEN FUTSAL ANTAR KAMPUNG',
+    'LELANG IKAN SEGAR — DERMAGA TUA',
+    'KELAS MENARI — SANGGAR MELATI',
+    'DISKON BUKU — TOKO BACA KENANGA',
+    'MALAM JAZZ — KLUB LAMPION',
+    'DONOR DARAH — BALAI KOTA',
+    'PASAR MALAM — ALUN-ALUN MERDEKA',
+    'KURSUS BERENANG ANAK — PANTAI SENJA',
+  ];
+
+  // ---------- kota ----------
+  class City {
+    constructor(seed) {
+      this.seed = seed || 20261121;
+      this.rng = mulberry32(this.seed);
+      this.districts = DISTRICTS.map(d => Object.assign({}, d));
+      this.buildings = [];   // {x,z,w,d,h,rot,color,district,windows,lit,interiorId}
+      this.lamps = [];       // {x,z,district,on}
+      this.kiosks = [];      // {x,z,kind,district,queue}
+      this.benches = [];     // {x,z,rot}
+      this.bins = [];        // {x,z}
+      this.posters = [];     // {x,z,rot,text}
+      this.palms = [];       // {x,z,h}
+      this.roads = [];       // {x1,z1,x2,z2,width,kind}
+      this.interiors = [];   // {id,name,buildingId,props:[],door:{x,z}}
+      this.pier = null;      // {x,z,len,w}
+      this.harbor = null;    // {x,z,r}
+      this.beach = null;     // {x,z,w,d}
+      this.timeOfDay = 12;   // jam 0-24
+      this.isNight = false;
+      this.rainZone = null;  // {x,z,r,vx,vz}
+      this.renderer = null;
+      this._build();
+    }
+
+    attachRenderer(renderer) { this.renderer = renderer; }
+
+    // ---- pembangunan kota ----
+    _build() {
+      const rng = this.rng;
+      let id = 0;
+      // Gedung per distrik: grid blok dengan jitter, jalan antar blok.
+      for (const d of this.districts) {
+        const count = d.kind === 'park' ? 6 : d.kind === 'beach' ? 14 : 22;
+        const grid = Math.ceil(Math.sqrt(count * 1.6));
+        const spacing = (d.r * 2) / grid;
+        for (let i = 0; i < grid; i++) {
+          for (let j = 0; j < grid; j++) {
+            if (this.buildings.filter(b => b.district === d.id).length >= count) break;
+            // sisakan koridor jalan di tengah distrik
+            const gx = d.cx - d.r + spacing * (i + 0.5);
+            const gz = d.cz - d.r + spacing * (j + 0.5);
+            if (Math.abs(gx - d.cx) < 7 && d.kind !== 'park') continue; // jalan N-S
+            if (Math.abs(gz - d.cz) < 7 && d.kind !== 'park') continue; // jalan E-W
+            const w = 6 + rng() * 8;
+            const dep = 6 + rng() * 8;
+            const h = d.kind === 'residential' || d.kind === 'village'
+              ? 4 + rng() * 6
+              : d.kind === 'nightlife' || d.kind === 'commercial'
+                ? 10 + rng() * 18
+                : 6 + rng() * 14;
+            const col = d.palette[Math.floor(rng() * d.palette.length)];
+            this.buildings.push({
+              id: id++, x: gx + (rng() - 0.5) * 3, z: gz + (rng() - 0.5) * 3,
+              w, d: dep, h, rot: (rng() - 0.5) * 0.08,
+              color: col, district: d.id, kind: d.kind,
+              windows: Math.max(2, Math.floor(h / 3)),
+              lit: false, interiorId: null,
+            });
+          }
+        }
+        this._fillBlock(d, rng);
+      }
+      // Pastikan total >= 219 gedung: tambah deretan ruko di jalan utama.
+      let guard = 0;
+      while (this.buildings.length < 222 && guard++ < 300) {
+        const d = this.districts[Math.floor(rng() * this.districts.length)];
+        const ang = rng() * Math.PI * 2;
+        const rad = d.r * (0.55 + rng() * 0.4);
+        const x = d.cx + Math.cos(ang) * rad;
+        const z = d.cz + Math.sin(ang) * rad;
+        if (this._tooClose(x, z, 9)) continue;
+        const col = d.palette[Math.floor(rng() * d.palette.length)];
+        this.buildings.push({
+          id: id++, x, z, w: 5 + rng() * 7, d: 5 + rng() * 7,
+          h: 5 + rng() * 12, rot: rng() * Math.PI,
+          color: col, district: d.id, kind: d.kind,
+          windows: 3 + Math.floor(rng() * 4), lit: false, interiorId: null,
+        });
+      }
+
+      // Jalan utama (N-S + E-W), jalan pantai, jalan pelabuhan.
+      this.roads.push(
+        { x1: 0, z1: -200, x2: 0, z2: 200, width: 10, kind: 'main' },
+        { x1: -180, z1: 10, x2: 180, z2: 10, width: 10, kind: 'main' },
+        { x1: -180, z1: -140, x2: 180, z2: -140, width: 8, kind: 'beach' },
+        { x1: -140, z1: -110, x2: -60, z2: -110, width: 8, kind: 'harbor' },
+        { x1: -140, z1: 40, x2: 140, z2: 130, width: 7, kind: 'side' },
+        { x1: 90, z1: -90, x2: 90, z2: 130, width: 7, kind: 'side' },
+      );
+
+      // Pantai, pelabuhan, dermaga.
+      this.beach = { x: 0, z: -175, w: 340, d: 55 };
+      this.harbor = { x: -120, z: -135, r: 45 };
+      this.pier = { x: -20, z: -168, len: 60, w: 6 };
+
+      // Interior yang bisa dimasuki (3): butik, kafe, toko kelontong.
+      this._makeInterior('toko-baju', 'Butik Kenanga', 'jalan-kenanga', [
+        { kind: 'rack', x: -2, z: -1, label: 'Rak baju' },
+        { kind: 'mirror', x: 2, z: -2, label: 'Cermin besar' },
+        { kind: 'photo', x: 0, z: -2.5, label: 'Foto pemilik toko 1998' },
+        { kind: 'counter', x: 0, z: 2, label: 'Kasir' },
+      ]);
+      this._makeInterior('kafe-senja', 'Kafe Senja', 'pantai-senja', [
+        { kind: 'cup', x: -1, z: 0, label: 'Cangkir kopi hangat' },
+        { kind: 'newspaper', x: 1, z: 0, label: 'Koran pagi: Festival Layang-layang' },
+        { kind: 'photo', x: -2, z: -2, label: 'Foto pantai tahun 1987' },
+        { kind: 'table', x: 0, z: 0, label: 'Meja kayu' },
+        { kind: 'plant', x: 2, z: 2, label: 'Tanaman gantung' },
+      ]);
+      this._makeInterior('toko-kelontong', 'Toko Bu Siti', 'pasar-pagi', [
+        { kind: 'shelf', x: -2, z: -1, label: 'Rak sembako' },
+        { kind: 'basket', x: 1, z: 1, label: 'Keranjang sayur' },
+        { kind: 'photo', x: 0, z: -2.5, label: 'Foto keluarga Bu Siti' },
+        { kind: 'counter', x: 0, z: 2, label: 'Kasir' },
+      ]);
+
+      // Zona hujan lokal (bergerak perlahan).
+      this.rainZone = { x: -40, z: 60, r: 55, vx: 0.6, vz: 0.25 };
+    }
+
+    _tooClose(x, z, min) {
+      for (const b of this.buildings) {
+        const dx = b.x - x, dz = b.z - z;
+        if (dx * dx + dz * dz < min * min) return true;
+      }
+      return false;
+    }
+
+    _fillBlock(d, rng) {
+      // Trotoar, kios, bangku, tempat sampah, poster, lampu, palma per distrik.
+      const n = d.kind === 'market' ? 14 : d.kind === 'beach' ? 10 : 8;
+      for (let i = 0; i < n; i++) {
+        const ang = rng() * Math.PI * 2;
+        const rad = d.r * (0.3 + rng() * 0.6);
+        const x = d.cx + Math.cos(ang) * rad;
+        const z = d.cz + Math.sin(ang) * rad;
+        const roll = rng();
+        if (roll < 0.25) {
+          this.kiosks.push({ x, z, kind: d.kind === 'market' ? 'sayur' : d.kind === 'beach' ? 'es-kelapa' : 'kopi', district: d.id, queue: 0 });
+        } else if (roll < 0.5) {
+          this.benches.push({ x, z, rot: rng() * Math.PI });
+        } else if (roll < 0.65) {
+          this.bins.push({ x, z });
+        } else if (roll < 0.85) {
+          this.posters.push({ x, z, rot: rng() * Math.PI * 2, text: POSTERS[Math.floor(rng() * POSTERS.length)] });
+        } else {
+          this.palms.push({ x, z, h: 4 + rng() * 3 });
+        }
+      }
+      // Lampu jalan di sekeliling distrik.
+      const lampCount = 10;
+      for (let i = 0; i < lampCount; i++) {
+        const ang = (i / lampCount) * Math.PI * 2;
+        this.lamps.push({ x: d.cx + Math.cos(ang) * d.r * 0.8, z: d.cz + Math.sin(ang) * d.r * 0.8, district: d.id, on: false });
+      }
+      // Palma ekstra di pantai.
+      if (d.kind === 'beach') {
+        for (let i = 0; i < 18; i++) {
+          this.palms.push({ x: d.cx - d.r + rng() * d.r * 2, z: d.cz - 20 + rng() * 30, h: 5 + rng() * 3 });
         }
       }
     }
-    // Shuffle so the dense side of a district is not always the same.
-    for (let i = blocks.length - 1; i > 0; i--) {
-      const j = Math.floor(rng() * (i + 1));
-      [blocks[i], blocks[j]] = [blocks[j], blocks[i]];
+
+    _makeInterior(id, name, districtId, props) {
+      // Cari gedung terdekat di distrik itu, jadikan interior.
+      let best = null, bestD = Infinity;
+      const d = this.districts.find(x => x.id === districtId);
+      for (const b of this.buildings) {
+        if (b.district !== districtId || b.interiorId) continue;
+        const dx = b.x - d.cx, dz = b.z - d.cz;
+        const dd = dx * dx + dz * dz;
+        if (dd < bestD) { bestD = dd; best = b; }
+      }
+      if (!best) return;
+      best.interiorId = id;
+      this.interiors.push({
+        id, name, district: districtId, buildingId: best.id,
+        door: { x: best.x, z: best.z + best.d / 2 + 0.5 },
+        props: props.map(p => Object.assign({}, p)),
+        closedAfterRobbery: false, guarded: false,
+      });
     }
-    for (let bi = 0; bi < blocks.length && placed.length < district.quota; bi++) {
-      const block = blocks[bi];
-      const remaining = district.quota - placed.length;
-      const blocksAfter = blocks.length - bi - 1;
-      // Minimum this block must contribute so the blocks after it
-      // (max 4 each) can still finish the quota.
-      let n = Math.max(1, remaining - blocksAfter * 4);
-      n = Math.min(n, 4, remaining);
-      // Occasionally pack one extra building in, when the blocks
-      // after this one can still absorb the rest.
-      if (n < 4 && n < remaining && rng() < 0.35 && remaining - (n + 1) <= blocksAfter * 4) n++;
-      const slots = slotLayout(n, rng() < 0.5);
-      for (const s of slots) {
-        if (placed.length >= district.quota) break;
-        tryPlace(placed, buildings, district, block.x + s.dx, block.z + s.dz, s.mw, s.md);
+
+    // ---- waktu ----
+    setTimeOfDay(hours) {
+      this.timeOfDay = ((hours % 24) + 24) % 24;
+      const h = this.timeOfDay;
+      this.isNight = h < 6 || h >= 18.5;
+      const lit = this.isNight;
+      for (const b of this.buildings) b.lit = lit && this.rng() < 0.55;
+      for (const l of this.lamps) l.on = lit;
+      // Hujan lokal bergerak perlahan.
+      if (this.rainZone) {
+        this.rainZone.x += this.rainZone.vx * 0.016;
+        this.rainZone.z += this.rainZone.vz * 0.016;
+        if (this.rainZone.x > 160) this.rainZone.x = -160;
+        if (this.rainZone.z > 180) this.rainZone.z = -180;
       }
     }
-    // Top-up: random retry for anything the block pass could not
-    // place (e.g. Marina Bay slots rejected at the water's edge).
-    let guard = 0;
-    while (placed.length < district.quota && guard < 8000) {
-      guard++;
-      const x = range(rng, x0 + 8, x1 - 8);
-      const z = range(rng, z0 + 8, z1 - 8);
-      if (isOnStreet(x, z)) continue;
-      tryPlace(placed, buildings, district, x, z, 14, 14);
+
+    isRainingAt(x, z) {
+      if (!this.rainZone) return false;
+      const dx = x - this.rainZone.x, dz = z - this.rainZone.z;
+      return dx * dx + dz * dz < this.rainZone.r * this.rainZone.r;
     }
-    byDistrict[district.name] = placed;
-  }
 
-  if (buildings.length !== TOTAL_BUILDINGS) {
-    throw new Error(
-      `generateCity: expected ${TOTAL_BUILDINGS} buildings, got ${buildings.length}`
-    );
-  }
+    districtAt(x, z) {
+      let best = null, bestD = Infinity;
+      for (const d of this.districts) {
+        const dx = x - d.cx, dz = z - d.cz;
+        const dd = dx * dx + dz * dz;
+        if (dd < bestD && dd < d.r * d.r) { bestD = dd; best = d; }
+      }
+      return best;
+    }
 
-  const roads = buildRoads();
-  const intersections = buildIntersections(roads);
-  const city = {
-    seed,
-    half: CITY_HALF,
-    streetStep: STREET_STEP,
-    streetWidth: STREET_WIDTH,
-    districts: DISTRICTS.map((d) => ({ name: d.name, bounds: d.bounds, quota: d.quota })),
-    buildings,
-    byDistrict,
-    roads,
-    intersections,
-    trafficLights: buildTrafficLights(rng, intersections),
-    streetLights: buildStreetLights(),
-    sidewalks: buildSidewalks(),
-    // The sea starts here (south edge); water.js owns everything
-    // past this line. The pier juts out from the Marina Bay shore.
-    seaLineZ: 190,
-    pier: { x: 0, z: 205, w: 10, d: 34, deckY: 1.2 },
-    spawn: { x: 0, z: 170, yaw: Math.PI },
-  };
+    // Densitas pejalan kaki target untuk satu distrik pada jam tertentu.
+    walkDensity(districtId, hour) {
+      const d = this.districts.find(x => x.id === districtId);
+      if (!d) return 0.4;
+      const h = hour == null ? this.timeOfDay : hour;
+      let base = (h >= 6 && h < 18) ? d.walkDay : d.walkNight;
+      // Jam makan siang: antrean di kios pasar & jalan belanja.
+      if (h >= 11.5 && h <= 13.5 && (d.kind === 'market' || d.kind === 'commercial')) base *= 1.4;
+      // Sunset: pantai ramai.
+      if (h >= 17 && h < 19 && d.kind === 'beach') base *= 1.5;
+      // Dini hari: jalan sepi.
+      if (h >= 1 && h < 5) base *= 0.3;
+      return clamp(base, 0, 1.6);
+    }
 
-  // Freeze the district lookup table for fast point queries.
-  city.getDistrict = (x, z) => getDistrict(city, x, z);
-  return city;
-}
+    // Antrean kecil di depan kios saat jam makan siang.
+    updateKioskQueues(hour) {
+      const lunch = hour >= 11.5 && hour <= 13.5;
+      for (const k of this.kiosks) {
+        const d = this.districts.find(x => x.id === k.district);
+        k.queue = lunch && (d.kind === 'market' || d.kind === 'commercial' || d.kind === 'beach')
+          ? 2 + Math.floor(this.rng() * 3)
+          : 0;
+      }
+    }
 
-// District containing the point (x, z), or null outside the city.
-// Call as getDistrict(city, x, z); getDistrict(x, z) also works and
-// looks the point up in the built-in DISTRICTS table. Marina Bay and
-// Hillcrest are real districts here, not aliases: the ten DISTRICTS
-// entries above are the single source of truth.
-function getDistrict(cityOrX, xOrZ, z) {
-  let districts;
-  let px, pz;
-  if (typeof cityOrX === "number") {
-    districts = DISTRICTS;
-    px = cityOrX;
-    pz = xOrZ;
-  } else {
-    districts = Array.isArray(cityOrX) ? cityOrX : cityOrX.districts;
-    px = xOrZ;
-    pz = z;
-  }
-  for (const d of districts) {
-    const b = d.bounds;
-    if (px >= b[0] && px <= b[2] && pz >= b[1] && pz <= b[3]) return d.name;
-  }
-  return null;
-}
+    // Toko tutup + polisi berjaga setelah dirampok.
+    markRobbed(interiorId) {
+      const it = this.interiors.find(x => x.id === interiorId);
+      if (it) { it.closedAfterRobbery = true; it.guarded = true; }
+    }
+    reopen(interiorId) {
+      const it = this.interiors.find(x => x.id === interiorId);
+      if (it) { it.closedAfterRobbery = false; it.guarded = false; }
+    }
 
-function buildingsInDistrict(city, name) {
-  return city.byDistrict[name] ? [...city.byDistrict[name]] : [];
-}
+    interiorAt(x, z, radius) {
+      const r = radius || 3;
+      for (const it of this.interiors) {
+        const dx = x - it.door.x, dz = z - it.door.z;
+        if (dx * dx + dz * dz < r * r) return it;
+      }
+      return null;
+    }
 
-// Cheap AABB test: is the point inside any building footprint?
-function buildingAt(city, x, z, pad = 0) {
-  for (const b of city.buildings) {
-    if (Math.abs(x - b.x) <= b.w / 2 + pad && Math.abs(z - b.z) <= b.d / 2 + pad) return b;
-  }
-  return null;
-}
+    buildingCount() { return this.buildings.length; }
 
-// Random street position (used for traffic / pedestrian spawns).
-function randomStreetPoint(rng, city) {
-  const roads = city.roads;
-  const road = roads[Math.floor(rng() * roads.length)];
-  const t = (rng() * 2 - 1) * (CITY_HALF - 10);
-  return road.axis === "x" ? { x: road.at, z: t } : { x: t, z: road.at };
-}
-
-// ---------------------------------------------------------------------------
-// Rendering (v10 integration): build() generates the city once and merges
-// every static piece into ONE mesh (ground, roads, sidewalks, buildings
-// with roofs); render() draws it every frame with GL.drawMesh. Without
-// these, main.js had nothing to call and the city never appeared.
-// ---------------------------------------------------------------------------
-
-let cachedCity = null;
-let cachedMesh = null;
-
-function buildCityMesh(city) {
-  const M = SB.Meshes;
-  if (!M) return null;
-  const b = new M.MeshBuilder();
-  // Ground: dry land only (z -240 .. sea line 190); the sea is water.js.
-  b.flatQuad(0, -0.05, (-CITY_HALF + 190) / 2, CITY_HALF * 2, 190 + CITY_HALF, "#5d7a4a");
-  // Roads: dark asphalt strips along every street centreline.
-  for (const road of city.roads) {
-    if (road.axis === "x") {
-      b.flatQuad(road.at, 0.0, 0, STREET_WIDTH, CITY_HALF * 2, "#3a3a40");
-    } else {
-      b.flatQuad(0, 0.0, road.at, CITY_HALF * 2, STREET_WIDTH, "#3a3a40");
+    // Ringkasan untuk HUD / debug.
+    summary() {
+      return {
+        buildings: this.buildings.length,
+        districts: this.districts.length,
+        lamps: this.lamps.length,
+        kiosks: this.kiosks.length,
+        benches: this.benches.length,
+        palms: this.palms.length,
+        posters: this.posters.length,
+        interiors: this.interiors.map(i => i.id),
+        isNight: this.isNight,
+        timeOfDay: this.timeOfDay,
+      };
     }
   }
-  // Sidewalks: pale strips flanking the roads.
-  for (const walk of city.sidewalks) {
-    if (walk.axis === "x") {
-      b.flatQuad(walk.x, 0.01, walk.z, walk.w, walk.d, "#8f8f86");
-    } else {
-      b.flatQuad(walk.x, 0.01, walk.z, walk.w, walk.d, "#8f8f86");
-    }
-  }
-  // Buildings: solid box + roof (gable / pyramid / flat cap).
-  for (const bd of city.buildings) {
-    b.boxAt(bd.x, 0, bd.z, bd.w, bd.h, bd.d, bd.color);
-    if (bd.roof === "gable") {
-      b.gableRoof(bd.x, bd.h, bd.z, bd.w + 0.6, Math.min(3.5, bd.w * 0.22), bd.d + 0.6, "#6b4a3a");
-    } else if (bd.roof === "pyramid") {
-      b.pyramid(bd.x, bd.h, bd.z, Math.max(bd.w, bd.d) * 0.75, Math.min(4, bd.w * 0.25), "#7a5240");
-    }
-  }
-  // Marina pier approach: wooden boardwalk strip on the shore.
-  b.flatQuad(0, 0.02, 186, 16, 8, "#8a6d4b");
-  return b.build();
-}
 
-/** Generate the city (once) and build its static render mesh. */
-function build(seed) {
-  cachedCity = generateCity(seed === undefined ? 1337 : seed);
-  cachedMesh = buildCityMesh(cachedCity);
-  return cachedCity;
-}
+  function createCity(seed) { return new City(seed); }
 
-function getBuiltCity() {
-  if (!cachedCity) build();
-  return cachedCity;
-}
-
-/** Draw the whole city. Call once per frame; mesh is built once. */
-function render(GL, Math3) {
-  if (!cachedCity || !cachedMesh) build();
-  if (!cachedMesh || !GL || typeof GL.drawMesh !== "function") return false;
-  const identity = Math3 && typeof Math3.mat4Identity === "function"
-    ? Math3.mat4Identity()
-    : new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
-  GL.drawMesh(cachedMesh, identity);
-  return true;
-}
-
-SB.City = {
-  DISTRICTS,
-  TOTAL_BUILDINGS,
-  CITY_HALF,
-  STREET_STEP,
-  STREET_WIDTH,
-  generateCity,
-  getDistrict,
-  buildingsInDistrict,
-  buildingAt,
-  isOnStreet,
-  randomStreetPoint,
-  build,
-  getBuiltCity,
-  render,
-};
-
-const City = SB.City;
-
-export { City, generateCity, getDistrict, buildingsInDistrict, buildingAt, isOnStreet, DISTRICTS, TOTAL_BUILDINGS, build, getBuiltCity, render as renderCity };
-export default SB.City;
+  const api = { City, createCity, DISTRICTS, POSTERS };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  global.SunsetCity = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);

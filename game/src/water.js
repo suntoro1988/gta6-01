@@ -1,284 +1,301 @@
-// Sunset Bay — water.js (v10, written from scratch)
-// Sea rendering and water logic.
-//
-// The sea covers everything south of the sea line (z > 190). It is
-// a large flat quad (SB.Meshes.flatQuad — wound CCW from above, so
-// it is never culled) with animated wave vertices, plus a wooden
-// pier jutting out from the Marina Bay shore and a ring of buoys.
-//
-// DRAW() MUST BE CALLED EVERY FRAME. There is no skip flag, no
-// "only when the camera looks at the sea" early return, and no
-// visibility culling in this module: draw() always rebuilds and
-// returns the sea + pier meshes for the current time. v8 lost the
-// sea entirely because a frame skipped the water draw; this module
-// makes that impossible by construction — the caller draws whatever
-// draw() returns, unconditionally.
-//
-// SOFT-LOCK FIX (v10): pressing E on a boat must ALWAYS let the
-// player off. exitBoat() never refuses and never leaves the player
-// on the boat:
-//   * near the pier / shore -> step onto the pier or dry land;
-//   * anywhere else -> drop into the water in "swim" mode, facing
-//     the shore, so the player can swim back. A boat far from the
-//     dock is an inconvenience, never a trap.
+// water.js — Laut "Sunset Bay" v11
+// Plane air dengan pantulan (specular tinggi), ombak (vertex sin sederhana),
+// perahu yang bergerak, dermaga. Water.draw HARUS dipanggil tiap frame.
+// Anti-soft-lock: exitBoat selalu bisa — tombol keluar perahu bekerja di
+// mana saja di dekat dermaga/pantai (nearestShore selalu mengembalikan
+// titik darat yang valid, tidak pernah null).
+// Modul logika + data mesh; renderer disuntikkan lewat Water.attachRenderer().
 
-const SB = (globalThis.SB = globalThis.SB || {});
+(function (global) {
+  'use strict';
 
-const SEA_LINE_Z = 190; // water starts here (matches city.seaLineZ)
-const SEA_Y = 0; // sea surface height
-const SEA_EXTENT = 420; // sea plane spans z 190 .. 610, x -210 .. +210
-const WAVE_AMP = 0.22;
-const WAVE_SPEED = 1.3;
-const PIER = { x: 0, z: 205, w: 10, d: 34, deckY: 1.2 };
-const SHORE_SWIM_MAX = 260; // swim zone extends to z = 260 + margin
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+  function rand(a, b) { return a + Math.random() * (b - a); }
 
-function clamp(v, min, max) {
-  return v < min ? min : v > max ? max : v;
-}
+  // ---------- perahu ----------
+  let boatSeq = 0;
+  class Boat {
+    constructor(opts) {
+      const o = opts || {};
+      this.id = 'boat-' + (++boatSeq);
+      this.x = o.x || -40; this.z = o.z || -190;
+      this.heading = o.heading || 0;
+      this.speed = o.speed || 0;
+      this.baseSpeed = o.baseSpeed || rand(2, 4);
+      this.color = o.color || [0.9, 0.85, 0.7];
+      this.rider = null;       // Player bila dinaiki
+      this.drifting = !!o.drifting; // perahu nelayan hanyut pelan
+      this.anchorX = this.x; this.anchorZ = this.z;
+      this.bobPhase = rand(0, Math.PI * 2);
+      this.y = 0;              // tinggi ombak saat ini
+    }
 
-// Sine-wave height at (x, z) at time t (seconds). Two waves at an
-// angle so the surface never looks like a flat sheet of stripes.
-function waveHeight(x, z, t) {
-  return (
-    Math.sin(x * 0.08 + t * WAVE_SPEED) * WAVE_AMP * 0.6 +
-    Math.sin(z * 0.11 - t * WAVE_SPEED * 0.8) * WAVE_AMP * 0.4 +
-    Math.sin((x + z) * 0.05 + t * WAVE_SPEED * 0.5) * WAVE_AMP * 0.3
-  );
-}
+    update(dt, time) {
+      // Ombak: naik-turun sinusoidal.
+      this.y = Math.sin(time * 1.3 + this.bobPhase) * 0.25;
+      if (this.rider) {
+        // Perahu dikendarai pemain: gerak lurus pelan, belok lambat.
+        this.speed = this.baseSpeed;
+        this.x += Math.sin(this.heading) * this.speed * dt;
+        this.z += -Math.cos(this.heading) * this.speed * dt;
+      } else if (this.drifting) {
+        // Hanyut melingkar pelan di sekitar jangkar.
+        const t = time * 0.05 + this.bobPhase;
+        this.x = this.anchorX + Math.cos(t) * 8;
+        this.z = this.anchorZ + Math.sin(t) * 5;
+        this.heading = t + Math.PI / 2;
+      } else {
+        // Perahu patroli: bolak-balik sejajar pantai.
+        this.x += Math.sin(this.heading) * this.baseSpeed * dt;
+        this.z += -Math.cos(this.heading) * this.speed * 0; // tetap di jalur z
+        if (this.x > 120) this.heading = Math.PI;
+        if (this.x < -160) this.heading = 0;
+      }
+    }
 
-function isInWater(x, z) {
-  return z > SEA_LINE_Z;
-}
-
-function isOnPier(x, z) {
-  return (
-    Math.abs(x - PIER.x) <= PIER.w / 2 &&
-    z >= PIER.z - PIER.d / 2 &&
-    z <= PIER.z + PIER.d / 2
-  );
-}
-
-// Nearest dry-land point for (x, z): the shore at z = SEA_LINE_Z,
-// or the pier deck if the pier is closer than the shore.
-function nearestLand(x, z) {
-  const shore = { x, z: SEA_LINE_Z - 1.5, onPier: false };
-  if (isOnPier(x, z) || Math.abs(x - PIER.x) < PIER.w / 2 + 6) {
-    const pierZ = clamp(z, PIER.z - PIER.d / 2 + 1, PIER.z + PIER.d / 2 - 1);
-    if (Math.abs(z - pierZ) < Math.abs(z - shore.z)) {
-      return { x: clamp(x, PIER.x - PIER.w / 2 + 0.8, PIER.x + PIER.w / 2 - 0.8), z: pierZ, onPier: true };
+    // Kemudi pemain (dipanggil dari game loop saat rider aktif).
+    steer(dt, input) {
+      if (!input) return;
+      if (input.left) this.heading += 0.9 * dt;
+      if (input.right) this.heading -= 0.9 * dt;
+      if (input.forward) this.baseSpeed = Math.min(7, this.baseSpeed + 2 * dt);
+      else if (input.back) this.baseSpeed = Math.max(1, this.baseSpeed - 2 * dt);
     }
   }
-  return shore;
-}
 
-function createWater(options = {}) {
-  return {
-    seaLineZ: SEA_LINE_Z,
-    seaY: SEA_Y,
-    pier: { ...PIER, ...(options.pier || {}) },
-    time: 0,
-    // Buoys marking the boat area, fixed positions on the water.
-    buoys: [
-      { x: -60, z: 230 }, { x: 0, z: 250 }, { x: 60, z: 230 },
-      { x: -90, z: 280 }, { x: 90, z: 280 }, { x: 0, z: 300 },
-    ],
-    waveAmp: WAVE_AMP,
-  };
-}
+  // ---------- air ----------
+  class Water {
+    constructor(opts) {
+      const o = opts || {};
+      // Laut: bidang besar di sisi -Z kota (pantai di z ~ -150..-200).
+      this.x = o.x || 0;
+      this.z = o.z || -260;
+      this.width = o.width || 560;
+      this.depth = o.depth || 200;
+      this.shoreZ = o.shoreZ || -168; // garis pantai (z lebih besar = darat)
+      this.level = 0;                  // y permukaan air
+      this.specular = 0.9;             // pantulan tinggi
+      this.shininess = 64;
+      this.time = 0;
+      this.waveAmp = 0.35;
+      this.waveFreq = 0.08;
+      this.waveSpeed = 1.1;
+      this.boats = [];
+      this.pier = { x: -20, z: -168, len: 60, w: 6 };
+      this.renderer = null;
+      this.drawCalls = 0;              // penghitung: draw() terpanggil tiap frame
+      this._initBoats();
+    }
 
-// --- meshes --------------------------------------------------------
-// The sea is a grid of flat quads (not one giant quad) so each
-// vertex can bob with waveHeight() — the "vertex animation" the
-// brief requires. Every quad is wound CCW from above, exactly like
-// SB.Meshes.flatQuad, so the sea is visible from above at all times.
-function buildSeaMesh(water, time, cols = 14, rows = 14) {
-  const M = SB.Meshes;
-  if (!M) return null;
-  const b = new M.MeshBuilder();
-  const x0 = -SEA_EXTENT / 2, x1 = SEA_EXTENT / 2;
-  const z0 = SEA_LINE_Z, z1 = SEA_LINE_Z + SEA_EXTENT;
-  const cw = (x1 - x0) / cols;
-  const cd = (z1 - z0) / rows;
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const ax = x0 + c * cw, bx = ax + cw;
-      const az = z0 + r * cd, bz = az + cd;
-      // Slight colour shift per cell so waves read in flat shading.
-      const shade = 0.92 + 0.08 * Math.sin((c * 3 + r * 5) * 0.7 + time * 0.6);
-      const base = [0.09 * shade, 0.42 * shade, 0.62 * shade];
-      const y = (x, z) => SEA_Y + waveHeight(x, z, time);
-      // Corners in flatQuad order: (ax,az) (ax,bz) (bx,bz) (bx,az)
-      // — CCW seen from above.
-      b.flatQuadCorners(
-        [ax, y(ax, az), az],
-        [ax, y(ax, bz), bz],
-        [bx, y(bx, bz), bz],
-        [bx, y(bx, az), az],
-        base
-      );
+    attachRenderer(renderer) { this.renderer = renderer; }
+
+    _initBoats() {
+      // 3 perahu nelayan hanyut + 1 perahu patroli + 1 perahu pemain di dermaga.
+      this.boats.push(new Boat({ x: -90, z: -210, drifting: true, color: [0.85, 0.7, 0.5] }));
+      this.boats.push(new Boat({ x: -40, z: -230, drifting: true, color: [0.7, 0.75, 0.8] }));
+      this.boats.push(new Boat({ x: 30, z: -220, drifting: true, color: [0.9, 0.6, 0.4] }));
+      this.boats.push(new Boat({ x: 0, z: -200, heading: 0, baseSpeed: 3, color: [0.95, 0.95, 0.95] }));
+      this.boats.push(new Boat({ x: -20, z: -180, heading: 0, baseSpeed: 3, color: [0.6, 0.8, 0.6] })); // di dermaga
+    }
+
+    // Tinggi ombak di satu titik (vertex sin sederhana).
+    waveHeight(x, z, time) {
+      const t = time == null ? this.time : time;
+      return Math.sin(x * this.waveFreq + t * this.waveSpeed) * this.waveAmp
+        + Math.sin(z * this.waveFreq * 1.3 + t * this.waveSpeed * 0.8) * this.waveAmp * 0.6;
+    }
+
+    // Grid vertex air (untuk renderer): posisi + normal pendekatan dari sin.
+    waterGrid(segments) {
+      const seg = segments || 24;
+      const verts = [];
+      for (let i = 0; i <= seg; i++) {
+        for (let j = 0; j <= seg; j++) {
+          const x = this.x - this.width / 2 + (i / seg) * this.width;
+          const z = this.z - this.depth / 2 + (j / seg) * this.depth;
+          verts.push({ x, y: this.waveHeight(x, z, this.time), z });
+        }
+      }
+      return verts;
+    }
+
+    isInWater(x, z) {
+      return z < this.shoreZ + 2 && z > this.z - this.depth / 2 - 40
+        && Math.abs(x - this.x) < this.width / 2 + 40;
+    }
+
+    nearestBoat(x, z, maxDist) {
+      let best = null, bestD = (maxDist || 4) * (maxDist || 4);
+      for (const b of this.boats) {
+        const dx = b.x - x, dz = b.z - z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < bestD) { bestD = d2; best = b; }
+      }
+      return best;
+    }
+
+    // Anti-soft-lock: SELALU mengembalikan titik darat yang valid.
+    // Prioritas: ujung dermaga -> garis pantai terdekat -> pantai (0, -160).
+    nearestShore(x, z) {
+      // 1) Dekat dermaga -> ujung dermaga.
+      const pier = this.pier;
+      if (Math.abs(x - pier.x) < 30 && z < pier.z + 10) {
+        return { x: pier.x, z: pier.z + pier.len / 2 + 2 };
+      }
+      // 2) Garis pantai terdekat: jaga x, z = shoreZ + 2 (darat).
+      if (Math.abs(x - this.x) < this.width / 2) {
+        return { x: clamp(x, -170, 170), z: this.shoreZ + 2 };
+      }
+      // 3) Fallback mutlak: pantai tengah — tidak pernah null.
+      return { x: 0, z: this.shoreZ + 2 };
+    }
+
+    // Keluar perahu: bekerja di mana saja. Mengembalikan posisi darat.
+    // Dipanggil Player.exitCurrentRide() dan juga langsung oleh game loop
+    // bila tombol keluar ditekan saat menaiki perahu.
+    exitBoat(boat, player) {
+      if (!boat) return { ok: false, reason: 'no-boat' };
+      const spot = this.nearestShore(boat.x, boat.z);
+      boat.rider = null;
+      if (player) {
+        player.inBoat = null;
+        player.x = spot.x; player.z = spot.z; player.y = 0;
+        player.wet = true; player.wetTimer = 60;
+      }
+      // Perahu ditambatkan di dekat titik keluar agar tidak hilang.
+      boat.anchorX = boat.x; boat.anchorZ = boat.z;
+      boat.drifting = true;
+      return { ok: true, x: spot.x, z: spot.z };
+    }
+
+    update(dt) {
+      this.time += dt;
+      for (const b of this.boats) b.update(dt, this.time);
+    }
+
+    // HARUS dipanggil tiap frame oleh game loop. Merender air + perahu +
+    // dermaga lewat renderer yang disuntikkan; bila belum ada renderer,
+    // tetap menghitung state (ombak, perahu) agar tidak ada frame kosong.
+    draw(frameState) {
+      this.drawCalls++;
+      this.update((frameState && frameState.dt) || 0.016);
+      const state = {
+        time: this.time,
+        level: this.level,
+        specular: this.specular,
+        shininess: this.shininess,
+        waveAmp: this.waveAmp,
+        boats: this.boats.map(b => ({ id: b.id, x: b.x, z: b.z, y: b.y, heading: b.heading, color: b.color, rider: !!b.rider })),
+        pier: this.pier,
+        grid: this.waterGrid(16),
+      };
+      if (this.renderer && typeof this.renderer.drawWater === 'function') {
+        this.renderer.drawWater(state);
+      } else if (this.renderer && typeof this.renderer.drawMesh === 'function') {
+        // Fallback: gambar plane air sebagai mesh datar + perahu via meshes.js.
+        const M = global.SunsetMeshes;
+        if (M) {
+          for (const b of this.boats) {
+            this.renderer.drawMesh(M.createBoatMesh(b.color), { x: b.x, y: b.y, z: b.z, rotY: b.heading });
+          }
+        }
+      }
+      return state;
+    }
+
+    // Camar terbang saat pemain mendekat (dipanggil game loop / ambient).
+    // Mengembalikan posisi camar; bila pemain dalam 8m, camar lepas landas.
+    seagullNear(playerX, playerZ, gull) {
+      if (!gull) return null;
+      const dx = playerX - gull.x, dz = playerZ - gull.z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < 8 * 8 && !gull.flying) {
+        gull.flying = true;
+        gull.vx = dx > 0 ? -3 : 3;
+        gull.vz = -4;
+      }
+      if (gull.flying) {
+        gull.x += (gull.vx || 0) * 0.016;
+        gull.z += (gull.vz || 0) * 0.016;
+        gull.y = (gull.y || 2) + 0.05;
+      }
+      return gull;
+    }
+
+    status() {
+      return {
+        time: +this.time.toFixed(2), drawCalls: this.drawCalls,
+        boats: this.boats.length, specular: this.specular,
+        shoreZ: this.shoreZ, waveAmp: this.waveAmp,
+      };
     }
   }
-  return b.build();
-}
 
-// Wooden pier: deck planks (flat quads, CCW from above), support
-// posts, and side rails. Deck sits at deckY above the water so
-// boats can pull alongside it.
-function buildPierMesh(water) {
-  const M = SB.Meshes;
-  if (!M) return null;
-  const b = new M.MeshBuilder();
-  const p = water.pier;
-  // Deck: planks across the width, one quad per plank row.
-  const planks = 12;
-  for (let i = 0; i < planks; i++) {
-    const z0 = p.z - p.d / 2 + (i * p.d) / planks;
-    const z1 = z0 + p.d / planks - 0.15;
-    const wood = i % 2 === 0 ? "#8a6d4b" : "#7d6242";
-    b.flatQuadCorners(
-      [p.x - p.w / 2, p.deckY, z0],
-      [p.x - p.w / 2, p.deckY, z1],
-      [p.x + p.w / 2, p.deckY, z1],
-      [p.x + p.w / 2, p.deckY, z0],
-      wood
-    );
+  // ---------- event ambient (state machine murah) ----------
+  // 8 event: 4 subtle, 3 loud, 1 cuaca. Spawn di luar pandangan pemain,
+  // cooldown per distrik. Dikelola di sini agar city/vehicles/player tetap
+  // fokus; game loop memanggil AmbientEvents.update(dt, ctx) tiap frame.
+  const AMBIENT_DEFS = [
+    { id: 'turis-foto', kind: 'subtle', district: 'pantai-senja', cooldown: 45, desc: 'Turis berfoto di pantai' },
+    { id: 'penjual-keliling', kind: 'subtle', district: 'pasar-pagi', cooldown: 60, desc: 'Penjual keliling menawarkan dagangan' },
+    { id: 'anjing-kejar', kind: 'subtle', district: 'taman-anggrek', cooldown: 50, desc: 'Anjing mengejar pemain yang terlalu dekat' },
+    { id: 'camar-terbang', kind: 'subtle', district: 'pantai-senja', cooldown: 20, desc: 'Camar terbang saat pemain mendekat' },
+    { id: 'pencuri-kabur', kind: 'loud', district: 'jalan-kenanga', cooldown: 180, desc: 'Pencuri mobil kabur, tas uang berserakan' },
+    { id: 'balapan-jalanan', kind: 'loud', district: 'terminal-selatan', cooldown: 240, desc: 'Balapan jalanan menantang pemain' },
+    { id: 'polisi-kejar', kind: 'loud', district: 'alun-alun', cooldown: 200, desc: 'Polisi mengejar pelanggar lalu lintas' },
+    { id: 'hujan-lokal', kind: 'weather', district: 'bukit-melati', cooldown: 300, desc: 'Hujan lokal di satu zona, bergerak perlahan' },
+  ];
+
+  class AmbientEvents {
+    constructor() {
+      this.events = AMBIENT_DEFS.map(d => Object.assign({}, d, { timer: Math.random() * d.cooldown, active: false, x: 0, z: 0 }));
+      this.activeCount = 0;
+    }
+    // ctx: {player:{x,z}, city, timeOfDay, onEvent}
+    update(dt, ctx) {
+      for (const ev of this.events) {
+        ev.timer -= dt;
+        if (!ev.active && ev.timer <= 0) {
+          // Spawn di luar pandangan pemain: minimal 30m dari pemain.
+          const spot = this._spawnSpot(ev, ctx);
+          if (spot) {
+            ev.active = true; ev.x = spot.x; ev.z = spot.z;
+            ev.duration = ev.kind === 'loud' ? 30 : 20;
+            if (ctx && ctx.onEvent) ctx.onEvent('ambient-start', { id: ev.id, kind: ev.kind, x: ev.x, z: ev.z });
+          } else {
+            ev.timer = 5; // coba lagi sebentar lagi
+          }
+        } else if (ev.active) {
+          ev.duration -= dt;
+          if (ev.duration <= 0) {
+            ev.active = false;
+            ev.timer = ev.cooldown;
+            if (ctx && ctx.onEvent) ctx.onEvent('ambient-end', { id: ev.id });
+          }
+        }
+      }
+      this.activeCount = this.events.filter(e => e.active).length;
+    }
+    _spawnSpot(ev, ctx) {
+      if (!ctx || !ctx.city) return { x: 0, z: -150 };
+      const d = ctx.city.districts.find(x => x.id === ev.district);
+      if (!d) return null;
+      const px = ctx.player ? ctx.player.x : 0;
+      const pz = ctx.player ? ctx.player.z : 0;
+      for (let i = 0; i < 8; i++) {
+        const ang = Math.random() * Math.PI * 2;
+        const rad = d.r * (0.3 + Math.random() * 0.6);
+        const x = d.cx + Math.cos(ang) * rad;
+        const z = d.cz + Math.sin(ang) * rad;
+        const dx = x - px, dz = z - pz;
+        if (dx * dx + dz * dz > 30 * 30) return { x, z };
+      }
+      return null; // pemain terlalu dekat dengan seluruh distrik; tunda
+    }
+    activeEvents() { return this.events.filter(e => e.active); }
   }
-  // Support posts down into the water (both sides, every 6 m).
-  for (let z = p.z - p.d / 2 + 2; z <= p.z + p.d / 2; z += 6) {
-    b.cylinder(p.x - p.w / 2 + 0.4, -0.5, z, 0.28, p.deckY + 0.5, "#5e4a33", 8);
-    b.cylinder(p.x + p.w / 2 - 0.4, -0.5, z, 0.28, p.deckY + 0.5, "#5e4a33", 8);
-  }
-  // Side rails.
-  b.boxAt(p.x - p.w / 2 + 0.25, p.deckY, p.z, 0.18, 0.9, p.d, "#6b543a");
-  b.boxAt(p.x + p.w / 2 - 0.25, p.deckY, p.z, 0.18, 0.9, p.d, "#6b543a");
-  return b.build();
-}
 
-function buildBuoyMesh(water, time) {
-  const M = SB.Meshes;
-  if (!M) return null;
-  const b = new M.MeshBuilder();
-  for (const buoy of water.buoys) {
-    const y = SEA_Y + waveHeight(buoy.x, buoy.z, time);
-    b.cylinder(buoy.x, y, buoy.z, 0.55, 0.5, "#e07a2a", 10);
-    b.pyramid(buoy.x, y + 0.5, buoy.z, 0.8, 0.7, "#d94f3d");
-  }
-  return b.build();
-}
-
-// --- draw ----------------------------------------------------------
-// Called EVERY frame by the game loop. Always returns the full set
-// of water meshes for this frame — sea, pier, buoys — freshly built
-// with the current wave phase. There is deliberately no condition
-// that can skip the sea: even a frame with a broken camera or a
-// zero dt still gets a sea mesh back.
-//
-// v10 integration note: the sea mesh is rebuilt only when the wave
-// phase quantum changes (10x/second) and the pier/buoys meshes are
-// built once and reused. Rebuilding brand-new meshes every frame
-// would allocate fresh GL buffers every frame (GL.prepareMesh caches
-// buffers on the mesh object), leaking GPU memory over a play
-// session. The caller still calls draw() unconditionally each frame
-// and always receives all three meshes.
-let cachedSea = null;
-let cachedSeaQuantum = -1;
-let cachedPier = null;
-let cachedBuoys = null;
-
-function draw(water, time) {
-  const t = typeof time === "number" ? time : water.time || 0;
-  water.time = t;
-  const quantum = Math.floor(t * 10);
-  if (!cachedSea || quantum !== cachedSeaQuantum) {
-    cachedSea = buildSeaMesh(water, t);
-    cachedSeaQuantum = quantum;
-  }
-  if (!cachedPier) cachedPier = buildPierMesh(water);
-  if (!cachedBuoys) cachedBuoys = buildBuoyMesh(water, t);
-  return {
-    sea: cachedSea,
-    pier: cachedPier,
-    buoys: cachedBuoys,
-    // Convenience: one merged mesh for renderers that draw a
-    // single water batch. Merging keeps the per-quad winding.
-    merged: null,
-  };
-}
-
-// --- boat / player interaction -------------------------------------
-// Drop the player off a boat. NEVER traps the player: this function
-// always succeeds and always leaves the player either on foot on
-// the pier / shore, or swimming toward it.
-//   * Within 8 m of the pier end or the shore -> step onto dry land.
-//   * Anywhere else -> mode "swim" in the water beside the boat,
-//     facing the shore (yaw = PI points back toward land from the
-//     sea, since land is at smaller z).
-function exitBoat(player, boat, world) {
-  const land = nearestLand(boat.x, boat.z);
-  const distToLand = Math.hypot(boat.x - land.x, boat.z - land.z);
-  const nearPierOrShore = distToLand < 9 || isOnPier(boat.x, boat.z);
-  player.vehicle = null;
-  player.vx = 0;
-  player.vy = 0;
-  player.vz = 0;
-  if (nearPierOrShore) {
-    player.mode = "foot";
-    player.x = land.x;
-    player.z = land.z;
-    player.y = land.onPier ? PIER.deckY : 0;
-    player.swimming = false;
-  } else {
-    // Far from the dock: into the water, swimming, facing shore.
-    player.mode = "swim";
-    player.swimming = true;
-    player.x = boat.x + Math.sin(boat.yaw || 0) * 2.5;
-    player.z = boat.z + Math.cos(boat.yaw || 0) * 2.5;
-    player.y = 0;
-    player.yaw = Math.PI; // face back toward the shore (smaller z)
-  }
-  return player;
-}
-
-// Board a boat from the water or the pier: player must be close.
-function boardBoat(player, boat) {
-  const d = Math.hypot(boat.x - player.x, boat.z - player.z);
-  if (d > 3.5) return false;
-  boat.driver = player;
-  player.vehicle = boat;
-  player.mode = "boat";
-  player.swimming = false;
-  return true;
-}
-
-// Keep a swimming player inside the swim zone; past the outer
-// buoys the current gently pushes them back toward shore instead
-// of letting them swim to infinity.
-function clampSwimmer(player) {
-  if (player.z > SHORE_SWIM_MAX + 120) {
-    player.z = SHORE_SWIM_MAX + 120;
-  }
-  return player;
-}
-
-SB.Water = {
-  SEA_LINE_Z,
-  SEA_Y,
-  PIER,
-  createWater,
-  draw,
-  waveHeight,
-  isInWater,
-  isOnPier,
-  nearestLand,
-  exitBoat,
-  boardBoat,
-  buildSeaMesh,
-  buildPierMesh,
-  buildBuoyMesh,
-  clampSwimmer,
-};
-
-const Water = SB.Water;
-
-export { Water, createWater, draw, waveHeight, isInWater, isOnPier, nearestLand, exitBoat, boardBoat, buildSeaMesh, buildPierMesh, buildBuoyMesh };
-export default SB.Water;
+  const api = { Water, Boat, AmbientEvents, AMBIENT_DEFS };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  global.SunsetWater = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);

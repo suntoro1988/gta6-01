@@ -1,323 +1,316 @@
-// Sunset Bay — player.js (v10, written from scratch)
-// The on-foot player character.
-//
-// Movement: WASD relative to the camera yaw, Shift to run, Space to
-// jump (simple gravity, ground y = 0 on land). The player is a small
-// articulated 3D figure built from SB.Meshes boxes — head, torso,
-// arms, legs, plus a visible gun when armed — so the character reads
-// clearly in third person and in screenshots.
-//   * E near a car steals / enters it; E while driving exits it.
-//   * E near / on a speedboat boards it; E on a boat ALWAYS drops
-//     the player off (see water.js — far from the pier the player
-//     lands in the water and swims, never soft-locked on the boat).
-//   * Left mouse (or F) fires while on foot; shooting is disabled
-//     while driving, and a short cooldown keeps the fire rate sane.
-// State machine: mode is "foot" | "car" | "boat" | "swim". The
-// update() function is pure over (player, input, dt, world) — the
-// world supplies city (building collision), water height, and the
-// vehicles list — so the same code drives both the game loop and
-// any test harness.
+// player.js — Pemain "Sunset Bay" v11
+// Jalan kaki (WASD + mouse), lari (Shift), masuk/keluar mobil (E — mencuri),
+// berenang di pantai (pakaian basah setelah berenang), tembak (klik),
+// ganti pakaian di toko (menghilangkan jejak "baju dikenali" dari wanted).
+// Health + stamina. Respons NPC terhadap pemain berdasarkan jarak + senjata.
+// Modul logika murni: tidak bergantung pada renderer; game loop memanggil
+// update(dt, input, world) tiap frame.
 
-const SB = (globalThis.SB = globalThis.SB || {});
+(function (global) {
+  'use strict';
 
-const WALK_SPEED = 4.2;
-const RUN_SPEED = 8.0;
-const SWIM_SPEED = 2.6;
-const JUMP_SPEED = 7.5;
-const GRAVITY = 20;
-const PLAYER_RADIUS = 0.45;
-const PLAYER_HEIGHT = 1.8;
-const SHOOT_COOLDOWN = 0.28;
-const ENTER_RANGE = 3.2;
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+  function dist2(ax, az, bx, bz) { const dx = ax - bx, dz = az - bz; return dx * dx + dz * dz; }
 
-function clamp(v, min, max) {
-  return v < min ? min : v > max ? max : v;
-}
+  // ---------- pakaian ----------
+  const OUTFITS = [
+    { id: 'kaos-biru', name: 'Kaos Biru + Jeans', shirt: [0.2, 0.45, 0.85], pants: [0.15, 0.2, 0.35], price: 0 },
+    { id: 'kemeja-krem', name: 'Kemeja Krem + Celana Cokelat', shirt: [0.9, 0.85, 0.7], pants: [0.45, 0.32, 0.2], price: 60 },
+    { id: 'hoodie-hijau', name: 'Hoodie Hijau + Jogger', shirt: [0.2, 0.55, 0.3], pants: [0.25, 0.25, 0.25], price: 80 },
+    { id: 'jaket-kulit', name: 'Jaket Kulit + Jeans Hitam', shirt: [0.15, 0.12, 0.12], pants: [0.1, 0.1, 0.14], price: 150 },
+    { id: 'baju-pantai', name: 'Baju Pantai + Celana Pendek', shirt: [0.95, 0.6, 0.25], pants: [0.9, 0.8, 0.6], price: 45 },
+  ];
 
-function createPlayer(spawn = { x: 0, z: 170, yaw: Math.PI }) {
-  return {
-    x: spawn.x,
-    y: 0,
-    z: spawn.z,
-    yaw: spawn.yaw || 0, // facing direction, radians
-    vx: 0,
-    vy: 0,
-    vz: 0,
-    onGround: true,
-    mode: "foot", // "foot" | "car" | "boat" | "swim"
-    vehicle: null, // vehicle record when mode is car/boat
-    health: 100,
-    armed: true,
-    shootCooldown: 0,
-    shotsFired: 0,
-    walkCycle: 0, // animates arms/legs in buildPlayerMesh
-    moving: false,
-    running: false,
-    swimming: false,
-  };
-}
+  // ---------- pemain ----------
+  class Player {
+    constructor(spawn) {
+      const s = spawn || { x: 0, z: 20 };
+      this.x = s.x; this.z = s.z; this.y = 0;
+      this.yaw = 0;            // arah hadap (radian, 0 = -Z)
+      this.pitch = 0;
+      this.vx = 0; this.vz = 0;
+      this.health = 100;
+      this.stamina = 100;
+      this.money = 250;
+      this.wanted = 0;         // level 0-5
+      this.outfitRecognized = false; // true bila saksi melihat baju saat kejahatan
+      this.outfit = OUTFITS[0];
+      this.wet = false;        // pakaian basah setelah berenang
+      this.wetTimer = 0;
+      this.swimming = false;
+      this.inVehicle = null;   // referensi kendaraan (dari vehicles.js) atau null
+      this.inBoat = null;      // referensi perahu (dari water.js) atau null
+      this.inInterior = null;  // id interior yang sedang dimasuki
+      this.weapon = 'none';    // 'none' | 'pistol'
+      this.ammo = 0;
+      this.shootCooldown = 0;
+      this.stealCooldown = 0;
+      this.footstepTimer = 0;
+      this.isRunning = false;
+      this.alive = true;
+      this.lastDamageAt = -999;
+    }
 
-// Build the player's 3D figure at the player's position. Arms and
-// legs swing with walkCycle while moving; the gun is a dark box in
-// the right hand when armed. Meshes are rebuilt per frame from the
-// live pose (cheap at this vertex count) so animation never needs
-// a skeleton or bone system.
-function buildPlayerMesh(player) {
-  const M = SB.Meshes;
-  if (!M) return null;
-  const b = new M.MeshBuilder();
-  const swing = player.moving ? Math.sin(player.walkCycle) * 0.55 : 0;
-  const y = player.y;
-  const skin = "#e8b98a";
-  const shirt = "#2e6fb0";
-  const pants = "#2b3440";
-  const shoes = "#1c1c22";
-  // Legs (swing opposite each other).
-  const legSwing = swing * 0.35;
-  b.boxAt(player.x - 0.16, y, player.z + legSwing, 0.26, 0.8, 0.3, pants);
-  b.boxAt(player.x + 0.16, y, player.z - legSwing, 0.26, 0.8, 0.3, pants);
-  // Shoes.
-  b.boxAt(player.x - 0.16, y, player.z + legSwing + 0.06, 0.28, 0.12, 0.42, shoes);
-  b.boxAt(player.x + 0.16, y, player.z - legSwing + 0.06, 0.28, 0.12, 0.42, shoes);
-  // Torso.
-  b.boxAt(player.x, y + 0.8, player.z, 0.72, 0.62, 0.4, shirt);
-  // Arms (swing opposite the legs).
-  b.boxAt(player.x - 0.48, y + 1.05, player.z - swing * 0.3, 0.2, 0.55, 0.22, shirt);
-  b.boxAt(player.x + 0.48, y + 1.05, player.z + swing * 0.3, 0.2, 0.55, 0.22, shirt);
-  // Hands.
-  b.boxAt(player.x - 0.48, y + 0.78, player.z - swing * 0.3, 0.18, 0.14, 0.18, skin);
-  b.boxAt(player.x + 0.48, y + 0.78, player.z + swing * 0.3, 0.18, 0.14, 0.18, skin);
-  // Head + cap.
-  b.boxAt(player.x, y + 1.48, player.z, 0.42, 0.4, 0.4, skin);
-  b.boxAt(player.x, y + 1.72, player.z, 0.46, 0.1, 0.46, "#d94f3d");
-  // Gun in the right hand when armed and on foot.
-  if (player.armed && player.mode === "foot") {
-    b.boxAt(player.x + 0.48, y + 0.9, player.z + 0.28, 0.1, 0.12, 0.5, "#22222a");
-  }
-  return b.build();
-}
+    // input: {forward,back,left,right,run,mouseDX,mouseDY,shoot,interact}
+    // world: {city, vehicles, water, npcs, time, onEvent}
+    update(dt, input, world) {
+      if (!this.alive) return;
+      dt = Math.min(dt, 0.05);
+      this.shootCooldown = Math.max(0, this.shootCooldown - dt);
+      this.stealCooldown = Math.max(0, this.stealCooldown - dt);
 
-// --- input helpers -------------------------------------------------
-// input: { forward, back, left, right, run, jump, shoot, interact,
-//          cameraYaw } — booleans + camera yaw in radians.
-// interact / jump / shoot are edge-triggered by the caller setting
-// them true for exactly one update (see consumeEdges below).
+      // Mouse look.
+      if (input) {
+        this.yaw -= (input.mouseDX || 0) * 0.0028;
+        this.pitch = clamp(this.pitch - (input.mouseDY || 0) * 0.0028, -1.2, 1.2);
+      }
 
-function moveDirection(input, cameraYaw) {
-  // v10 integration fix: forward MUST match the camera view direction
-  // (sin yaw, cos yaw) — the old signs were exactly 180 deg flipped,
-  // so W walked toward (and then behind) the camera. Right is the
-  // camera-right vector (-cos yaw, sin yaw).
-  let fx = 0, fz = 0;
-  if (input.forward) { fx += Math.sin(cameraYaw); fz += Math.cos(cameraYaw); }
-  if (input.back) { fx += -Math.sin(cameraYaw); fz += -Math.cos(cameraYaw); }
-  if (input.left) { fx += Math.cos(cameraYaw); fz += -Math.sin(cameraYaw); }
-  if (input.right) { fx += -Math.cos(cameraYaw); fz += Math.sin(cameraYaw); }
-  const len = Math.hypot(fx, fz);
-  if (len === 0) return { x: 0, z: 0 };
-  return { x: fx / len, z: fz / len };
-}
+      // Pakaian basah mengering perlahan (60 detik).
+      if (this.wet) {
+        this.wetTimer -= dt;
+        if (this.wetTimer <= 0) { this.wet = false; this.wetTimer = 0; }
+      }
 
-// Push the player out of a building AABB (circle vs box, XZ only).
-function resolveBuildingCollision(player, city) {
-  if (!city || !city.buildings) return;
-  for (const b of city.buildings) {
-    const dx = player.x - b.x;
-    const dz = player.z - b.z;
-    const px = b.w / 2 + PLAYER_RADIUS - Math.abs(dx);
-    const pz = b.d / 2 + PLAYER_RADIUS - Math.abs(dz);
-    if (px > 0 && pz > 0) {
-      if (px < pz) player.x = b.x + Math.sign(dx || 1) * (b.w / 2 + PLAYER_RADIUS);
-      else player.z = b.z + Math.sign(dz || 1) * (b.d / 2 + PLAYER_RADIUS);
+      // Di dalam mobil / perahu: kendali diserahkan ke vehicles/water.
+      if (this.inVehicle || this.inBoat) {
+        if (input && input.interact) this.exitCurrentRide(world);
+        return;
+      }
+
+      // --- gerak jalan kaki ---
+      const inWater = world && world.water ? world.water.isInWater(this.x, this.z) : false;
+      this.swimming = inWater && this.y <= 0.2;
+      const wantRun = !!(input && input.run) && this.stamina > 1 && !this.swimming;
+      this.isRunning = wantRun;
+      const speed = this.swimming ? 2.2 : wantRun ? 7.5 : 4.2;
+
+      let mx = 0, mz = 0;
+      if (input) {
+        if (input.forward) mz -= 1;
+        if (input.back) mz += 1;
+        if (input.left) mx -= 1;
+        if (input.right) mx += 1;
+      }
+      const ml = Math.hypot(mx, mz) || 1;
+      mx /= ml; mz /= ml;
+      const sin = Math.sin(this.yaw), cos = Math.cos(this.yaw);
+      const wx = mx * cos - mz * sin;
+      const wz = mx * sin + mz * cos;
+      this.vx = wx * speed;
+      this.vz = wz * speed;
+      this.x += this.vx * dt;
+      this.z += this.vz * dt;
+
+      // Stamina: lari menguras, jalan memulihkan.
+      if (wantRun && (mx !== 0 || mz !== 0)) this.stamina = Math.max(0, this.stamina - 14 * dt);
+      else this.stamina = Math.min(100, this.stamina + 9 * dt);
+
+      // Berenang: masuk air pantai -> basah.
+      if (this.swimming && !this.wet) {
+        this.wet = true; this.wetTimer = 60;
+        if (world && world.onEvent) world.onEvent('swim-start', { x: this.x, z: this.z });
+      }
+
+      // Tembak (klik).
+      if (input && input.shoot) this.shoot(world);
+
+      // Interaksi (E): masuk mobil / perahu / interior terdekat.
+      if (input && input.interact) this.tryInteract(world);
+    }
+
+    // ---- tembak ----
+    shoot(world) {
+      if (this.weapon === 'none' || this.ammo <= 0 || this.shootCooldown > 0) return false;
+      this.shootCooldown = 0.25;
+      this.ammo--;
+      if (world && world.onEvent) {
+        world.onEvent('shoot', { x: this.x, z: this.z, yaw: this.yaw, weapon: this.weapon });
+      }
+      // Menembak di depan saksi menaikkan wanted + menandai baju dikenali.
+      if (world && world.npcs) {
+        for (const npc of world.npcs) {
+          if (npc && dist2(this.x, this.z, npc.x, npc.z) < 25 * 25) {
+            this.raiseWanted(1);
+            this.outfitRecognized = true;
+            break;
+          }
+        }
+      }
+      return true;
+    }
+
+    giveWeapon(kind, ammo) {
+      this.weapon = kind;
+      this.ammo = ammo;
+    }
+
+    // ---- interaksi (E) ----
+    tryInteract(world) {
+      if (!world) return null;
+      // 1) Perahu terdekat (di dermaga/pantai).
+      if (world.water && world.water.nearestBoat) {
+        const boat = world.water.nearestBoat(this.x, this.z, 4);
+        if (boat) { this.boardBoat(boat, world); return 'boat'; }
+      }
+      // 2) Mobil terdekat -> mencuri (E).
+      if (world.vehicles && world.vehicles.nearestCar) {
+        const car = world.vehicles.nearestCar(this.x, this.z, 4);
+        if (car && this.stealCooldown <= 0) {
+          this.stealCar(car, world);
+          return 'car';
+        }
+      }
+      // 3) Pintu interior terdekat (toko/kafe).
+      if (world.city && world.city.interiorAt) {
+        const it = world.city.interiorAt(this.x, this.z, 3);
+        if (it) {
+          if (it.closedAfterRobbery) {
+            if (world.onEvent) world.onEvent('interior-closed', { id: it.id, name: it.name });
+            return 'closed';
+          }
+          this.inInterior = it.id;
+          if (world.onEvent) world.onEvent('enter-interior', { id: it.id, name: it.name });
+          return 'interior';
+        }
+      }
+      return null;
+    }
+
+    stealCar(car, world) {
+      this.inVehicle = car;
+      this.stealCooldown = 1.0;
+      car.driver = this;
+      this.raiseWanted(1);
+      this.outfitRecognized = true; // saksi melihat baju saat mencuri
+      if (world && world.onEvent) world.onEvent('car-stolen', { carId: car.id, x: this.x, z: this.z });
+    }
+
+    boardBoat(boat, world) {
+      this.inBoat = boat;
+      boat.rider = this;
+      if (world && world.onEvent) world.onEvent('board-boat', { boatId: boat.id });
+    }
+
+    // Keluar dari mobil/perahu. Anti-soft-lock: selalu berhasil, posisi
+    // aman dicari di sekitar kendaraan (atau di dermaga/pantai terdekat).
+    exitCurrentRide(world) {
+      if (this.inVehicle) {
+        const car = this.inVehicle;
+        car.driver = null;
+        this.inVehicle = null;
+        this.x = car.x + Math.sin(car.heading + Math.PI / 2) * 2.5;
+        this.z = car.z + Math.cos(car.heading + Math.PI / 2) * 2.5;
+      }
+      if (this.inBoat) {
+        const boat = this.inBoat;
+        boat.rider = null;
+        this.inBoat = null;
+        // Keluar di dermaga/pantai terdekat — tidak pernah di tengah laut.
+        const spot = world && world.water && world.water.nearestShore
+          ? world.water.nearestShore(boat.x, boat.z)
+          : { x: boat.x + 3, z: boat.z };
+        this.x = spot.x; this.z = spot.z; this.y = 0;
+        this.wet = true; this.wetTimer = 60;
+      }
+      this.stealCooldown = 0.5;
+    }
+
+    exitInterior() { this.inInterior = null; }
+
+    // ---- ganti pakaian di toko ----
+    // Menghilangkan jejak "baju dikenali": wanted turun 1 level dan saksi
+    // tidak lagi mengenali pemain dari bajunya.
+    changeOutfit(outfitId, world) {
+      const outfit = OUTFITS.find(o => o.id === outfitId);
+      if (!outfit) return { ok: false, reason: 'outfit-not-found' };
+      if (this.money < outfit.price) return { ok: false, reason: 'not-enough-money' };
+      this.money -= outfit.price;
+      this.outfit = outfit;
+      if (this.outfitRecognized) {
+        this.outfitRecognized = false;
+        this.wanted = Math.max(0, this.wanted - 1);
+      }
+      if (world && world.onEvent) world.onEvent('outfit-changed', { outfit: outfit.id, wanted: this.wanted });
+      return { ok: true, outfit: outfit.name, wanted: this.wanted };
+    }
+
+    // ---- wanted / damage ----
+    raiseWanted(levels) {
+      this.wanted = clamp(this.wanted + (levels || 1), 0, 5);
+    }
+    lowerWanted(levels) {
+      this.wanted = clamp(this.wanted - (levels || 1), 0, 5);
+      if (this.wanted === 0) this.outfitRecognized = false;
+    }
+    takeDamage(amount, from) {
+      if (!this.alive) return;
+      this.health = Math.max(0, this.health - amount);
+      this.lastDamageAt = Date.now() / 1000;
+      if (this.health <= 0) {
+        this.alive = false;
+        if (this.inVehicle) this.inVehicle.driver = null;
+        if (this.inBoat) this.inBoat.rider = null;
+        this.inVehicle = null; this.inBoat = null;
+      }
+    }
+    heal(amount) {
+      this.health = clamp(this.health + amount, 0, 100);
+      if (this.health > 0) this.alive = true;
+    }
+    respawn(spawn) {
+      const s = spawn || { x: 0, z: 20 };
+      this.x = s.x; this.z = s.z; this.y = 0;
+      this.health = 100; this.stamina = 100; this.alive = true;
+      this.wanted = 0; this.outfitRecognized = false;
+      this.inVehicle = null; this.inBoat = null; this.inInterior = null;
+    }
+
+    // ---- respons NPC terhadap pemain ----
+    // Mengembalikan aksi yang sebaiknya dilakukan NPC:
+    // 'ignore' | 'flee' | 'confront' | 'warn'
+    // Berdasarkan jarak + apakah pemain bersenjata / wanted / basah kuyup.
+    static npcReaction(npc, player) {
+      if (!npc || !player) return 'ignore';
+      const d2 = dist2(npc.x, npc.z, player.x, player.z);
+      const armed = player.weapon !== 'none';
+      const threatening = armed || player.wanted >= 2;
+      if (d2 < 3 * 3) {
+        if (threatening) return 'flee';
+        if (npc.blocked) return 'warn'; // pemain menghalangi jalan NPC
+        return 'ignore';
+      }
+      if (d2 < 10 * 10) {
+        if (threatening) return 'flee';
+        if (player.isRunning) return 'ignore';
+        return 'ignore';
+      }
+      if (d2 < 25 * 25 && threatening) return 'flee';
+      return 'ignore';
+    }
+
+    // NPC memaki / menghindar bila dihalangi: dipanggil saat pemain berdiri
+    // di jalur NPC lebih dari 1,5 detik.
+    static npcBlockedResponse(npc, player, blockedSeconds) {
+      if (blockedSeconds > 1.5) return { action: 'warn', line: 'Hei, minggir dong!' };
+      if (blockedSeconds > 0.5) return { action: 'sidestep', line: '' };
+      return { action: 'wait', line: '' };
+    }
+
+    status() {
+      return {
+        x: +this.x.toFixed(2), z: +this.z.toFixed(2),
+        health: this.health, stamina: Math.round(this.stamina),
+        money: this.money, wanted: this.wanted,
+        outfit: this.outfit.id, outfitRecognized: this.outfitRecognized,
+        wet: this.wet, swimming: this.swimming,
+        inVehicle: !!this.inVehicle, inBoat: !!this.inBoat,
+        inInterior: this.inInterior, weapon: this.weapon, ammo: this.ammo,
+        alive: this.alive,
+      };
     }
   }
-  player.x = clamp(player.x, -city.half, city.half);
-  player.z = clamp(player.z, -city.half, city.half);
-}
 
-function nearestVehicle(player, vehicles, maxDist = ENTER_RANGE) {
-  let best = null;
-  let bestD = maxDist;
-  for (const v of vehicles || []) {
-    if (v.driver) continue; // already driven
-    const d = Math.hypot(v.x - player.x, v.z - player.z);
-    if (d < bestD) {
-      best = v;
-      bestD = d;
-    }
-  }
-  return best;
-}
-
-// Try to enter the nearest free vehicle (E). Returns the vehicle
-// entered, or null. Boats are entered the same way as cars.
-function tryEnterVehicle(player, vehicles) {
-  const v = nearestVehicle(player, vehicles);
-  if (!v) return null;
-  v.driver = player;
-  player.vehicle = v;
-  player.mode = v.kind === "boat" ? "boat" : "car";
-  player.vx = 0;
-  player.vy = 0;
-  player.vz = 0;
-  return v;
-}
-
-// Leave the current vehicle (E while driving).
-//   * Car: step out to the driver's side on solid ground.
-//   * Boat: hand off to SB.Water.exitBoat — near the pier the player
-//     steps onto the dock; anywhere else the player drops into the
-//     water and swims (mode "swim"), so E can NEVER trap the player
-//     on a boat far from shore. That is the v10 soft-lock fix.
-function exitVehicle(player, world) {
-  const v = player.vehicle;
-  if (!v) return false;
-  v.driver = null;
-  player.vehicle = null;
-  if (v.kind === "boat" && SB.Water && typeof SB.Water.exitBoat === "function") {
-    SB.Water.exitBoat(player, v, world);
-    return true;
-  }
-  if (v.kind === "boat") {
-    // Fallback if water.js is not loaded: drop into the water
-    // and swim — still never trap the player on the boat.
-    player.mode = "swim";
-    player.x = v.x;
-    player.z = v.z + 2;
-    player.y = 0;
-    return true;
-  }
-  // Car: exit to the left of the car, clear of its body.
-  const sideX = Math.cos(v.yaw || 0);
-  const sideZ = -Math.sin(v.yaw || 0);
-  player.x = v.x + sideX * 2.0;
-  player.z = v.z + sideZ * 2.0;
-  player.y = 0;
-  player.mode = "foot";
-  return true;
-}
-
-// Fire one shot while on foot. Returns a shot record
-// { x, y, z, yaw, range } for the game loop / HUD, or null.
-function shoot(player) {
-  if (player.mode !== "foot" || !player.armed) return null;
-  if (player.shootCooldown > 0) return null;
-  player.shootCooldown = SHOOT_COOLDOWN;
-  player.shotsFired++;
-  return {
-    x: player.x,
-    y: player.y + 1.35,
-    z: player.z,
-    yaw: player.yaw,
-    range: 60,
-  };
-}
-
-function updateOnFoot(player, input, dt, world) {
-  const dir = moveDirection(input, input.cameraYaw || 0);
-  const speed = input.run ? RUN_SPEED : WALK_SPEED;
-  player.moving = dir.x !== 0 || dir.z !== 0;
-  player.running = player.moving && !!input.run;
-  player.vx = dir.x * speed;
-  player.vz = dir.z * speed;
-  player.x += player.vx * dt;
-  player.z += player.vz * dt;
-  if (player.moving) {
-    player.yaw = Math.atan2(-dir.x, -dir.z);
-    player.walkCycle += dt * (player.running ? 13 : 9);
-  }
-  if (input.jump && player.onGround) {
-    player.vy = JUMP_SPEED;
-    player.onGround = false;
-  }
-  if (!player.onGround) {
-    player.vy -= GRAVITY * dt;
-    player.y += player.vy * dt;
-    if (player.y <= 0) {
-      player.y = 0;
-      player.vy = 0;
-      player.onGround = true;
-    }
-  }
-  resolveBuildingCollision(player, world && world.city);
-  // Walked into the sea? Start swimming instead of walking on water.
-  if (world && world.water && typeof world.water.isInWater === "function") {
-    if (world.water.isInWater(player.x, player.z) && player.mode === "foot") {
-      player.mode = "swim";
-      player.y = 0;
-      player.swimming = true;
-    }
-  }
-  if (input.shoot) shoot(player);
-}
-
-function updateSwimming(player, input, dt, world) {
-  const dir = moveDirection(input, input.cameraYaw || 0);
-  player.moving = dir.x !== 0 || dir.z !== 0;
-  player.x += dir.x * SWIM_SPEED * dt;
-  player.z += dir.z * SWIM_SPEED * dt;
-  player.y = 0;
-  player.swimming = true;
-  if (player.moving) {
-    player.yaw = Math.atan2(-dir.x, -dir.z);
-    player.walkCycle += dt * 7;
-  }
-  // Reached dry land again? Climb out and walk.
-  if (world && world.water && typeof world.water.isInWater === "function") {
-    if (!world.water.isInWater(player.x, player.z)) {
-      player.mode = "foot";
-      player.swimming = false;
-    }
-  }
-  resolveBuildingCollision(player, world && world.city);
-}
-
-// Main per-frame update. world = { city, water, vehicles }.
-// Vehicles drive themselves in vehicles.js; while the player is in
-// a car/boat this function only keeps the player glued to the seat
-// and handles the E-to-exit edge.
-function update(player, input, dt, world = {}) {
-  if (player.shootCooldown > 0) player.shootCooldown -= dt;
-  if (input.interact) {
-    if (player.mode === "car" || player.mode === "boat") {
-      exitVehicle(player, world);
-    } else if (player.mode === "foot") {
-      tryEnterVehicle(player, world.vehicles);
-    }
-    // In "swim" mode E does nothing — the player is already free.
-  }
-  if (player.mode === "foot") {
-    updateOnFoot(player, input, dt, world);
-  } else if (player.mode === "swim") {
-    updateSwimming(player, input, dt, world);
-  } else if (player.vehicle) {
-    // Riding: the vehicle moves the player; mirror its position.
-    player.x = player.vehicle.x;
-    player.z = player.vehicle.z;
-    player.y = player.vehicle.y || 0;
-    player.yaw = player.vehicle.yaw || player.yaw;
-    player.moving = Math.abs(player.vehicle.speed || 0) > 0.5;
-  }
-  return player;
-}
-
-SB.Player = {
-  WALK_SPEED,
-  RUN_SPEED,
-  SWIM_SPEED,
-  JUMP_SPEED,
-  ENTER_RANGE,
-  createPlayer,
-  buildPlayerMesh,
-  update,
-  tryEnterVehicle,
-  exitVehicle,
-  nearestVehicle,
-  shoot,
-  moveDirection,
-};
-
-const Player = SB.Player;
-
-export { Player, createPlayer, buildPlayerMesh, update, tryEnterVehicle, exitVehicle, nearestVehicle, shoot };
-export default SB.Player;
+  const api = { Player, OUTFITS };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  global.SunsetPlayer = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);

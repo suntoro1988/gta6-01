@@ -1,68 +1,136 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="id">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Sunset Bay — GTA-style Open World</title>
-<link rel="icon" href="./favicon.ico">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Sunset Bay — Open World Pantai</title>
+<meta name="description" content="Sunset Bay: kota pantai open-world 3D ala GTA di browser. Jalan kaki, nyetir, misi, wanted, golden hour.">
+<link rel="icon" href="favicon.ico">
 <style>
+  :root {
+    --accent: #ff9a3c;
+    --accent-2: #ff5e7a;
+    --panel: rgba(12, 10, 24, 0.55);
+    --panel-border: rgba(255, 255, 255, 0.14);
+    --text: #fff5ea;
+    --muted: rgba(255, 245, 234, 0.72);
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { width: 100%; height: 100%; overflow: hidden; background: #0b1020; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; color: #fff; }
-  #game-canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; touch-action: none; }
-  .hidden { display: none !important; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #1a0f2e; }
+  body { font-family: "Segoe UI", system-ui, -apple-system, Arial, sans-serif; color: var(--text); }
+  #game-canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
 
-  /* ---- HUD atas ---- */
-  #hud { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: flex-start; padding: 12px 14px; pointer-events: none; z-index: 10; }
-  #hud-left { display: flex; flex-direction: column; gap: 6px; }
-  #hud-wanted { font-size: 26px; letter-spacing: 3px; color: #ffd23f; text-shadow: 0 2px 6px rgba(0,0,0,.8); }
-  #hud-wanted .star-off { color: rgba(255,255,255,.35); }
-  #hud-cash { font-size: 24px; font-weight: 800; color: #7dff9b; text-shadow: 0 2px 6px rgba(0,0,0,.8); }
-  #hud-rep { font-size: 13px; font-weight: 700; color: #ffb347; text-shadow: 0 1px 4px rgba(0,0,0,.8); }
-  #hud-right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
-  #hud-time { font-size: 15px; font-weight: 700; background: rgba(0,0,0,.45); padding: 4px 10px; border-radius: 20px; }
-  #hud-weather { font-size: 12px; background: rgba(0,0,0,.45); padding: 3px 9px; border-radius: 20px; }
-  #health-wrap { width: 170px; }
-  #health-label { font-size: 11px; font-weight: 700; letter-spacing: 1px; margin-bottom: 3px; text-shadow: 0 1px 4px rgba(0,0,0,.8); }
-  #health-bar-bg { width: 100%; height: 12px; background: rgba(0,0,0,.55); border-radius: 8px; overflow: hidden; border: 1px solid rgba(255,255,255,.35); }
-  #health-bar { height: 100%; width: 100%; background: linear-gradient(90deg, #2ecc71, #a8e063); transition: width .2s; }
-  #hud-health { font-size: 12px; font-weight: 700; }
+  /* ---------------- HUD ---------------- */
+  #hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; display: none; }
+  #hud.visible { display: block; }
+  .hud-panel { position: absolute; background: var(--panel); border: 1px solid var(--panel-border);
+    border-radius: 12px; padding: 10px 12px; backdrop-filter: blur(6px); }
 
-  /* ---- Misi & radio ---- */
-  #mission-box { position: fixed; left: 14px; top: 142px; max-width: 320px; background: rgba(0,0,0,.55); border-left: 4px solid #ff9f1c; border-radius: 8px; padding: 10px 12px; z-index: 10; pointer-events: none; }
-  #mission-title { font-size: 12px; font-weight: 800; letter-spacing: 1px; color: #ff9f1c; margin-bottom: 4px; }
-  #mission-text, #hud-mission { font-size: 14px; line-height: 1.45; }
-  #radio-box { position: fixed; right: 14px; bottom: 92px; background: rgba(0,0,0,.55); border-radius: 20px; padding: 6px 12px; font-size: 13px; z-index: 10; pointer-events: none; }
-  #radio-display, #hud-radio { font-weight: 700; color: #ff8fd1; }
-  #radio-station { color: #fff; }
+  #hud-topleft { top: 14px; left: 14px; min-width: 210px; }
+  .bar-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  .bar-label { font-size: 11px; font-weight: 700; letter-spacing: 1px; width: 62px; color: var(--muted); }
+  .bar { flex: 1; height: 10px; background: rgba(0,0,0,0.55); border-radius: 6px; overflow: hidden; }
+  .bar > div { height: 100%; border-radius: 6px; transition: width 0.2s ease; }
+  #hp-fill { background: linear-gradient(90deg, #37d67a, #7cf2a8); width: 100%; }
+  #stamina-fill { background: linear-gradient(90deg, #ffc93c, #ffe27a); width: 100%; }
+  #player-state { font-size: 12px; color: var(--muted); margin-top: 4px; }
 
-  /* ---- Minimap ---- */
-  #minimap-wrap { position: fixed; left: 14px; bottom: 14px; z-index: 10; border: 2px solid rgba(255,255,255,.7); border-radius: 50%; overflow: hidden; background: #12203a; box-shadow: 0 4px 16px rgba(0,0,0,.5); }
-  #minimap { display: block; width: 150px; height: 150px; }
-  #minimap-label { position: absolute; bottom: 2px; width: 100%; text-align: center; font-size: 10px; font-weight: 800; letter-spacing: 2px; text-shadow: 0 1px 3px #000; }
+  #hud-topright { top: 14px; right: 14px; text-align: right; min-width: 200px; }
+  #money-text { font-size: 22px; font-weight: 800; color: #7cf2a8; text-shadow: 0 2px 8px rgba(0,0,0,0.6); }
+  #wanted-stars { font-size: 20px; letter-spacing: 3px; color: #ffd23c; text-shadow: 0 0 10px rgba(255, 210, 60, 0.7); min-height: 26px; }
+  #wanted-stars.none { color: rgba(255,255,255,0.25); text-shadow: none; }
+  #weapon-text { font-size: 13px; color: var(--muted); margin-top: 2px; }
+  #clock-text { font-size: 13px; color: var(--muted); margin-top: 2px; }
+  #radio-text { font-size: 12px; color: var(--accent); margin-top: 2px; }
 
-  /* ---- Tombol layar sentuh ---- */
-  #touch-controls { position: fixed; right: 14px; bottom: 14px; display: flex; gap: 10px; z-index: 11; }
-  .touch-btn { width: 58px; height: 58px; border-radius: 50%; border: 2px solid rgba(255,255,255,.6); background: rgba(0,0,0,.5); color: #fff; font-size: 15px; font-weight: 800; cursor: pointer; }
-  .touch-btn:active { background: rgba(255,159,28,.8); }
-  #btn-pause, #btn-sound { position: fixed; top: 118px; right: 14px; z-index: 11; width: 44px; height: 44px; border-radius: 50%; border: 2px solid rgba(255,255,255,.6); background: rgba(0,0,0,.5); color: #fff; font-size: 18px; cursor: pointer; }
-  #btn-sound { top: 170px; }
+  #hud-bottomleft { bottom: 14px; left: 14px; padding: 8px; }
+  #minimap { display: block; width: 180px; height: 180px; border-radius: 8px; background: #241a3d; }
+  #minimap-label { font-size: 11px; color: var(--muted); margin-top: 5px; letter-spacing: 1px; }
 
-  /* ---- Overlay ---- */
-  .overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: rgba(5,8,20,.78); z-index: 20; text-align: center; padding: 20px; }
-  .overlay h1 { font-size: 52px; letter-spacing: 4px; color: #ffb347; text-shadow: 0 4px 0 #c0392b, 0 8px 24px rgba(0,0,0,.7); }
-  .overlay h2 { font-size: 34px; letter-spacing: 3px; }
-  .overlay p { font-size: 16px; line-height: 1.6; max-width: 480px; color: #e8e8e8; }
-  .overlay .controls { font-size: 14px; color: #bcd; }
-  .btn { pointer-events: auto; padding: 13px 34px; font-size: 18px; font-weight: 800; border: none; border-radius: 30px; background: linear-gradient(180deg, #ff9f1c, #e76f00); color: #fff; cursor: pointer; box-shadow: 0 4px 0 #9c4a00, 0 8px 20px rgba(0,0,0,.5); }
-  .btn:active { transform: translateY(2px); box-shadow: 0 2px 0 #9c4a00; }
-  .btn.secondary { background: linear-gradient(180deg, #3a6ea5, #274b73); box-shadow: 0 4px 0 #162f4d, 0 8px 20px rgba(0,0,0,.5); }
-  #wasted-overlay h1 { color: #e74c3c; text-shadow: 0 4px 0 #7b1a10, 0 8px 24px rgba(0,0,0,.7); }
-  #load-error { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); background: #a00; color: #fff; padding: 12px 18px; border-radius: 8px; z-index: 30; }
-  #hud-score { font-size: 13px; font-weight: 700; color: #9fd8ff; text-shadow: 0 1px 4px rgba(0,0,0,.8); }
+  #hud-bottomright { bottom: 14px; right: 14px; text-align: right; }
+  #speed-text { font-size: 26px; font-weight: 800; }
+  #speed-unit { font-size: 12px; color: var(--muted); }
+  #vehicle-text { font-size: 12px; color: var(--muted); }
+
+  #crosshair { position: absolute; left: 50%; top: 50%; width: 10px; height: 10px; margin: -5px 0 0 -5px;
+    border: 2px solid rgba(255,255,255,0.8); border-radius: 50%; display: none; }
+
+  /* ---------------- Toast & pesan ---------------- */
+  #toast { position: fixed; left: 50%; bottom: 110px; transform: translateX(-50%); z-index: 20;
+    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px;
+    padding: 10px 18px; font-size: 15px; font-weight: 600; opacity: 0; transition: opacity 0.25s ease;
+    pointer-events: none; max-width: 88vw; text-align: center; backdrop-filter: blur(6px); }
+  #toast.show { opacity: 1; }
+
+  #hint { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 9;
+    font-size: 13px; color: var(--muted); background: rgba(12,10,24,0.4); padding: 6px 12px;
+    border-radius: 8px; pointer-events: none; display: none; }
+  #hint.show { display: block; }
+
+  /* ---------------- Overlay misi ---------------- */
+  #mission-overlay { position: fixed; top: 76px; left: 50%; transform: translateX(-50%); z-index: 11;
+    background: var(--panel); border: 1px solid var(--panel-border); border-left: 4px solid var(--accent);
+    border-radius: 10px; padding: 10px 16px; max-width: 520px; width: calc(100vw - 32px); display: none;
+    backdrop-filter: blur(6px); pointer-events: none; }
+  #mission-overlay.show { display: block; }
+  #mission-title { font-size: 15px; font-weight: 800; color: var(--accent); }
+  #mission-desc { font-size: 13px; color: var(--text); margin-top: 3px; }
+  #mission-progress { font-size: 12px; color: var(--muted); margin-top: 3px; }
+
+  /* ---------------- Overlay layar penuh ---------------- */
+  .screen-overlay { position: fixed; inset: 0; z-index: 30; display: none; align-items: center;
+    justify-content: center; background: linear-gradient(180deg, rgba(26,10,46,0.82), rgba(60,16,40,0.88));
+    backdrop-filter: blur(4px); }
+  .screen-overlay.show { display: flex; }
+  .overlay-card { text-align: center; max-width: 560px; width: calc(100vw - 40px); padding: 28px 24px;
+    background: rgba(12, 10, 24, 0.6); border: 1px solid var(--panel-border); border-radius: 18px; }
+  .game-title { font-size: 52px; font-weight: 900; letter-spacing: 4px; line-height: 1;
+    background: linear-gradient(90deg, #ffb347, #ff5e7a, #b967ff);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    text-shadow: 0 4px 30px rgba(255, 94, 122, 0.35); }
+  .game-subtitle { font-size: 15px; color: var(--muted); margin-top: 8px; letter-spacing: 1px; }
+  .btn { display: inline-block; margin: 8px 6px 0; padding: 13px 30px; font-size: 16px; font-weight: 800;
+    color: #1a0f2e; background: linear-gradient(90deg, #ffb347, #ff7a3c); border: none; border-radius: 12px;
+    cursor: pointer; pointer-events: auto; box-shadow: 0 4px 18px rgba(255, 154, 60, 0.45); }
+  .btn:hover { filter: brightness(1.08); }
+  .btn:active { transform: translateY(1px); }
+  .btn.secondary { background: rgba(255,255,255,0.12); color: var(--text); box-shadow: none;
+    border: 1px solid var(--panel-border); }
+  .controls-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 18px; text-align: left;
+    font-size: 13px; color: var(--muted); margin: 18px auto 4px; max-width: 420px; }
+  .controls-grid b { color: var(--text); background: rgba(255,255,255,0.1); border-radius: 5px;
+    padding: 1px 7px; font-size: 12px; margin-right: 6px; }
+  .save-note { font-size: 12px; color: var(--muted); margin-top: 12px; }
+  #pause-title { font-size: 34px; font-weight: 900; letter-spacing: 3px; }
+  .pause-stats { font-size: 14px; color: var(--muted); margin: 10px 0 4px; line-height: 1.7; }
+
+  #loading { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center; justify-content: center;
+    background: #1a0f2e; flex-direction: column; gap: 14px; }
+  #loading.hide { display: none; }
+  .spinner { width: 44px; height: 44px; border: 4px solid rgba(255,255,255,0.2);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loading-text { font-size: 14px; color: var(--muted); }
+  #webgl-error { display: none; color: #ffb3c1; font-size: 14px; max-width: 420px; text-align: center; line-height: 1.6; }
+
+  #fps-meter { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); z-index: 10;
+    font-size: 11px; color: rgba(255,255,255,0.5); pointer-events: none; display: none; }
+  #fps-meter.show { display: block; }
+
+  /* ---------------- Tombol sentuh ---------------- */
+  #touch-buttons { position: fixed; right: 16px; bottom: 210px; z-index: 12; display: none; flex-direction: column; gap: 10px; }
+  @media (pointer: coarse) { #touch-buttons { display: flex; } }
+  .touch-btn { width: 62px; height: 62px; border-radius: 50%; border: 1px solid var(--panel-border);
+    background: var(--panel); color: var(--text); font-size: 20px; font-weight: 800; backdrop-filter: blur(6px); }
+  .touch-btn:active { background: rgba(255, 154, 60, 0.5); }
+
   @media (max-width: 640px) {
-    #minimap { width: 110px; height: 110px; }
-    .overlay h1 { font-size: 38px; }
-    #mission-box { max-width: 230px; top: 132px; }
+    .game-title { font-size: 38px; }
+    #minimap { width: 120px; height: 120px; }
+    #hud-topleft { min-width: 160px; }
+    #hud-topright { min-width: 150px; }
+    #money-text { font-size: 18px; }
+    .controls-grid { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -71,76 +139,90 @@
 
 <!-- HUD -->
 <div id="hud">
-  <div id="hud-left">
-    <div id="hud-wanted" aria-label="Wanted level"><span id="wanted-stars">☆☆☆☆☆</span></div>
-    <div id="hud-cash">$150</div>
-    <div id="hud-rep">REP 0</div>
-    <div id="hud-score">SKOR 0</div>
+  <div id="hud-topleft" class="hud-panel">
+    <div class="bar-row"><span class="bar-label">HEALTH</span><div class="bar"><div id="hp-fill"></div></div></div>
+    <div class="bar-row"><span class="bar-label">STAMINA</span><div class="bar"><div id="stamina-fill"></div></div></div>
+    <div id="player-state">Jalan kaki</div>
   </div>
-  <div id="hud-right">
-    <div id="hud-time">17:30</div>
-    <div id="hud-weather">🌇 Sunset</div>
-    <div id="health-wrap">
-      <div id="health-label">HEALTH <span id="hud-health">100%</span></div>
-      <div id="health-bar-bg"><div id="health-bar"></div></div>
-    </div>
+  <div id="hud-topright" class="hud-panel">
+    <div id="money-text">$0</div>
+    <div id="wanted-stars" class="none">☆☆☆☆☆</div>
+    <div id="weapon-text">Tangan kosong</div>
+    <div id="clock-text">18:20 — Sunset</div>
+    <div id="radio-text">RADIO: Sunset FM</div>
   </div>
+  <div id="hud-bottomleft" class="hud-panel">
+    <canvas id="minimap" width="180" height="180"></canvas>
+    <div id="minimap-label">SUNSET BAY</div>
+  </div>
+  <div id="hud-bottomright" class="hud-panel">
+    <div><span id="speed-text">0</span> <span id="speed-unit">km/h</span></div>
+    <div id="vehicle-text"></div>
+  </div>
+  <div id="crosshair"></div>
 </div>
+<div id="fps-meter">60 FPS</div>
 
-<!-- Teks misi -->
-<div id="mission-box">
+<!-- Misi -->
+<div id="mission-overlay">
   <div id="mission-title">MISI</div>
-  <div id="mission-text"><span id="hud-mission">Selamat datang di Sunset Bay! Cari mobil, kerjakan job, dan hindari polisi.</span></div>
+  <div id="mission-desc"></div>
+  <div id="mission-progress"></div>
 </div>
 
-<!-- Radio -->
-<div id="radio-box">📻 <span id="radio-display"><span id="hud-radio">SUNSET FM</span> — <span id="radio-station">Golden Hour Hits</span></span></div>
+<!-- Toast & hint -->
+<div id="toast"></div>
+<div id="hint"></div>
 
-<!-- Minimap -->
-<div id="minimap-wrap">
-  <canvas id="minimap" width="150" height="150"></canvas>
-  <div id="minimap-label">SUNSET BAY</div>
+<!-- Tombol sentuh -->
+<div id="touch-buttons">
+  <button class="touch-btn" id="touch-interact" aria-label="Interaksi">E</button>
+  <button class="touch-btn" id="touch-jump" aria-label="Lompat">▲</button>
 </div>
 
-<!-- Kontrol sentuh -->
-<div id="touch-controls">
-  <button class="touch-btn" id="btn-shoot" type="button">🔫</button>
-</div>
-<button id="btn-pause" type="button" title="Pause (P / Esc)">⏸</button>
-<button id="btn-sound" type="button" title="Suara">🔊</button>
-
-<!-- Menu utama -->
-<div id="menu-overlay" class="overlay">
-  <h1>SUNSET BAY</h1>
-  <p>Kota pantai di ujung senja. Curi mobil, kabur dari polisi, kerjakan job, dan jadi legenda Sunset Bay.</p>
-  <p class="controls">WASD / Panah — bergerak &amp; mengemudi &nbsp;•&nbsp; F / klik — menembak &nbsp;•&nbsp; E — masuk mobil &nbsp;•&nbsp; P / Esc — pause</p>
-  <button class="btn" id="btn-start" type="button">▶ MULAI</button>
+<!-- Pause -->
+<div id="pause-overlay" class="screen-overlay">
+  <div class="overlay-card">
+    <div id="pause-title">JEDA</div>
+    <div class="pause-stats" id="pause-stats"></div>
+    <button class="btn" id="btn-resume">Lanjutkan</button>
+    <button class="btn secondary" id="btn-restart">Mulai Baru</button>
+    <button class="btn secondary" id="btn-quit-to-menu">Menu Utama</button>
+  </div>
 </div>
 
-<!-- Overlay pause -->
-<div id="pause-overlay" class="overlay hidden" style="display:none">
-  <h2>PAUSED</h2>
-  <p>Game dijeda. Progress tersimpan otomatis.</p>
-  <button class="btn" id="btn-resume" type="button">▶ LANJUTKAN</button>
-  <button class="btn secondary" id="btn-menu" type="button">MENU UTAMA</button>
+<!-- Start / menu utama -->
+<div id="start-overlay" class="screen-overlay">
+  <div class="overlay-card">
+    <div class="game-title">SUNSET BAY</div>
+    <div class="game-subtitle">KOTA PANTAI OPEN-WORLD &middot; GOLDEN HOUR &middot; v11</div>
+    <div style="margin-top: 22px;">
+      <button class="btn" id="btn-continue" style="display:none;">Continue</button>
+      <button class="btn" id="btn-start">Mulai Baru</button>
+    </div>
+    <div class="controls-grid">
+      <div><b>W A S D</b> Bergerak</div>
+      <div><b>Mouse</b> Putar kamera (seret)</div>
+      <div><b>Shift</b> Lari</div>
+      <div><b>Spasi</b> Lompat</div>
+      <div><b>E</b> Curi / keluar mobil</div>
+      <div><b>R</b> Ganti radio</div>
+      <div><b>1 / 2 / 3</b> Ganti senjata</div>
+      <div><b>P / Esc</b> Jeda</div>
+      <div><b>M</b> Bisukan audio</div>
+      <div><b>F</b> Lampu mobil</div>
+    </div>
+    <div class="save-note" id="save-note">Progress tersimpan otomatis di browser ini.</div>
+  </div>
 </div>
 
-<!-- Overlay WASTED -->
-<div id="wasted-overlay" class="overlay hidden" style="display:none">
-  <h1>WASTED</h1>
-  <p>Kamu tumbang. Rumah sakit memotong 10% cash-mu. Bangkit dan balas dendam!</p>
-  <button class="btn" id="btn-respawn" type="button">↻ RESPAWN</button>
-  <button class="btn secondary" id="btn-restart" type="button">MULAI DARI AWAL</button>
+<!-- Loading -->
+<div id="loading">
+  <div class="spinner"></div>
+  <div id="loading-text">Memuat Sunset Bay…</div>
+  <div id="webgl-error"></div>
 </div>
 
-<div id="load-error"></div>
-
-<!-- Urutan load ES module: math3 -> gl -> game -> main (entry point terakhir).
-     Modul pendukung (player, vehicles, city, jobs, hud, audio, shots)
-     di-import oleh main.js. -->
-<script type="module" src="./src/math3.js"></script>
-<script type="module" src="./src/gl.js"></script>
-<script type="module" src="./src/game.js"></script>
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>

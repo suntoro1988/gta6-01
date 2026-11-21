@@ -1,249 +1,272 @@
-// Sunset Bay — shooting system: fire, bullet tracers, hit detection,
-// ammo economy, crosshair.
-// Written from scratch for v10. Depends only on ./rng.js (shot spread).
-//
-// Ammo rules (note: the field is always lowercase `ammo`):
-//   - Every shot costs 1 ammo.
-//   - buyAmmo: $50 buys +24 ammo, only when the player can afford it.
-//   - Firing with 0 ammo plays an empty click and fires nothing.
-// Damage:
-//   - A hit on police deals 34 damage: 100 HP -> 66 HP on the first hit,
-//     dead on the third.
-//   - A hit on a vehicle deals 25 damage.
-//
-// The game owns the targets: pass them in as plain objects
-//   { id, type: 'police' | 'vehicle' | 'target', x, y, z, radius, hp }
-// and this module returns hit results without touching the renderer.
-// Tracers are kept in SB.Shots.tracers so the renderer can draw them.
+// shots.js — Sunset Bay (v11)
+// Shooting system for Sunset Bay, written from scratch.
+//  * Ammunition is spelled lowercase "ammo" everywhere (HUD, shop,
+//    code) — the v10 convention, kept on purpose.
+//  * buyAmmo: $50 for +24 ammo.
+//  * Shooting a police officer: HP 100 -> 66 per hit (34 damage —
+//    the v10 value, kept). Three hits take an officer down.
+//  * Reload, crosshair (DOM + canvas-drawn), spread, range, cooldown.
+//  * No dependencies except an optional audio hook: pass an object
+//    with sfxGunshot() / sfxReload() (the audio.js engine) and the
+//    system will call it; without one it runs silently.
+//  * Hit detection is a plain ray-vs-target test over caller-supplied
+//    targets, so it works with any world representation.
 
-import { rng } from "./rng.js";
+'use strict';
 
-const SB = (globalThis.SB = globalThis.SB || {});
+export const AMMO_PRICE = 50;
+export const AMMO_PACK = 24;
+export const MAG_SIZE = 12;
+export const POLICE_HP = 100;
+export const DAMAGE_PER_HIT = 34; // 100 -> 66 on the first hit (v10 value)
+export const RELOAD_TIME_MS = 1100;
+export const FIRE_COOLDOWN_MS = 180;
+export const MAX_RANGE = 120;
+export const BASE_SPREAD_DEG = 1.2;
 
-const AMMO_PRICE = 50;
-const AMMO_PACK = 24;
-const POLICE_DAMAGE = 34;
-const VEHICLE_DAMAGE = 25;
-const TRACER_LIFE = 0.12;
-const MAX_RANGE = 120;
-const BASE_SPREAD = 0.012; // radians, grows while moving
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
-const spreadRng = rng("sunset-bay-shots");
-
-const state = {
-  tracers: [], // { from:{x,y,z}, to:{x,y,z}, life, maxLife }
-  shotsFired: 0,
-  shotsHit: 0,
-};
-
-function normalize(v) {
-  const len = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z) || 1;
-  return { x: v.x / len, y: v.y / len, z: v.z / len };
-}
-
-function sub(a, b) {
-  return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
-}
-
-function add(a, b) {
-  return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
-}
-
-function scale(v, s) {
-  return { x: v.x * s, y: v.y * s, z: v.z * s };
-}
-
-function dot(a, b) {
-  return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-/**
- * Ray vs sphere: does the ray (origin + t*dir, t in [0, maxT]) hit the
- * sphere centered on target with the given radius? Returns t or null.
- */
-function rayHitSphere(origin, dir, target) {
-  const oc = sub(origin, { x: target.x, y: target.y || 0, z: target.z });
-  const r = target.radius || 1;
-  const b = dot(oc, dir);
-  const c = dot(oc, oc) - r * r;
-  const disc = b * b - c;
-  if (disc < 0) return null;
-  const root = Math.sqrt(disc);
-  const t = -b - root;
-  if (t >= 0) return t;
-  // Asal sinar sudah DI DALAM bola (target menempel / point-blank):
-  // perpotongan masuk ada di belakang, pakai perpotongan keluar.
-  const t2 = -b + root;
-  if (t2 < 0) return null;
-  return t2;
-}
-
-function damageFor(target) {
-  if (target.type === "police") return POLICE_DAMAGE;
-  if (target.type === "vehicle") return VEHICLE_DAMAGE;
-  return POLICE_DAMAGE;
-}
-
-/**
- * Fire one shot.
- *   game: { ammo, cash?, audio?, player? } — ammo is read and decremented.
- *   origin: { x, y, z } muzzle position.
- *   dir: { x, y, z } aim direction (need not be normalized).
- *   targets: array of hittable objects (see header).
- *   opts: { moving: boolean } — moving widens the spread.
- * Returns { fired, hit, target?, damage?, hpLeft?, end, reason? }.
- */
-function fire(game, origin, dir, targets, opts) {
-  if (!game || game.ammo === undefined) return { fired: false, reason: "no ammo field" };
-  if (game.ammo <= 0) {
-    if (game.audio) game.audio.playSFX("emptyClick");
-    return { fired: false, reason: "empty" };
+export class ShootingSystem {
+  constructor(options) {
+    const o = options || {};
+    this.audio = o.audio || null;      // optional audio.js engine
+    this.onEvent = typeof o.onEvent === 'function' ? o.onEvent : null;
+    this.money = o.money != null ? o.money : 0;
+    this.ammo = o.ammo != null ? o.ammo : 48;          // reserve ammo
+    this.mag = o.mag != null ? o.mag : MAG_SIZE;        // ammo in the magazine
+    this.magSize = MAG_SIZE;
+    this.reloading = false;
+    this._reloadTimer = null;
+    this._lastShotAt = 0;
+    this._shotsFired = 0;
+    this._shotsHit = 0;
+    this.crosshair = { visible: false, spread: 8, hitMarkerAt: 0 };
+    this._crossEl = null;
   }
-  game.ammo -= 1;
-  state.shotsFired += 1;
 
-  const moving = opts && opts.moving;
-  const spread = BASE_SPREAD * (moving ? 2.2 : 1);
-  const d = normalize(dir);
-  const jittered = normalize({
-    x: d.x + spreadRng.normal(0, spread),
-    y: d.y + spreadRng.normal(0, spread * 0.7),
-    z: d.z + spreadRng.normal(0, spread),
-  });
+  emit(event, data) {
+    if (this.onEvent) this.onEvent(event, data);
+  }
 
-  let best = null;
-  let bestT = MAX_RANGE;
-  for (const t of targets || []) {
-    if (t.hp !== undefined && t.hp <= 0) continue;
-    const hitT = rayHitSphere(origin, jittered, t);
-    if (hitT !== null && hitT < bestT) {
-      bestT = hitT;
-      best = t;
+  // --- Ammunition shop ----------------------------------------------
+  // $50 buys +24 ammo (reserve). Returns { ok, ammo, money }.
+  buyAmmo() {
+    if (this.money < AMMO_PRICE) {
+      return { ok: false, error: 'need $' + AMMO_PRICE, money: this.money, ammo: this.ammo };
     }
+    this.money -= AMMO_PRICE;
+    this.ammo += AMMO_PACK;
+    this.emit('ammo-bought', { price: AMMO_PRICE, gained: AMMO_PACK, ammo: this.ammo, money: this.money });
+    return { ok: true, price: AMMO_PRICE, gained: AMMO_PACK, ammo: this.ammo, money: this.money };
   }
 
-  const end = add(origin, scale(jittered, best ? bestT : MAX_RANGE));
-  state.tracers.push({ from: { x: origin.x, y: origin.y, z: origin.z }, to: end, life: TRACER_LIFE, maxLife: TRACER_LIFE });
-  if (game.audio) game.audio.playSFX("shot");
+  // How many $50 packs the player can currently afford.
+  affordablePacks() { return Math.floor(this.money / AMMO_PRICE); }
 
-  if (!best) return { fired: true, hit: false, end };
-
-  const damage = damageFor(best);
-  best.hp = (best.hp === undefined ? 100 : best.hp) - damage;
-  state.shotsHit += 1;
-  if (game.audio) game.audio.playSFX("hit");
-  return {
-    fired: true,
-    hit: true,
-    target: best,
-    damage,
-    hpLeft: Math.max(0, best.hp),
-    killed: best.hp <= 0,
-    end,
-  };
-}
-
-/** $50 for +24 ammo. Returns { ok, ammo, cash } or { ok:false, reason }. */
-function buyAmmo(game) {
-  if (!game) return { ok: false, reason: "no game state" };
-  if ((game.cash || 0) < AMMO_PRICE) {
-    return { ok: false, reason: "not enough cash", price: AMMO_PRICE, pack: AMMO_PACK };
+  // --- Firing ---------------------------------------------------------
+  canFire(now) {
+    if (this.reloading) return { ok: false, reason: 'reloading' };
+    if (this.mag <= 0) return { ok: false, reason: 'empty' };
+    const t = now || Date.now();
+    if (t - this._lastShotAt < FIRE_COOLDOWN_MS) return { ok: false, reason: 'cooldown' };
+    return { ok: true };
   }
-  game.cash -= AMMO_PRICE;
-  game.ammo = (game.ammo || 0) + AMMO_PACK;
-  if (game.audio) game.audio.playSFX("cash");
-  return { ok: true, price: AMMO_PRICE, pack: AMMO_PACK, ammo: game.ammo, cash: game.cash };
-}
 
-/** Advance tracer lifetimes; call once per frame with dt in seconds. */
-function update(dt) {
-  const step = dt || 0;
-  for (let i = state.tracers.length - 1; i >= 0; i--) {
-    state.tracers[i].life -= step;
-    if (state.tracers[i].life <= 0) state.tracers.splice(i, 1);
+  // Fire one shot along a ray. `aim` = { ox, oy, oz, dx, dy, dz }
+  // (origin + normalised direction). `targets` = array of
+  // { id, kind, x, y, z, radius, hp } — kind 'police' | 'npc' | 'prop'.
+  // Returns { ok, hit, target, damage, remaining }.
+  fire(aim, targets) {
+    const check = this.canFire();
+    if (!check.ok) {
+      if (check.reason === 'empty') this.emit('dry-fire', {});
+      return { ok: false, reason: check.reason };
+    }
+    this._lastShotAt = Date.now();
+    this.mag -= 1;
+    this._shotsFired += 1;
+    this.crosshair.spread = 14;
+    if (this.audio && typeof this.audio.sfxGunshot === 'function') this.audio.sfxGunshot();
+
+    const hit = this._raycast(aim, targets || []);
+    if (hit) {
+      this._shotsHit += 1;
+      this.crosshair.hitMarkerAt = Date.now();
+      const result = this._applyHit(hit.target);
+      this.emit('shot-hit', { target: hit.target, damage: result.damage, hp: result.hp, distance: hit.distance });
+      if (result.down) this.emit('target-down', { target: hit.target });
+      return { ok: true, hit: true, target: hit.target, damage: result.damage, hp: result.hp, down: result.down, mag: this.mag, ammo: this.ammo };
+    }
+    this.emit('shot-miss', {});
+    return { ok: true, hit: false, mag: this.mag, ammo: this.ammo };
   }
-  return state.tracers.length;
-}
 
-/** Live tracers for the renderer (each has from/to in world space). */
-function getTracers() {
-  return state.tracers;
-}
-
-function accuracy() {
-  if (state.shotsFired === 0) return 0;
-  return state.shotsHit / state.shotsFired;
-}
-
-// ---------------------------------------------------------------------------
-// Crosshair (2D overlay; the HUD also draws one — this is the standalone
-// version the shooting system owns so it works even without the HUD).
-// ---------------------------------------------------------------------------
-
-let crosshairEl = null;
-
-function showCrosshair() {
-  if (typeof document === "undefined") return null;
-  if (!crosshairEl) {
-    crosshairEl = document.createElement("div");
-    crosshairEl.id = "sb-shots-crosshair";
-    crosshairEl.textContent = "+";
-    crosshairEl.style.cssText =
-      "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);" +
-      "font-size:28px;font-weight:700;color:rgba(255,255,255,.9);" +
-      "text-shadow:0 0 3px #000,0 1px 2px #000;pointer-events:none;z-index:11;" +
-      "font-family:Arial,Helvetica,sans-serif";
-    document.body.appendChild(crosshairEl);
+  // Nearest target whose sphere the ray passes within `radius`.
+  _raycast(aim, targets) {
+    if (!aim) return null;
+    const spreadRad = (BASE_SPREAD_DEG * Math.PI) / 180;
+    // Deterministic-ish spread: rotate the direction slightly by a
+    // pseudo-random amount scaled by the crosshair spread.
+    const jx = (Math.random() - 0.5) * spreadRad * 2;
+    const jz = (Math.random() - 0.5) * spreadRad * 2;
+    const dx = aim.dx + jx, dy = aim.dy, dz = aim.dz + jz;
+    const len = Math.hypot(dx, dy, dz) || 1;
+    const ndx = dx / len, ndy = dy / len, ndz = dz / len;
+    let best = null;
+    for (const t of targets) {
+      if (t.hp != null && t.hp <= 0) continue;
+      const rx = t.x - aim.ox, ry = t.y - aim.oy, rz = t.z - aim.oz;
+      const along = rx * ndx + ry * ndy + rz * ndz;
+      if (along < 0 || along > MAX_RANGE) continue;
+      const px = aim.ox + ndx * along, py = aim.oy + ndy * along, pz = aim.oz + ndz * along;
+      const miss = Math.hypot(t.x - px, t.y - py, t.z - pz);
+      const radius = t.radius || 1;
+      if (miss <= radius && (!best || along < best.distance)) best = { target: t, distance: along };
+    }
+    return best;
   }
-  crosshairEl.style.display = "block";
-  return crosshairEl;
+
+  // Damage model. Police: 100 -> 66 -> 32 -> 0 (34 per hit).
+  // Civilians / props take the same base damage; only police have
+  // the exact 100 HP the brief pins down.
+  _applyHit(target) {
+    const damage = DAMAGE_PER_HIT;
+    if (target.hp == null) target.hp = target.kind === 'police' ? POLICE_HP : 50;
+    target.hp = Math.max(0, target.hp - damage);
+    return { damage, hp: target.hp, down: target.hp <= 0 };
+  }
+
+  // Convenience: shoot a police officer object directly (used by
+  // tests and by simple callers that already did their own aiming).
+  // officer = { hp } — starts at 100 if unset. Returns new HP.
+  shootPolice(officer) {
+    if (!officer) return { ok: false, error: 'no officer' };
+    if (this.mag <= 0) return { ok: false, reason: 'empty' };
+    this.mag -= 1;
+    this._shotsFired += 1;
+    if (officer.hp == null) officer.hp = POLICE_HP;
+    officer.hp = Math.max(0, officer.hp - DAMAGE_PER_HIT);
+    this._shotsHit += 1;
+    if (this.audio && typeof this.audio.sfxGunshot === 'function') this.audio.sfxGunshot();
+    this.emit('shot-hit', { target: officer, damage: DAMAGE_PER_HIT, hp: officer.hp });
+    if (officer.hp <= 0) this.emit('target-down', { target: officer });
+    return { ok: true, damage: DAMAGE_PER_HIT, hp: officer.hp, down: officer.hp <= 0, mag: this.mag };
+  }
+
+  // --- Reload ---------------------------------------------------------
+  reload() {
+    if (this.reloading) return { ok: false, reason: 'already reloading' };
+    if (this.mag >= this.magSize) return { ok: false, reason: 'mag full' };
+    if (this.ammo <= 0) return { ok: false, reason: 'no ammo' };
+    this.reloading = true;
+    if (this.audio && typeof this.audio.sfxReload === 'function') this.audio.sfxReload();
+    this.emit('reload-start', {});
+    this._reloadTimer = setTimeout(() => {
+      const need = this.magSize - this.mag;
+      const take = Math.min(need, this.ammo);
+      this.mag += take;
+      this.ammo -= take;
+      this.reloading = false;
+      this._reloadTimer = null;
+      this.emit('reload-done', { mag: this.mag, ammo: this.ammo });
+    }, RELOAD_TIME_MS);
+    return { ok: true, ms: RELOAD_TIME_MS };
+  }
+
+  // Instant reload used by tests / save loading (no timer).
+  reloadInstant() {
+    if (this._reloadTimer) { clearTimeout(this._reloadTimer); this._reloadTimer = null; }
+    const need = this.magSize - this.mag;
+    const take = Math.min(need, this.ammo);
+    this.mag += take;
+    this.ammo -= take;
+    this.reloading = false;
+    return { mag: this.mag, ammo: this.ammo };
+  }
+
+  cancelReload() {
+    if (this._reloadTimer) { clearTimeout(this._reloadTimer); this._reloadTimer = null; }
+    this.reloading = false;
+  }
+
+  // --- Crosshair ------------------------------------------------------
+  // A DOM crosshair: four ticks + a centre dot that blooms with
+  // spread and flashes a hit marker (X) for 150ms after a hit.
+  // Build once; show()/hide() toggle it; tick() eases the spread.
+  buildCrosshair(container) {
+    if (this._crossEl) return this._crossEl;
+    const parent = container || (typeof document !== 'undefined' ? document.body : null);
+    if (!parent) return null;
+    const c = document.createElement('div');
+    c.className = 'sunset-crosshair';
+    c.style.cssText = 'position:fixed;left:50%;top:50%;width:40px;height:40px;margin:-20px 0 0 -20px;pointer-events:none;z-index:25;display:none;';
+    c.innerHTML =
+      '<div style="position:absolute;left:19px;top:19px;width:2px;height:2px;background:#fff;border-radius:50%;box-shadow:0 0 3px #000;"></div>' +
+      '<div class="ch-t" style="position:absolute;left:19px;top:2px;width:2px;height:10px;background:#fff;box-shadow:0 0 3px #000;"></div>' +
+      '<div class="ch-b" style="position:absolute;left:19px;bottom:2px;width:2px;height:10px;background:#fff;box-shadow:0 0 3px #000;"></div>' +
+      '<div class="ch-l" style="position:absolute;top:19px;left:2px;height:2px;width:10px;background:#fff;box-shadow:0 0 3px #000;"></div>' +
+      '<div class="ch-r" style="position:absolute;top:19px;right:2px;height:2px;width:10px;background:#fff;box-shadow:0 0 3px #000;"></div>' +
+      '<div class="ch-x" style="position:absolute;inset:0;display:none;color:#ff4d4d;font-size:22px;line-height:40px;text-align:center;">✕</div>';
+    parent.appendChild(c);
+    this._crossEl = c;
+    return c;
+  }
+
+  showCrosshair(show) {
+    this.crosshair.visible = !!show;
+    if (this._crossEl) this._crossEl.style.display = show ? 'block' : 'none';
+    return this.crosshair.visible;
+  }
+
+  // Call once per frame: eases spread back down and clears the hit marker.
+  tickCrosshair() {
+    this.crosshair.spread += (8 - this.crosshair.spread) * 0.2;
+    if (this._crossEl) {
+      const s = Math.round(this.crosshair.spread);
+      const set = (sel, v) => { const n = this._crossEl.querySelector(sel); if (n) n.style.transform = v; };
+      set('.ch-t', 'translateY(' + (-s + 8) + 'px)');
+      set('.ch-b', 'translateY(' + (s - 8) + 'px)');
+      set('.ch-l', 'translateX(' + (-s + 8) + 'px)');
+      set('.ch-r', 'translateX(' + (s - 8) + 'px)');
+      const x = this._crossEl.querySelector('.ch-x');
+      if (x) x.style.display = (Date.now() - this.crosshair.hitMarkerAt < 150) ? 'block' : 'none';
+    }
+    return this.crosshair.spread;
+  }
+
+  // --- Stats / persistence --------------------------------------------
+  accuracy() {
+    if (this._shotsFired === 0) return 0;
+    return Math.round((this._shotsHit / this._shotsFired) * 100);
+  }
+
+  status() {
+    return {
+      mag: this.mag, magSize: this.magSize, ammo: this.ammo,
+      reloading: this.reloading, money: this.money,
+      shotsFired: this._shotsFired, shotsHit: this._shotsHit,
+      accuracy: this.accuracy(),
+    };
+  }
+
+  save() { return { mag: this.mag, ammo: this.ammo, money: this.money }; }
+
+  load(data) {
+    if (!data) return;
+    if (data.mag != null) this.mag = clamp(data.mag, 0, this.magSize);
+    if (data.ammo != null) this.ammo = Math.max(0, data.ammo);
+    if (data.money != null) this.money = data.money;
+  }
 }
 
-function hideCrosshair() {
-  if (crosshairEl) crosshairEl.style.display = "none";
-  return true;
+export function createShootingSystem(options) { return new ShootingSystem(options); }
+
+if (typeof window !== 'undefined') {
+  window.SunsetShots = window.SunsetShots || {};
+  window.SunsetShots.ShootingSystem = ShootingSystem;
+  window.SunsetShots.AMMO_PRICE = AMMO_PRICE;
+  window.SunsetShots.AMMO_PACK = AMMO_PACK;
+  window.SunsetShots.DAMAGE_PER_HIT = DAMAGE_PER_HIT;
+  window.SunsetShots.POLICE_HP = POLICE_HP;
+  window.SunsetShots.createShootingSystem = createShootingSystem;
 }
-
-/** Widen the crosshair while moving / firing (spread in px, 0-40). */
-function setCrosshairSpread(spread) {
-  if (!crosshairEl) showCrosshair();
-  if (!crosshairEl) return;
-  const s = Math.max(0, Math.min(40, spread || 0));
-  crosshairEl.style.letterSpacing = s + "px";
-  crosshairEl.style.opacity = String(1 - s / 80);
-}
-
-SB.Shots = {
-  fire,
-  buyAmmo,
-  update,
-  getTracers,
-  accuracy,
-  showCrosshair,
-  hideCrosshair,
-  setCrosshairSpread,
-  AMMO_PRICE,
-  AMMO_PACK,
-  POLICE_DAMAGE,
-  VEHICLE_DAMAGE,
-  state,
-};
-
-const Shots = SB.Shots;
-
-export {
-  Shots,
-  fire,
-  buyAmmo,
-  update,
-  getTracers,
-  accuracy,
-  showCrosshair,
-  hideCrosshair,
-  setCrosshairSpread,
-  AMMO_PRICE,
-  AMMO_PACK,
-  POLICE_DAMAGE,
-  VEHICLE_DAMAGE,
-};
-export default SB.Shots;

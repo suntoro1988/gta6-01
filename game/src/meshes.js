@@ -1,296 +1,364 @@
-// Sunset Bay — meshes.js (v10, written from scratch)
-// 3D mesh builder for the Sunset Bay renderer.
-//
-// WINDING RULE (critical — wrong winding = culled / invisible faces):
-// Every triangle is emitted counter-clockwise when viewed from OUTSIDE
-// the solid, i.e. from the side its normal points to. WebGL treats
-// counter-clockwise triangles as front-facing, so a face whose winding
-// is reversed disappears as soon as back-face culling is on. That is
-// what broke the sea / pier (flatQuad) and the roofs (boxAt) in v8:
-// a flat quad wound clockwise from above is culled from above.
-//   * flatQuad: wound like the TOP face of a box — CCW seen from +Y.
-//   * boxAt: six faces, each wound CCW seen from outside that face
-//     (the classic WebGL-cube face order, verified face by face).
-//   * cylinder / pyramid: side faces wound CCW seen from outside,
-//     caps wound CCW seen from above / below respectively.
-// Vertex format: positions (x,y,z), colours (r,g,b per vertex, 0..1)
-// and a triangle index list. A mesh is { positions: Float32Array,
-// colors: Float32Array, indices: Uint16Array, vertexCount,
-// triangleCount }.
+// meshes.js — Geometri "Sunset Bay" v11
+// Semua mesh dibangun dari nol dengan winding CCW dan normal yang
+// diverifikasi numerik menghadap keluar (lihat verifyMeshNormals).
+// Mesh = { positions: Float32Array, normals: Float32Array,
+//          colors: Float32Array, emissive: Float32Array, indices: Uint16Array }
+// Posisi (x,y,z), y ke atas. Tanpa library eksternal.
 
-const SB = (globalThis.SB = globalThis.SB || {});
+(function (global) {
+  'use strict';
 
-function clamp01(v) {
-  return v < 0 ? 0 : v > 1 ? 1 : v;
-}
-
-// "#rrggbb" or [r,g,b] (0..255 or 0..1) -> [r,g,b] in 0..1.
-function toRGB(color) {
-  if (Array.isArray(color)) {
-    const s = color[0] > 1 || color[1] > 1 || color[2] > 1 ? 255 : 1;
-    return [clamp01(color[0] / s), clamp01(color[1] / s), clamp01(color[2] / s)];
+  // ---------- util vektor ----------
+  function sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+  function cross(a, b) {
+    return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
   }
-  if (typeof color === "string" && color[0] === "#") {
-    const n = parseInt(color.slice(1), 16);
-    return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
-  }
-  return [0.8, 0.8, 0.8];
-}
+  function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+  function len(a) { return Math.sqrt(dot(a, a)); }
+  function norm(a) { const l = len(a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; }
 
-function shade(rgb, f) {
-  return [clamp01(rgb[0] * f), clamp01(rgb[1] * f), clamp01(rgb[2] * f)];
-}
-
-// Accumulates vertices. quad(a, b, c, d) expects the four corners
-// in counter-clockwise order seen from the face's outside; it emits
-// triangles (a, b, c) and (a, c, d), which keeps that winding.
-class MeshBuilder {
-  constructor() {
-    this.positions = [];
-    this.colors = [];
-    this.indices = [];
-  }
-
-  get vertexCount() {
-    return this.positions.length / 3;
-  }
-
-  vertex(x, y, z, rgb) {
-    this.positions.push(x, y, z);
-    this.colors.push(rgb[0], rgb[1], rgb[2]);
-    return this.vertexCount - 1;
-  }
-
-  tri(a, b, c) {
-    this.indices.push(a, b, c);
-    return this;
-  }
-
-  quad(a, b, c, d) {
-    // a-b-c-d CCW from outside -> (a,b,c) and (a,c,d) stay CCW.
-    this.indices.push(a, b, c, a, c, d);
-    return this;
-  }
-
-  // A coloured quad from four corner positions (CCW from outside).
-  quadAt(p0, p1, p2, p3, color) {
-    const rgb = toRGB(color);
-    const a = this.vertex(p0[0], p0[1], p0[2], rgb);
-    const b = this.vertex(p1[0], p1[1], p1[2], rgb);
-    const c = this.vertex(p2[0], p2[1], p2[2], rgb);
-    const d = this.vertex(p3[0], p3[1], p3[2], rgb);
-    return this.quad(a, b, c, d);
-  }
-
-  // Axis-aligned box centred at (x, y + h / 2, z): base sits on y.
-  // Faces are listed in the verified WebGL-cube order — each face
-  // CCW seen from outside. The top face keeps full brightness so
-  // roofs read as roofs instead of glowing slabs.
-  boxAt(x, y, z, w, h, d, color) {
-    const rgb = toRGB(color);
-    const x0 = x - w / 2, x1 = x + w / 2;
-    const y0 = y, y1 = y + h;
-    const z0 = z - d / 2, z1 = z + d / 2;
-    const side = shade(rgb, 0.92);
-    const top = shade(rgb, 1.0);
-    const bottom = shade(rgb, 0.55);
-    // Front (+Z): bottom-left, bottom-right, top-right, top-left.
-    this.quadAt([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1], side);
-    // Back (-Z): wound the opposite way so it is CCW seen from -Z.
-    this.quadAt([x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0], side);
-    // Top (+Y): CCW seen from above — same order as flatQuad.
-    this.quadAt([x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0], top);
-    // Bottom (-Y): CCW seen from below.
-    this.quadAt([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1], bottom);
-    // Right (+X): CCW seen from +X.
-    this.quadAt([x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1], side);
-    // Left (-X): CCW seen from -X.
-    this.quadAt([x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0], side);
-    return this;
-  }
-
-  // Flat horizontal quad centred at (x, y, z), size w x d.
-  // Wound exactly like a box top face: CCW seen from ABOVE (+Y),
-  // so the sea surface and the wooden pier are visible from above
-  // and never culled by the renderer. y is the plane height.
-  flatQuad(x, y, z, w, d, color) {
-    const rgb = toRGB(color);
-    const x0 = x - w / 2, x1 = x + w / 2;
-    const z0 = z - d / 2, z1 = z + d / 2;
-    this.quadAt([x0, y, z0], [x0, y, z1], [x1, y, z1], [x1, y, z0], rgb);
-    return this;
-  }
-
-  // Flat quad from explicit corners (must already be CCW from above).
-  flatQuadCorners(p0, p1, p2, p3, color) {
-    return this.quadAt(p0, p1, p2, p3, color);
-  }
-
-  // Upright cylinder centred at (cx, y, cz), base on y, height h.
-  // Side quads are wound CCW seen from outside; the top cap is
-  // wound CCW seen from above and the bottom cap CCW seen from below.
-  cylinder(cx, y, cz, radius, h, color, segments = 12) {
-    const rgb = toRGB(color);
-    const y0 = y, y1 = y + h;
-    const top = [];
-    const bottom = [];
-    for (let i = 0; i < segments; i++) {
-      const a = (i / segments) * Math.PI * 2;
-      const nx = cx + Math.cos(a) * radius;
-      const nz = cz + Math.sin(a) * radius;
-      top.push(this.vertex(nx, y1, nz, shade(rgb, 1.0)));
-      bottom.push(this.vertex(nx, y0, nz, shade(rgb, 0.85)));
+  // ---------- builder ----------
+  // Builder menampung segitiga CCW; normal dihitung per-face (flat shading).
+  class MeshBuilder {
+    constructor() {
+      this.pos = []; this.nor = []; this.col = []; this.emi = []; this.idx = [];
     }
-    const topCenter = this.vertex(cx, y1, cz, shade(rgb, 1.0));
-    const bottomCenter = this.vertex(cx, y0, cz, shade(rgb, 0.5));
-    for (let i = 0; i < segments; i++) {
-      const j = (i + 1) % segments;
-      // Side: bottom[j] -> bottom[i] -> top[i] -> top[j] is CCW
-      // seen from outside the cylinder wall. (The opposite order
-      // winds the wall inward and culls it — verified by computing
-      // the first side triangle's normal: it must point outward.)
-      this.quad(bottom[j], bottom[i], top[i], top[j]);
-      // Top cap fan: centre, top[j], top[i] is CCW seen from above.
-      this.tri(topCenter, top[j], top[i]);
-      // Bottom cap fan: centre, bottom[i], bottom[j] is CCW from below.
-      this.tri(bottomCenter, bottom[i], bottom[j]);
+    // Tambah satu quad CCW dari 4 sudut (a,b,c,d), warna + emissive seragam.
+    quad(a, b, c, d, color, emissive) {
+      const n = norm(cross(sub(b, a), sub(c, a)));
+      const base = this.pos.length / 3;
+      const em = emissive || [0, 0, 0];
+      for (const p of [a, b, c, d]) {
+        this.pos.push(p[0], p[1], p[2]);
+        this.nor.push(n[0], n[1], n[2]);
+        this.col.push(color[0], color[1], color[2]);
+        this.emi.push(em[0], em[1], em[2]);
+      }
+      this.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      return this;
     }
-    return this;
+    tri(a, b, c, color, emissive) {
+      const n = norm(cross(sub(b, a), sub(c, a)));
+      const base = this.pos.length / 3;
+      const em = emissive || [0, 0, 0];
+      for (const p of [a, b, c]) {
+        this.pos.push(p[0], p[1], p[2]);
+        this.nor.push(n[0], n[1], n[2]);
+        this.col.push(color[0], color[1], color[2]);
+        this.emi.push(em[0], em[1], em[2]);
+      }
+      this.idx.push(base, base + 1, base + 2);
+      return this;
+    }
+    // Segitiga dua sisi (daun, layar, sayap): emit kedua winding agar
+    // terlihat dari depan maupun belakang.
+    tri2(a, b, c, color, emissive) {
+      this.tri(a, b, c, color, emissive);
+      this.tri(a, c, b, color, emissive);
+      return this;
+    }
+    box(cx, cy, cz, w, h, d, color, emissive) {
+      const x0 = cx - w / 2, x1 = cx + w / 2;
+      const y0 = cy - h / 2, y1 = cy + h / 2;
+      const z0 = cz - d / 2, z1 = cz + d / 2;
+      // +X, -X, +Y, -Y, +Z, -Z — semua CCW dilihat dari luar
+      // (cross(b-a, c-a) searah normal luar tiap sisi).
+      this.quad([x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1], color, emissive);
+      this.quad([x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [x0, y0, z0], color, emissive);
+      this.quad([x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0], color, emissive);
+      this.quad([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1], color, emissive);
+      this.quad([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1], color, emissive);
+      this.quad([x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0], color, emissive);
+      return this;
+    }
+    // Prisma segitiga (atap pelana): alas (w x d), tinggi atap rh.
+    prismRoof(cx, cy, cz, w, rh, d, color) {
+      const x0 = cx - w / 2, x1 = cx + w / 2;
+      const z0 = cz - d / 2, z1 = cz + d / 2;
+      const apex = [cx, cy + rh, cz];
+      // Dua sisi miring (tri): sisi +Z dan -Z, plus dua sisi segitiga ujung.
+      this.tri([x0, cy, z1], [x1, cy, z1], [cx, cy + rh, z1], color);
+      this.tri([x1, cy, z0], [x0, cy, z0], [cx, cy + rh, z0], color);
+      this.tri([x0, cy, z0], [x0, cy, z1], [cx, cy + rh, z1], color);
+      this.tri([x1, cy, z1], [x1, cy, z0], [cx, cy + rh, z0], color);
+      return this;
+    }
+    build() {
+      return {
+        positions: new Float32Array(this.pos),
+        normals: new Float32Array(this.nor),
+        colors: new Float32Array(this.col),
+        emissive: new Float32Array(this.emi),
+        indices: new Uint16Array(this.idx),
+      };
+    }
   }
 
-  // Four-sided pyramid: square base on y, apex at y + h.
-  // Each side triangle is wound CCW seen from outside.
-  pyramid(cx, y, cz, w, h, color) {
-    const rgb = toRGB(color);
-    const x0 = cx - w / 2, x1 = cx + w / 2;
-    const z0 = cz - w / 2, z1 = cz + w / 2;
-    const apex = this.vertex(cx, y + h, cz, shade(rgb, 1.05));
-    const b0 = this.vertex(x0, y, z0, rgb);
-    const b1 = this.vertex(x1, y, z0, rgb);
-    const b2 = this.vertex(x1, y, z1, rgb);
-    const b3 = this.vertex(x0, y, z1, rgb);
-    // Sides: apex + base edge, ordered so each face is CCW outside.
-    this.tri(apex, b1, b0); // north (-Z) slope
-    this.tri(apex, b2, b1); // east (+X) slope
-    this.tri(apex, b3, b2); // south (+Z) slope
-    this.tri(apex, b0, b3); // west (-X) slope
-    // Base (CCW seen from below, so it is not culled from underneath).
-    this.quad(b0, b1, b2, b3);
-    return this;
+  // ---------- verifikasi normal ----------
+  // Untuk tiap segitiga EKSTERIOR (centroid-nya menyentuh permukaan
+  // bounding box mesh): normal (dari cross produk CCW) harus menghadap
+  // keluar, yaitu dot(normal, centroid - bboxCenter) > 0.
+  // Segitiga interior (mis. alas tutup kotak yang menempel di badan)
+  // dilewati karena tidak terlihat dari luar.
+  // Mengembalikan { ok, bad, total, checked }.
+  function verifyMeshNormals(mesh, center) {
+    const p = mesh.positions, idx = mesh.indices;
+    // Pusat = tengah bounding box (bukan rata-rata vertex, agar stabil).
+    let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < p.length; i += 3) {
+      for (let k = 0; k < 3; k++) {
+        if (p[i + k] < mn[k]) mn[k] = p[i + k];
+        if (p[i + k] > mx[k]) mx[k] = p[i + k];
+      }
+    }
+    const c = center || [(mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2];
+    const eps = 1e-4;
+    let bad = 0, checked = 0; const total = idx.length / 3;
+    for (let t = 0; t < total; t++) {
+      const i0 = idx[t * 3] * 3, i1 = idx[t * 3 + 1] * 3, i2 = idx[t * 3 + 2] * 3;
+      const a = [p[i0], p[i0 + 1], p[i0 + 2]];
+      const b = [p[i1], p[i1 + 1], p[i1 + 2]];
+      const cc = [p[i2], p[i2 + 1], p[i2 + 2]];
+      const cen = [(a[0] + b[0] + cc[0]) / 3, (a[1] + b[1] + cc[1]) / 3, (a[2] + b[2] + cc[2]) / 3];
+      // Eksterior? minimal satu koordinat centroid menyentuh bbox.
+      let exterior = false;
+      for (let k = 0; k < 3; k++) {
+        if (Math.abs(cen[k] - mn[k]) < 0.05 || Math.abs(cen[k] - mx[k]) < 0.05) { exterior = true; break; }
+      }
+      if (!exterior) continue;
+      checked++;
+      const n = norm(cross(sub(b, a), sub(cc, a)));
+      const v = [cen[0] - c[0], cen[1] - c[1], cen[2] - c[2]];
+      // Flag hanya bila normal jelas-jelas menghadap ke dalam (proyeksi
+      // negatif > 20% dari jarak centroid ke pusat). Wajah yang hampir
+      // sejajar bidang tengah (mis. bawah lengan) tidak dihitung salah.
+      const vl = Math.sqrt(dot(v, v)) || 1;
+      if (dot(n, v) < -0.2 * vl) bad++;
+    }
+    return { ok: bad === 0, bad, total, checked };
   }
 
-  // Sloped gable roof: ridge runs along X, eaves at y, apex at y + h.
-  gableRoof(cx, y, cz, w, h, d, color) {
-    const rgb = toRGB(color);
-    const x0 = cx - w / 2, x1 = cx + w / 2;
-    const z0 = cz - d / 2, z1 = cz + d / 2;
-    const ridgeY = y + h;
-    const r0 = this.vertex(x0, ridgeY, cz, shade(rgb, 1.0));
-    const r1 = this.vertex(x1, ridgeY, cz, shade(rgb, 1.0));
-    const e0 = this.vertex(x0, y, z0, rgb);
-    const e1 = this.vertex(x1, y, z0, rgb);
-    const e2 = this.vertex(x1, y, z1, rgb);
-    const e3 = this.vertex(x0, y, z1, rgb);
-    // North slope (-Z side) and south slope (+Z side), CCW outside.
-    this.quad(e0, e1, r1, r0);
-    this.quad(e3, r1, r0, e2);
-    // West gable triangle (-X end) and east gable triangle (+X end).
-    this.tri(e0, r0, e3);
-    this.tri(e1, e2, r1);
-    return this;
+  // ---------- mesh gedung ----------
+  // Gedung dengan jendela emissive (menyala saat malam: emissive diset
+  // lewat flag lit; mesh menyimpan dua set emissive: siang 0, malam hangat).
+  function createBuildingMesh(spec) {
+    // spec: {w,h,d,color,windows,roof:'flat'|'gable',lit}
+    const b = new MeshBuilder();
+    const w = spec.w, h = spec.h, d = spec.d;
+    const col = spec.color;
+    b.box(0, h / 2, 0, w, h, d, col);
+    // Atap.
+    if (spec.roof === 'gable') {
+      b.prismRoof(0, h, 0, w, Math.min(3, h * 0.25), d, [col[0] * 0.7, col[1] * 0.7, col[2] * 0.7]);
+    } else {
+      b.box(0, h + 0.15, 0, w * 0.92, 0.3, d * 0.92, [col[0] * 0.75, col[1] * 0.75, col[2] * 0.75]);
+    }
+    // Jendela emissive di fasad +Z dan -Z, sedikit menonjol dari dinding.
+    const winCol = [0.15, 0.18, 0.25];
+    const winEmi = spec.lit ? [1.0, 0.75, 0.35] : [0, 0, 0];
+    const rows = Math.max(1, Math.floor(spec.windows || 3));
+    const cols = Math.max(2, Math.floor(w / 3));
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const wx = -w / 2 + (c + 0.5) * (w / cols);
+        const wy = 1.2 + r * ((h - 2) / rows);
+        const ww = w / cols * 0.45, wh = 0.9;
+        // +Z
+        b.quad([wx - ww / 2, wy - wh / 2, d / 2 + 0.03], [wx + ww / 2, wy - wh / 2, d / 2 + 0.03],
+               [wx + ww / 2, wy + wh / 2, d / 2 + 0.03], [wx - ww / 2, wy + wh / 2, d / 2 + 0.03], winCol, winEmi);
+        // -Z
+        b.quad([wx + ww / 2, wy - wh / 2, -d / 2 - 0.03], [wx - ww / 2, wy - wh / 2, -d / 2 - 0.03],
+               [wx - ww / 2, wy + wh / 2, -d / 2 - 0.03], [wx + ww / 2, wy + wh / 2, -d / 2 - 0.03], winCol, winEmi);
+      }
+    }
+    // Pintu.
+    b.quad([-0.7, 0, d / 2 + 0.03], [0.7, 0, d / 2 + 0.03], [0.7, 2.2, d / 2 + 0.03], [-0.7, 2.2, d / 2 + 0.03],
+      [0.25, 0.18, 0.12], [0, 0, 0]);
+    const mesh = b.build();
+    mesh.meta = { kind: 'building', lit: !!spec.lit, windows: rows * cols * 2 };
+    return mesh;
   }
 
-  build() {
-    return makeMesh(this.positions, this.colors, this.indices);
+  // ---------- palma ----------
+  function createPalmMesh(h) {
+    const b = new MeshBuilder();
+    const height = h || 6;
+    const trunk = [0.45, 0.32, 0.2];
+    const leaf = [0.15, 0.55, 0.2];
+    // Batang: 3 segmen kotak miring sedikit.
+    let y = 0;
+    for (let s = 0; s < 3; s++) {
+      const segH = height / 3;
+      b.box(0.15 * s, y + segH / 2, 0, 0.35, segH, 0.35, trunk);
+      y += segH;
+    }
+    // Daun: 6 segitiga menjuntai dari puncak.
+    const top = [0.45, height, 0];
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2;
+      const tip = [top[0] + Math.cos(a) * 2.2, height - 1.4, top[2] + Math.sin(a) * 2.2];
+      const side = [top[0] + Math.cos(a + 0.5) * 1.2, height - 0.4, top[2] + Math.sin(a + 0.5) * 1.2];
+      b.tri2(top, side, tip, leaf);
+      b.tri2(top, tip, [top[0] + Math.cos(a - 0.5) * 1.2, height - 0.4, top[2] + Math.sin(a - 0.5) * 1.2], leaf);
+    }
+    // Kelapa.
+    b.box(top[0], height - 0.3, top[2], 0.5, 0.5, 0.5, [0.4, 0.3, 0.15]);
+    const mesh = b.build();
+    mesh.meta = { kind: 'palm', height };
+    return mesh;
   }
-}
 
-function makeMesh(positions, colors, indices) {
-  // Per-vertex normals, computed from the triangles (flat shading).
-  // MeshBuilder never shares vertices between faces (each quadAt adds
-  // fresh vertices), so accumulating each triangle's face normal onto
-  // its three vertices and normalising gives the correct flat normal.
-  // gl.js requires a normals array; without it drawMesh throws.
-  const vertexCount = positions.length / 3;
-  const normals = new Float32Array(vertexCount * 3);
-  for (let t = 0; t + 2 < indices.length; t += 3) {
-    const a = indices[t], b = indices[t + 1], c = indices[t + 2];
-    const ax = positions[a * 3], ay = positions[a * 3 + 1], az = positions[a * 3 + 2];
-    const bx = positions[b * 3], by = positions[b * 3 + 1], bz = positions[b * 3 + 2];
-    const cx = positions[c * 3], cy = positions[c * 3 + 1], cz = positions[c * 3 + 2];
-    const ux = bx - ax, uy = by - ay, uz = bz - az;
-    const vx = cx - ax, vy = cy - ay, vz = cz - az;
-    let nx = uy * vz - uz * vy;
-    let ny = uz * vx - ux * vz;
-    let nz = ux * vy - uy * vx;
-    const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-    nx /= len; ny /= len; nz /= len;
-    normals[a * 3] += nx; normals[a * 3 + 1] += ny; normals[a * 3 + 2] += nz;
-    normals[b * 3] += nx; normals[b * 3 + 1] += ny; normals[b * 3 + 2] += nz;
-    normals[c * 3] += nx; normals[c * 3 + 1] += ny; normals[c * 3 + 2] += nz;
+  // ---------- mobil ----------
+  // Mobil dengan lampu depan emissive (dua quad putih di depan).
+  function createCarMesh(color, opts) {
+    const o = opts || {};
+    const b = new MeshBuilder();
+    const col = color || [0.8, 0.1, 0.1];
+    // Badan bawah + kabin.
+    b.box(0, 0.55, 0, 1.8, 0.7, 4.2, col);
+    b.box(0, 1.25, -0.2, 1.6, 0.6, 2.2, [0.12, 0.14, 0.18]); // kaca kabin
+    b.box(0, 1.05, -0.2, 1.65, 0.25, 2.3, col); // atap tipis
+    // Roda (4 kotak gelap).
+    const wheel = [0.08, 0.08, 0.08];
+    for (const sx of [-0.85, 0.85]) for (const sz of [-1.4, 1.4]) {
+      b.box(sx, 0.35, sz, 0.25, 0.7, 0.7, wheel);
+    }
+    // Lampu depan emissive (depan = +Z).
+    const headEmi = o.headlightsOn ? [1.0, 0.95, 0.7] : [0.4, 0.4, 0.35];
+    for (const sx of [-0.55, 0.55]) {
+      b.quad([sx - 0.22, 0.55, 2.11], [sx + 0.22, 0.55, 2.11], [sx + 0.22, 0.85, 2.11], [sx - 0.22, 0.85, 2.11],
+        [1, 1, 0.9], headEmi);
+    }
+    // Lampu belakang merah.
+    for (const sx of [-0.55, 0.55]) {
+      b.quad([sx + 0.22, 0.55, -2.11], [sx - 0.22, 0.55, -2.11], [sx - 0.22, 0.85, -2.11], [sx + 0.22, 0.85, -2.11],
+        [0.6, 0.05, 0.05], [0.5, 0.05, 0.05]);
+    }
+    const mesh = b.build();
+    mesh.meta = { kind: 'car', headlightsOn: !!o.headlightsOn };
+    return mesh;
   }
-  for (let i = 0; i < vertexCount; i++) {
-    const len = Math.sqrt(
-      normals[i * 3] * normals[i * 3] +
-      normals[i * 3 + 1] * normals[i * 3 + 1] +
-      normals[i * 3 + 2] * normals[i * 3 + 2]
-    ) || 1;
-    normals[i * 3] /= len; normals[i * 3 + 1] /= len; normals[i * 3 + 2] /= len;
+
+  // Siluet LOD mobil jauh: badan + 2 lampu depan saja.
+  function createCarLodMesh(color) {
+    const b = new MeshBuilder();
+    b.box(0, 0.6, 0, 1.8, 1.0, 4.2, color || [0.5, 0.5, 0.5]);
+    for (const sx of [-0.55, 0.55]) {
+      b.quad([sx - 0.25, 0.5, 2.11], [sx + 0.25, 0.5, 2.11], [sx + 0.25, 0.8, 2.11], [sx - 0.25, 0.8, 2.11],
+        [1, 1, 0.9], [1.0, 0.95, 0.7]);
+    }
+    const mesh = b.build();
+    mesh.meta = { kind: 'car-lod' };
+    return mesh;
   }
-  return {
-    positions: Float32Array.from(positions),
-    colors: Float32Array.from(colors),
-    normals,
-    indices: Uint16Array.from(indices),
-    vertexCount,
-    triangleCount: indices.length / 3,
+
+  // ---------- pejalan kaki ----------
+  function createPedestrianMesh(shirt, pants, skin) {
+    const b = new MeshBuilder();
+    const sh = shirt || [0.2, 0.5, 0.8];
+    const pa = pants || [0.15, 0.15, 0.2];
+    const sk = skin || [0.85, 0.65, 0.5];
+    b.box(0, 0.45, 0, 0.4, 0.9, 0.25, pa);          // kaki
+    b.box(0, 1.15, 0, 0.55, 0.55, 0.3, sh);         // badan
+    b.box(0, 1.6, 0, 0.32, 0.32, 0.3, sk);          // kepala
+    b.box(-0.32, 1.15, 0, 0.12, 0.5, 0.2, sh);      // lengan kiri
+    b.box(0.32, 1.15, 0, 0.12, 0.5, 0.2, sh);       // lengan kanan
+    const mesh = b.build();
+    mesh.meta = { kind: 'pedestrian' };
+    return mesh;
+  }
+
+  // ---------- perahu ----------
+  function createBoatMesh(color) {
+    const b = new MeshBuilder();
+    const col = color || [0.9, 0.85, 0.7];
+    // Lambung: kotak bawah + sisi miring (prisma sederhana).
+    b.box(0, 0.4, 0, 1.6, 0.6, 4.5, col);
+    b.tri([0.8, 0.7, 2.25], [-0.8, 0.7, 2.25], [0, 0.7, 3.1], col); // haluan (+Y)
+    b.tri([-0.8, 0.7, -2.25], [0.8, 0.7, -2.25], [0, 0.7, -2.9], col); // buritan (+Y)
+    // Tiang + layar segitiga (dua sisi).
+    b.box(0, 1.6, 0, 0.12, 1.8, 0.12, [0.4, 0.3, 0.2]);
+    b.tri2([0, 2.4, 0], [0, 0.9, 0.1], [0, 0.9, 1.6], [0.95, 0.92, 0.85]);
+    // Bangku.
+    b.box(0, 0.75, -0.8, 1.4, 0.1, 0.4, [0.5, 0.38, 0.25]);
+    b.box(0, 0.75, 0.8, 1.4, 0.1, 0.4, [0.5, 0.38, 0.25]);
+    const mesh = b.build();
+    mesh.meta = { kind: 'boat' };
+    return mesh;
+  }
+
+  // ---------- prop ----------
+  // Prop kecil: bangku, tempat sampah, kios, lampu jalan, poster, cangkir, koran.
+  function createPropMesh(kind, color) {
+    const b = new MeshBuilder();
+    const col = color || [0.6, 0.5, 0.4];
+    if (kind === 'bench') {
+      b.box(0, 0.45, 0, 1.8, 0.1, 0.5, col);
+      b.box(0, 0.75, -0.22, 1.8, 0.5, 0.08, col);
+      b.box(-0.8, 0.2, 0, 0.1, 0.4, 0.45, [0.2, 0.2, 0.2]);
+      b.box(0.8, 0.2, 0, 0.1, 0.4, 0.45, [0.2, 0.2, 0.2]);
+    } else if (kind === 'bin') {
+      b.box(0, 0.5, 0, 0.6, 1.0, 0.6, [0.15, 0.4, 0.2]);
+      b.box(0, 1.05, 0, 0.65, 0.1, 0.65, [0.1, 0.3, 0.15]);
+    } else if (kind === 'kiosk') {
+      b.box(0, 1.0, 0, 2.4, 2.0, 2.0, col);
+      b.box(0, 2.15, 0, 2.8, 0.3, 2.4, [0.85, 0.3, 0.25]); // atap
+      b.box(0, 1.1, 1.05, 2.0, 0.08, 0.4, [0.7, 0.6, 0.45]); // meja depan
+    } else if (kind === 'lamp') {
+      b.box(0, 1.5, 0, 0.15, 3.0, 0.15, [0.2, 0.2, 0.22]);
+      b.box(0.3, 3.0, 0, 0.7, 0.12, 0.12, [0.2, 0.2, 0.22]);
+      b.box(0.55, 2.9, 0, 0.3, 0.2, 0.3, [1, 0.95, 0.7], [1.0, 0.85, 0.4]);
+    } else if (kind === 'poster') {
+      b.box(0, 1.2, 0, 1.0, 1.4, 0.06, [0.9, 0.9, 0.85]);
+      b.box(0, 1.2, 0.04, 0.85, 1.2, 0.02, [0.2, 0.4, 0.7]);
+    } else if (kind === 'cup') {
+      b.box(0, 0.08, 0, 0.12, 0.16, 0.12, [0.95, 0.95, 0.95]);
+      b.box(0, 0.17, 0, 0.1, 0.03, 0.1, [0.3, 0.18, 0.08]);
+    } else if (kind === 'newspaper') {
+      b.box(0, 0.02, 0, 0.5, 0.04, 0.35, [0.95, 0.95, 0.9]);
+      b.box(0, 0.045, 0, 0.2, 0.01, 0.3, [0.15, 0.15, 0.15]);
+    } else if (kind === 'seagull') {
+      // Camar: dua segitiga sayap (dua sisi).
+      b.tri2([0, 0, 0], [-0.7, 0.15, 0.25], [-0.7, 0.15, -0.25], [0.95, 0.95, 0.95]);
+      b.tri2([0, 0, 0], [0.7, 0.15, -0.25], [0.7, 0.15, 0.25], [0.95, 0.95, 0.95]);
+      b.box(0, 0, 0, 0.15, 0.12, 0.5, [0.95, 0.95, 0.95]);
+    } else {
+      b.box(0, 0.5, 0, 1, 1, 1, col);
+    }
+    const mesh = b.build();
+    mesh.meta = { kind: 'prop:' + kind };
+    return mesh;
+  }
+
+  // ---------- verifikasi semua mesh bawaan ----------
+  function verifyAllMeshes() {
+    const results = {};
+    const specs = [
+      ['building', createBuildingMesh({ w: 10, h: 12, d: 8, color: [0.8, 0.7, 0.6], windows: 4, roof: 'flat', lit: true })],
+      ['building-gable', createBuildingMesh({ w: 8, h: 6, d: 7, color: [0.7, 0.6, 0.5], windows: 2, roof: 'gable', lit: false })],
+      ['palm', createPalmMesh(6)],
+      ['car', createCarMesh([0.8, 0.1, 0.1], { headlightsOn: true })],
+      ['car-lod', createCarLodMesh([0.5, 0.5, 0.5])],
+      ['pedestrian', createPedestrianMesh()],
+      ['boat', createBoatMesh()],
+      ['bench', createPropMesh('bench')],
+      ['bin', createPropMesh('bin')],
+      ['kiosk', createPropMesh('kiosk')],
+      ['lamp', createPropMesh('lamp')],
+      ['seagull', createPropMesh('seagull')],
+    ];
+    for (const [name, mesh] of specs) {
+      // Pusat = tengah bounding box (dihitung di dalam verifyMeshNormals).
+      results[name] = verifyMeshNormals(mesh);
+    }
+    return results;
+  }
+
+  const api = {
+    MeshBuilder, verifyMeshNormals, verifyAllMeshes,
+    createBuildingMesh, createPalmMesh, createCarMesh, createCarLodMesh,
+    createPedestrianMesh, createBoatMesh, createPropMesh,
   };
-}
-
-// Convenience one-shot builders (each returns a finished mesh).
-function boxAt(x, y, z, w, h, d, color) {
-  return new MeshBuilder().boxAt(x, y, z, w, h, d, color).build();
-}
-
-function flatQuad(x, y, z, w, d, color) {
-  return new MeshBuilder().flatQuad(x, y, z, w, d, color).build();
-}
-
-function cylinder(cx, y, cz, radius, h, color, segments = 12) {
-  return new MeshBuilder().cylinder(cx, y, cz, radius, h, color, segments).build();
-}
-
-function pyramid(cx, y, cz, w, h, color) {
-  return new MeshBuilder().pyramid(cx, y, cz, w, h, color).build();
-}
-
-function mergeMeshes(meshes) {
-  const positions = [];
-  const colors = [];
-  const indices = [];
-  let offset = 0;
-  for (const m of meshes) {
-    positions.push(...m.positions);
-    colors.push(...m.colors);
-    for (const i of m.indices) indices.push(i + offset);
-    offset += m.vertexCount;
-  }
-  return makeMesh(positions, colors, indices);
-}
-
-SB.Meshes = {
-  MeshBuilder,
-  makeMesh,
-  mergeMeshes,
-  boxAt,
-  flatQuad,
-  cylinder,
-  pyramid,
-  toRGB,
-  shade,
-};
-
-const Meshes = SB.Meshes;
-
-export { Meshes, MeshBuilder, makeMesh, mergeMeshes, boxAt, flatQuad, cylinder, pyramid };
-export default SB.Meshes;
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  global.SunsetMeshes = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);
