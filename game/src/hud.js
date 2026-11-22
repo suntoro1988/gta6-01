@@ -1,523 +1,669 @@
 window.SB = window.SB || {};
-(function () {
-  'use strict';
+(function(){ 'use strict';
+// ---------------------------------------------------------------------------
+// SB.HUD — the on-screen interface of Sunset Bay, drawn as DOM over the
+// WebGL canvas: three corners of live information, a mission banner, a
+// toast feed, a damage vignette, and a canvas minimap with a route line.
+// Layout (spec: "HUD 3 sudut" + minimap):
+//   top-left     — money, wanted stars, health + armour bars
+//   top-right    — clock, day, weather, radio station, heat meter
+//   bottom-right — minimap (canvas) with player arrow, mission marker,
+//                  route line, wanted zone tint
+//   bottom-left  — mission tracker + toast feed + contextual hints
+//   centre       — crosshair (only while armed on foot), mission banner
+// API (spec): init(state), update(state), showMission(text),
+// showToast(text), setWanted(n), setMoney(n), minimap(state).
+// ---------------------------------------------------------------------------
 
-  // ---------------------------------------------------------------------------
-  // SB.HUD — professional 3-corner DOM HUD for Sunset Bay v12.
-  //  Top-left:    active mission + money + REP + respect rank.
-  //  Top-right:   wanted stars + Heat meter + clock + radio station.
-  //  Bottom-left: minimap (190x190 canvas) + mission route line.
-  // Plus: toast / notification queue, BUSTED overlay, pause overlay,
-  // damage vignette flash, and a small centre prompt line.
-  // All DOM is built once in init(); update(state) only touches text /
-  // styles that changed, so the HUD costs almost nothing per frame.
-  // The minimap draws from state: player, mission target, cops, districts.
-  // ---------------------------------------------------------------------------
+var root = null;        // #sb-hud container
+var el = {};            // named DOM nodes, built once in init()
+var stateRef = null;
+var money = 500;
+var wanted = 0;
+var health = 100;
+var armor = 0;
+var ammo = 24;
+var weapon = 0;
+var missionText = '';
+var missionVisible = false;
+var toasts = [];        // {node, until}
+var bannerTimer = 0;
+var bannerNode = null;
+var lastUpdate = 0;
+var minimapCtx = null;
+var minimapCanvas = null;
+var routePoints = [];   // world {x,z} waypoints for the active route
+var blipPulse = 0;
+var damageFlash = 0;    // 0..1, decays; drives the red vignette
+var speedKmh = 0;
+var clockCache = '';
+var WEAPON_NAMES = ['Pistol', 'SMG', 'Shotgun', 'Rifle'];
+var WEAPON_ICONS = ['P', 'S', 'SG', 'R'];
+var DISTRICT_COLORS = {
+  'Marina': '#37c8e8', 'Palm Parade': '#7ed957', 'Old Town': '#e8b64c',
+  'Harbour': '#5b8def', 'Downtown': '#e86a92', 'Beachfront': '#ffd166'
+};
 
-  var root = null;
-  var els = {};
-  var minimapCtx = null;
-  var stateRef = null;
-  var toastQueue = [];
-  var toastTimer = null;
-  var missionText = '';
-  var missionSub = '';
-  var lastWanted = -1;
-  var lastMoney = -1;
-  var lastRank = '';
-  var lastClock = '';
-  var lastHeat = -1;
-  var lastStation = -1;
-  var bustedShown = false;
-  var pausedShown = false;
-  var promptTimer = null;
+// Small DOM helper: create an element with a class and optional text.
+function mk(tag, cls, text) {
+  var n = document.createElement(tag);
+  if (cls) { n.className = cls; }
+  if (text !== undefined && text !== null) { n.textContent = text; }
+  return n;
+}
 
-  var RANKS = ['Rookie', 'Street', 'Boss', 'Kingpin'];
-  var RANK_COLORS = ['#c9d1d9', '#7ee787', '#ffd166', '#ff6b9d'];
-
-  function rankFor(respect) {
-    if (respect >= 900) return 'Kingpin';
-    if (respect >= 500) return 'Boss';
-    if (respect >= 150) return 'Street';
-    return 'Rookie';
+// Format money as "$1,250" with thousands separators.
+function fmtMoney(n) {
+  var neg = n < 0;
+  var s = String(Math.abs(Math.floor(n)));
+  var out = '';
+  while (s.length > 3) {
+    out = ',' + s.slice(-3) + out;
+    s = s.slice(0, -3);
   }
+  out = s + out;
+  return (neg ? '-$' : '$') + out;
+}
 
-  function rankIndex(rank) {
-    var i = RANKS.indexOf(rank);
-    return i < 0 ? 0 : i;
+// Format game clock: timeOfDay 18.33 -> "18:20".
+function fmtClock(tod) {
+  var h = Math.floor(tod) % 24;
+  var m = Math.floor((tod - Math.floor(tod)) * 60);
+  return (h < 10 ? '0' + h : '' + h) + ':' + (m < 10 ? '0' + m : '' + m);
+}
+
+// Stars string for a wanted level: ★★★☆☆.
+function stars(n) {
+  var s = '';
+  var i;
+  for (i = 0; i < 5; i++) { s += i < n ? '★' : '☆'; }
+  return s;
+}
+
+// ---------------------------------------------------------------------------
+// Styles. Injected once as a <style> tag so the HUD works without any
+// extra CSS file. Colours follow the golden-hour palette: warm amber
+// accents on deep translucent navy panels.
+// ---------------------------------------------------------------------------
+var CSS = [
+  '#sb-hud{position:absolute;inset:0;pointer-events:none;font-family:"Segoe UI",Arial,sans-serif;color:#fff;z-index:10;overflow:hidden}',
+  '#sb-hud .panel{background:rgba(8,16,32,.62);border:1px solid rgba(255,255,255,.18);border-radius:10px;padding:8px 12px;backdrop-filter:blur(2px)}',
+  '#sb-hud .hud-tl{position:absolute;top:12px;left:12px;min-width:210px}',
+  '#sb-hud .hud-money{font-size:22px;font-weight:700;color:#7dff8a;text-shadow:0 1px 2px #000}',
+  '#sb-hud .hud-wanted{font-size:19px;letter-spacing:2px;color:#ffd23e;text-shadow:0 0 6px rgba(255,60,60,.8)}',
+  '#sb-hud .hud-wanted.hot{color:#ff5340;animation:sb-pulse .7s infinite alternate}',
+  '#sb-hud .bar{height:9px;border-radius:5px;background:rgba(0,0,0,.55);margin-top:5px;overflow:hidden;border:1px solid rgba(255,255,255,.25)}',
+  '#sb-hud .bar>i{display:block;height:100%;border-radius:5px}',
+  '#sb-hud .bar-hp>i{background:linear-gradient(90deg,#37e05b,#a5f2a5)}',
+  '#sb-hud .bar-armor>i{background:linear-gradient(90deg,#4aa8ff,#a5d3ff)}',
+  '#sb-hud .bar-heat>i{background:linear-gradient(90deg,#ffb13d,#ff5340)}',
+  '#sb-hud .bar-label{font-size:10px;letter-spacing:1px;color:#cfe0ff;margin-top:3px}',
+  '#sb-hud .hud-tr{position:absolute;top:12px;right:12px;text-align:right;min-width:180px}',
+  '#sb-hud .hud-clock{font-size:22px;font-weight:700;text-shadow:0 1px 2px #000}',
+  '#sb-hud .hud-sub{font-size:12px;color:#d8e6ff;margin-top:2px}',
+  '#sb-hud .hud-radio{font-size:12px;color:#ffd23e;margin-top:4px;font-weight:600}',
+  '#sb-hud .hud-br{position:absolute;right:12px;bottom:12px;text-align:right}',
+  '#sb-hud #sb-minimap{display:block;border-radius:50%;border:3px solid rgba(255,255,255,.65);box-shadow:0 0 0 2px rgba(0,0,0,.45),0 4px 18px rgba(0,0,0,.5);background:#0a1a2e}',
+  '#sb-hud .hud-speed{font-size:15px;font-weight:700;margin-top:5px;text-shadow:0 1px 2px #000}',
+  '#sb-hud .hud-bl{position:absolute;left:12px;bottom:12px;max-width:380px}',
+  '#sb-hud .hud-mission{font-size:15px;font-weight:600;line-height:1.35}',
+  '#sb-hud .hud-mission .obj{color:#ffd23e}',
+  '#sb-hud .hud-toasts{margin-top:8px}',
+  '#sb-hud .toast{background:rgba(8,16,32,.72);border-left:3px solid #ffd23e;border-radius:6px;padding:6px 10px;font-size:13px;margin-top:5px;animation:sb-toast-in .25s ease-out}',
+  '#sb-hud .toast.good{border-left-color:#37e05b}',
+  '#sb-hud .toast.bad{border-left-color:#ff5340}',
+  '#sb-hud .toast.info{border-left-color:#4aa8ff}',
+  '#sb-hud .hud-hint{font-size:12px;color:#cfe0ff;margin-top:8px;opacity:.9}',
+  '#sb-hud .hud-banner{position:absolute;top:22%;left:50%;transform:translate(-50%,-50%);text-align:center;display:none}',
+  '#sb-hud .hud-banner h1{font-size:34px;letter-spacing:3px;margin:0;text-shadow:0 2px 10px #000;color:#ffd23e}',
+  '#sb-hud .hud-banner p{font-size:16px;margin:4px 0 0;text-shadow:0 1px 4px #000}',
+  '#sb-hud .hud-cross{position:absolute;left:50%;top:50%;width:22px;height:22px;margin:-11px 0 0 -11px;display:none}',
+  '#sb-hud .hud-cross:before,#sb-hud .hud-cross:after{content:"";position:absolute;background:#fff;box-shadow:0 0 3px #000}',
+  '#sb-hud .hud-cross:before{left:10px;top:0;width:2px;height:22px}',
+  '#sb-hud .hud-cross:after{top:10px;left:0;width:22px;height:2px}',
+  '#sb-hud .hud-vignette{position:absolute;inset:0;pointer-events:none;opacity:0;background:radial-gradient(ellipse at center,transparent 55%,rgba(255,0,0,.55) 100%)}',
+  '#sb-hud .hud-ammo{font-size:14px;margin-top:5px;color:#ffe9a8}',
+  '@keyframes sb-pulse{from{transform:scale(1)}to{transform:scale(1.08)}}',
+  '@keyframes sb-toast-in{from{opacity:0;transform:translateX(-12px)}to{opacity:1;transform:none}}'
+].join('\n');
+
+// Build the whole DOM tree once. Safe to call twice (rebuilds cleanly).
+function buildDom() {
+  if (root && root.parentNode) { root.parentNode.removeChild(root); }
+  root = mk('div', null, null);
+  root.id = 'sb-hud';
+
+  var style = document.createElement('style');
+  style.textContent = CSS;
+  root.appendChild(style);
+
+  // Damage vignette (under everything else).
+  el.vignette = mk('div', 'hud-vignette', null);
+  root.appendChild(el.vignette);
+
+  // --- Top-left: money / wanted / health / armour / weapon ---
+  var tl = mk('div', 'panel hud-tl', null);
+  el.money = mk('div', 'hud-money', fmtMoney(money));
+  el.wanted = mk('div', 'hud-wanted', stars(wanted));
+  var hpBar = mk('div', 'bar bar-hp', null);
+  el.hpFill = mk('i', null, null);
+  hpBar.appendChild(el.hpFill);
+  var arBar = mk('div', 'bar bar-armor', null);
+  el.armorFill = mk('i', null, null);
+  arBar.appendChild(el.armorFill);
+  el.ammo = mk('div', 'hud-ammo', 'Pistol — ammo 24');
+  tl.appendChild(el.money);
+  tl.appendChild(el.wanted);
+  tl.appendChild(hpBar);
+  tl.appendChild(mk('div', 'bar-label', 'HEALTH'));
+  tl.appendChild(arBar);
+  tl.appendChild(mk('div', 'bar-label', 'ARMOUR'));
+  tl.appendChild(el.ammo);
+  root.appendChild(tl);
+
+  // --- Top-right: clock / day / weather / heat / radio ---
+  var tr = mk('div', 'panel hud-tr', null);
+  el.clock = mk('div', 'hud-clock', '18:20');
+  el.day = mk('div', 'hud-sub', 'Day 1 — Golden Hour');
+  el.weather = mk('div', 'hud-sub', 'Clear skies');
+  var heatBar = mk('div', 'bar bar-heat', null);
+  el.heatFill = mk('i', null, null);
+  heatBar.appendChild(el.heatFill);
+  el.heatLabel = mk('div', 'bar-label', 'HEAT 0');
+  el.radio = mk('div', 'hud-radio', '♪ SUNSET FM 88.1');
+  tr.appendChild(el.clock);
+  tr.appendChild(el.day);
+  tr.appendChild(el.weather);
+  tr.appendChild(heatBar);
+  tr.appendChild(el.heatLabel);
+  tr.appendChild(el.radio);
+  root.appendChild(tr);
+
+  // --- Bottom-right: minimap + speed ---
+  // Pakai kanvas minimap STATIS dari index.html (#minimap-canvas) supaya
+  // tidak ada dua lingkaran minimap di layar (satu kosong, satu terisi).
+  var br = mk('div', 'hud-br', null);
+  minimapCanvas = document.getElementById('minimap-canvas');
+  if (!minimapCanvas) {
+    minimapCanvas = document.createElement('canvas');
+    minimapCanvas.id = 'sb-minimap';
+    br.appendChild(minimapCanvas);
   }
+  minimapCanvas.width = 168;
+  minimapCanvas.height = 168;
+  minimapCtx = minimapCanvas.getContext('2d');
+  el.speed = mk('div', 'hud-speed', '');
+  // JANGAN appendChild kanvas statis ke br: itu memindahkannya dari
+  // #hud-minimap ke dalam #sb-hud, lalu buildDom berikutnya menghapus
+  // #sb-hud beserta kanvasnya (minimap hilang total).
+  br.appendChild(el.speed);
+  root.appendChild(br);
 
-  function fmtMoney(n) {
-    var v = Math.floor(n || 0);
-    var neg = v < 0;
-    var s = String(Math.abs(v));
-    var out = '';
-    while (s.length > 3) { out = ',' + s.slice(-3) + out; s = s.slice(0, -3); }
-    out = s + out;
-    return (neg ? '-$' : '$') + out;
+  // --- Bottom-left: mission tracker + toasts + hints ---
+  var bl = mk('div', 'hud-bl', null);
+  var missionPanel = mk('div', 'panel hud-mission', null);
+  el.mission = mk('div', null, 'No active mission — find work at the marina.');
+  missionPanel.appendChild(el.mission);
+  el.toasts = mk('div', 'hud-toasts', null);
+  el.hint = mk('div', 'hud-hint', 'WASD move · E enter car · Q radio · M mute');
+  bl.appendChild(missionPanel);
+  bl.appendChild(el.toasts);
+  bl.appendChild(el.hint);
+  root.appendChild(bl);
+
+  // --- Centre: mission banner + crosshair ---
+  bannerNode = mk('div', 'hud-banner', null);
+  el.bannerTitle = mk('h1', null, '');
+  el.bannerSub = mk('p', null, '');
+  bannerNode.appendChild(el.bannerTitle);
+  bannerNode.appendChild(el.bannerSub);
+  root.appendChild(bannerNode);
+  el.cross = mk('div', 'hud-cross', null);
+  root.appendChild(el.cross);
+
+  var host = document.getElementById('game-container') || document.body;
+  host.appendChild(root);
+}
+
+// ---------------------------------------------------------------------------
+// init(state): build the HUD DOM and sync it once with shared state.
+// ---------------------------------------------------------------------------
+function init(state) {
+  stateRef = state || null;
+  if (stateRef) {
+    money = stateRef.money || 0;
+    wanted = stateRef.wanted || 0;
+    health = (stateRef.player && stateRef.player.hp) || 100;
+    armor = (stateRef.player && stateRef.player.armor) || 0;
+    ammo = (typeof stateRef.ammo === 'number') ? stateRef.ammo : 24;
+    weapon = stateRef.weapon || 0;
   }
+  buildDom();
+  setMoney(money);
+  setWanted(wanted);
+  update(stateRef || {});
+  return true;
+}
 
-  function fmtClock(timeOfDay) {
-    var h = Math.floor(timeOfDay || 0) % 24;
-    var m = Math.floor(((timeOfDay || 0) % 1) * 60);
-    var hh = (h < 10 ? '0' : '') + h;
-    var mm = (m < 10 ? '0' : '') + m;
-    return hh + ':' + mm;
-  }
-
-  function el(tag, cls, parent, text) {
-    var d = document.createElement(tag);
-    if (cls) d.className = cls;
-    if (text !== undefined && text !== null) d.textContent = text;
-    if (parent) parent.appendChild(d);
-    return d;
-  }
-
-  function injectCSS() {
-    if (document.getElementById('sb-hud-css')) return;
-    var css = [
-      '#sb-hud{position:fixed;inset:0;pointer-events:none;z-index:20;',
-      ' font-family:"Segoe UI",system-ui,-apple-system,Arial,sans-serif;color:#fff;}',
-      '#sb-hud .sb-panel{background:rgba(8,12,20,.62);border:1px solid rgba(255,255,255,.14);',
-      ' border-radius:10px;backdrop-filter:blur(3px);box-shadow:0 4px 18px rgba(0,0,0,.35);}',
-      '#sb-hud-tl{position:absolute;top:14px;left:14px;min-width:250px;max-width:330px;padding:10px 12px;}',
-      '#sb-hud-mission{font-size:15px;font-weight:700;letter-spacing:.3px;line-height:1.25;}',
-      '#sb-hud-mission-sub{font-size:12px;color:#ffd166;margin-top:3px;line-height:1.35;}',
-      '#sb-hud-stats{display:flex;gap:14px;margin-top:8px;font-size:13px;}',
-      '#sb-hud-money{color:#7ee787;font-weight:700;}',
-      '#sb-hud-rep{color:#79c0ff;}',
-      '#sb-hud-rank{font-weight:700;}',
-      '#sb-hud-rankbar{height:5px;background:rgba(255,255,255,.15);border-radius:3px;margin-top:7px;overflow:hidden;}',
-      '#sb-hud-rankfill{height:100%;background:linear-gradient(90deg,#ff9a3c,#ffd166);width:0%;transition:width .4s;}',
-      '#sb-hud-tr{position:absolute;top:14px;right:14px;text-align:right;padding:10px 12px;min-width:210px;}',
-      '#sb-hud-stars{font-size:21px;letter-spacing:3px;color:#ffd166;line-height:1;}',
-      '#sb-hud-stars .sb-off{color:rgba(255,255,255,.22);}',
-      '#sb-hud-heat{margin-top:6px;font-size:11px;color:#ffb4b4;}',
-      '#sb-hud-heatbar{height:5px;background:rgba(255,255,255,.15);border-radius:3px;margin-top:3px;overflow:hidden;}',
-      '#sb-hud-heatfill{height:100%;background:linear-gradient(90deg,#ffb020,#ff3b30);width:0%;transition:width .3s;}',
-      '#sb-hud-clock{font-size:19px;font-weight:700;margin-top:6px;}',
-      '#sb-hud-radio{font-size:12px;color:#a5d6ff;margin-top:2px;}',
-      '#sb-hud-bl{position:absolute;left:14px;bottom:14px;}',
-      '#sb-hud-minimap{display:block;border-radius:10px;border:1px solid rgba(255,255,255,.2);',
-      ' background:#0a1420;box-shadow:0 4px 18px rgba(0,0,0,.45);}',
-      '#sb-hud-route{font-size:11px;color:#a5d6ff;margin-top:5px;padding:4px 8px;display:inline-block;}',
-      '#sb-hud-toasts{position:absolute;top:76px;left:50%;transform:translateX(-50%);',
-      ' display:flex;flex-direction:column;gap:8px;align-items:center;width:min(480px,86vw);}',
-      '.sb-toast{background:rgba(8,12,20,.85);border:1px solid rgba(255,209,102,.5);border-radius:8px;',
-      ' padding:9px 16px;font-size:14px;font-weight:600;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.4);',
-      ' animation:sb-toast-in .25s ease-out;}',
-      '@keyframes sb-toast-in{from{opacity:0;transform:translateY(-8px);}to{opacity:1;transform:none;}}',
-      '#sb-hud-prompt{position:absolute;left:50%;bottom:22%;transform:translateX(-50%);',
-      ' font-size:14px;background:rgba(8,12,20,.7);padding:7px 14px;border-radius:8px;display:none;}',
-      '#sb-hud-vignette{position:fixed;inset:0;pointer-events:none;opacity:0;transition:opacity .18s;',
-      ' background:radial-gradient(ellipse at center,transparent 52%,rgba(255,0,0,.5) 100%);}',
-      '#sb-hud-busted,#sb-hud-pause{position:fixed;inset:0;display:none;align-items:center;justify-content:center;',
-      ' flex-direction:column;background:rgba(5,5,12,.72);z-index:40;pointer-events:auto;text-align:center;}',
-      '#sb-hud-busted h1{font-size:64px;letter-spacing:14px;color:#ff3b30;margin:0;text-shadow:0 0 30px rgba(255,59,48,.7);}',
-      '#sb-hud-busted p{font-size:17px;color:#eee;}',
-      '#sb-hud-pause h1{font-size:44px;letter-spacing:8px;margin:0;}',
-      '#sb-hud-pause p{font-size:15px;color:#bbb;line-height:1.7;}',
-      '#sb-hud-pause kbd{background:#222;border:1px solid #555;border-radius:4px;padding:1px 7px;}'
-    ].join('\n');
-    var style = document.createElement('style');
-    style.id = 'sb-hud-css';
-    style.textContent = css;
-    document.head.appendChild(style);
-  }
-
-  function buildDOM() {
-    injectCSS();
-    root = document.createElement('div');
-    root.id = 'sb-hud';
-
-    // Top-left panel.
-    var tl = el('div', 'sb-panel', root);
-    tl.id = 'sb-hud-tl';
-    els.mission = el('div', '', tl, 'Sunset Bay');
-    els.mission.id = 'sb-hud-mission';
-    els.missionSub = el('div', '', tl, 'Explore the bay — press M for a mission.');
-    els.missionSub.id = 'sb-hud-mission-sub';
-    var stats = el('div', '', tl);
-    stats.id = 'sb-hud-stats';
-    els.money = el('span', '', stats, '$500');
-    els.money.id = 'sb-hud-money';
-    els.rep = el('span', '', stats, 'REP 0');
-    els.rep.id = 'sb-hud-rep';
-    els.rank = el('span', '', stats, 'Rookie');
-    els.rank.id = 'sb-hud-rank';
-    var bar = el('div', '', tl);
-    bar.id = 'sb-hud-rankbar';
-    els.rankFill = el('div', '', bar);
-    els.rankFill.id = 'sb-hud-rankfill';
-
-    // Top-right panel.
-    var tr = el('div', 'sb-panel', root);
-    tr.id = 'sb-hud-tr';
-    els.stars = el('div', '', tr, '☆☆☆☆☆');
-    els.stars.id = 'sb-hud-stars';
-    els.heat = el('div', '', tr, 'HEAT 0');
-    els.heat.id = 'sb-hud-heat';
-    var heatbar = el('div', '', tr);
-    heatbar.id = 'sb-hud-heatbar';
-    els.heatFill = el('div', '', heatbar);
-    els.heatFill.id = 'sb-hud-heatfill';
-    els.clock = el('div', '', tr, '18:20');
-    els.clock.id = 'sb-hud-clock';
-    els.radio = el('div', '', tr, 'Bay FM 88.1');
-    els.radio.id = 'sb-hud-radio';
-
-    // Bottom-left: minimap + route.
-    var bl = el('div', '', root);
-    bl.id = 'sb-hud-bl';
-    var canvas = document.createElement('canvas');
-    canvas.id = 'sb-hud-minimap';
-    canvas.width = 190; canvas.height = 190;
-    bl.appendChild(canvas);
-    minimapCtx = canvas.getContext('2d');
-    els.route = el('div', 'sb-panel', bl, '');
-    els.route.id = 'sb-hud-route';
-    els.route.style.display = 'none';
-
-    // Toasts, centre prompt, vignette.
-    els.toasts = el('div', '', root);
-    els.toasts.id = 'sb-hud-toasts';
-    els.prompt = el('div', '', root, '');
-    els.prompt.id = 'sb-hud-prompt';
-    var vig = el('div', '', root);
-    vig.id = 'sb-hud-vignette';
-    els.vignette = vig;
-
-    // BUSTED overlay.
-    var busted = el('div', '', root);
-    busted.id = 'sb-hud-busted';
-    el('h1', '', busted, 'BUSTED');
-    el('p', '', busted, 'The Sunset Bay PD caught up with you. Press R to try again.');
-    els.busted = busted;
-
-    // Pause overlay.
-    var pause = el('div', '', root);
-    pause.id = 'sb-hud-pause';
-    el('h1', '', pause, 'PAUSED');
-    var ptext = el('p', '', pause, '');
-    ptext.innerHTML = '<kbd>P</kbd> resume &nbsp;·&nbsp; <kbd>M</kbd> missions &nbsp;·&nbsp; ' +
-      '<kbd>R</kbd> radio &nbsp;·&nbsp; <kbd>Q</kbd> / <kbd>E</kbd> switch weapon<br>' +
-      'Sunset Bay — golden hour never ends if you keep driving.';
-    els.pause = pause;
-
-    document.body.appendChild(root);
-  }
-
-  // --- Minimap ---------------------------------------------------------------
-
-  function worldToMap(x, z, range) {
-    // World spans roughly -range..+range in x/z; map is 190px with a margin.
-    var m = 8;
-    var s = (190 - m * 2) / (range * 2);
-    return { x: 95 + x * s, y: 95 + z * s };
-  }
-
-  function minimap(state) {
-    if (!minimapCtx || !state) return;
-    var g = minimapCtx;
-    var range = 260;
-    g.clearRect(0, 0, 190, 190);
-    // Sea / land background.
-    g.fillStyle = '#0d2b45';
-    g.fillRect(0, 0, 190, 190);
-    g.fillStyle = '#14351f';
-    g.beginPath();
-    g.ellipse(95, 108, 88, 76, 0, 0, Math.PI * 2);
-    g.fill();
-    // Beach strip along the south edge.
-    g.fillStyle = '#c9a86a';
-    g.fillRect(0, 168, 190, 22);
-    // Harbour (north-east).
-    g.fillStyle = '#1d4a6b';
-    g.fillRect(138, 18, 44, 26);
-    g.strokeStyle = 'rgba(255,255,255,.35)';
-    g.strokeRect(138, 18, 44, 26);
-
-    // Roads: a simple grid + the coastal highway.
-    g.strokeStyle = 'rgba(255,255,255,.28)';
-    g.lineWidth = 3;
-    var i, p1, p2;
-    for (i = -2; i <= 2; i++) {
-      p1 = worldToMap(i * 80, -range, range);
-      p2 = worldToMap(i * 80, range, range);
-      g.beginPath(); g.moveTo(p1.x, p1.y); g.lineTo(p2.x, p2.y); g.stroke();
-      p1 = worldToMap(-range, i * 80, range);
-      p2 = worldToMap(range, i * 80, range);
-      g.beginPath(); g.moveTo(p1.x, p1.y); g.lineTo(p2.x, p2.y); g.stroke();
-    }
-    // Coastal highway (curved, golden).
-    g.strokeStyle = '#ffd166';
-    g.lineWidth = 2.5;
-    g.beginPath();
-    for (i = 0; i <= 20; i++) {
-      var x = -range + (i / 20) * range * 2;
-      var z = 170 + Math.sin(x * 0.012) * 22;
-      var p = worldToMap(x, z, range);
-      if (i === 0) g.moveTo(p.x, p.y); else g.lineTo(p.x, p.y);
-    }
-    g.stroke();
-
-    // District dots (from SB.City when available, else a fixed ring).
-    var districts = (window.SB && window.SB.City && window.SB.City.districts) || [];
-    g.fillStyle = 'rgba(255,255,255,.5)';
-    for (i = 0; i < districts.length; i++) {
-      var ang = (i / Math.max(1, districts.length)) * Math.PI * 2;
-      var dp = worldToMap(Math.cos(ang) * 150, Math.sin(ang) * 120, range);
-      g.fillRect(dp.x - 1, dp.y - 1, 2, 2);
-    }
-
-    // Mission route: player -> mission target (red dashed line).
-    var target = missionTarget(state);
-    var pp = state.player ? worldToMap(state.player.x || 0, state.player.z || 0, range) : null;
-    if (target && pp) {
-      var tp = worldToMap(target.x, target.z, range);
-      g.strokeStyle = '#ff3b30';
-      g.lineWidth = 2;
-      g.setLineDash([5, 4]);
-      g.beginPath(); g.moveTo(pp.x, pp.y); g.lineTo(tp.x, tp.y); g.stroke();
-      g.setLineDash([]);
-      // Target marker: pulsing diamond.
-      var pulse = 4 + Math.sin((state.time || 0) * 5) * 1.5;
-      g.fillStyle = '#ff3b30';
-      g.beginPath();
-      g.moveTo(tp.x, tp.y - pulse); g.lineTo(tp.x + pulse, tp.y);
-      g.lineTo(tp.x, tp.y + pulse); g.lineTo(tp.x - pulse, tp.y);
-      g.closePath(); g.fill();
-      g.fillStyle = '#fff';
-      g.font = 'bold 9px sans-serif';
-      g.fillText('★', tp.x - 4, tp.y - pulse - 3);
-    }
-
-    // Cops (blue dots) when wanted.
-    if (state.wanted > 0 && window.SB && window.SB.Police && window.SB.Police.cops) {
-      g.fillStyle = '#4da3ff';
-      window.SB.Police.cops.forEach(function (cop) {
-        var cp = worldToMap(cop.x || 0, cop.z || 0, range);
-        g.beginPath(); g.arc(cp.x, cp.y, 2.5, 0, Math.PI * 2); g.fill();
-      });
-    }
-
-    // Player arrow (white triangle, rotated by heading).
-    if (pp) {
-      var ang2 = state.player ? (state.player.angle || 0) : 0;
-      g.save();
-      g.translate(pp.x, pp.y);
-      g.rotate(-ang2);
-      g.fillStyle = '#fff';
-      g.strokeStyle = '#111';
-      g.lineWidth = 1;
-      g.beginPath();
-      g.moveTo(0, -7); g.lineTo(5, 6); g.lineTo(-5, 6); g.closePath();
-      g.fill(); g.stroke();
-      g.restore();
-    }
-
-    // North marker.
-    g.fillStyle = 'rgba(255,255,255,.85)';
-    g.font = 'bold 10px sans-serif';
-    g.fillText('N', 92, 12);
-  }
-
-  function missionTarget(state) {
-    if (state.mission && state.mission.target) return state.mission.target;
-    if (state.race && state.race.nextCheckpoint) return state.race.nextCheckpoint;
-    if (window.SB && window.SB.Jobs && window.SB.Jobs.currentTarget) {
-      return window.SB.Jobs.currentTarget();
-    }
-    return null;
-  }
-
-  // --- Toasts ----------------------------------------------------------------
-
-  function showToast(text) {
-    if (!els.toasts || !text) return;
-    toastQueue.push(String(text));
-    pumpToast();
-  }
-
-  function pumpToast() {
-    if (toastTimer || toastQueue.length === 0 || !els.toasts) return;
-    var text = toastQueue.shift();
-    var t = document.createElement('div');
-    t.className = 'sb-toast';
-    t.textContent = text;
-    els.toasts.appendChild(t);
-    // Keep at most 3 visible.
-    while (els.toasts.children.length > 3) {
-      els.toasts.removeChild(els.toasts.firstChild);
-    }
-    toastTimer = setTimeout(function () {
-      if (t.parentNode) t.parentNode.removeChild(t);
-      toastTimer = null;
-      pumpToast();
-    }, 3200);
-  }
-
-  function showPrompt(text, ms) {
-    if (!els.prompt) return;
-    els.prompt.textContent = text;
-    els.prompt.style.display = 'block';
-    if (promptTimer) clearTimeout(promptTimer);
-    promptTimer = setTimeout(function () {
-      els.prompt.style.display = 'none';
-    }, ms || 3500);
-  }
-
-  function flashDamage() {
-    if (!els.vignette) return;
-    els.vignette.style.opacity = '1';
-    setTimeout(function () { els.vignette.style.opacity = '0'; }, 180);
-  }
-
-  // --- Public API ------------------------------------------------------------
-
-  function init(state) {
-    stateRef = state || null;
-    if (typeof document === 'undefined') return;
-    if (!root) buildDOM();
-    if (state) update(state);
-  }
-
-  function update(state) {
-    if (!root || !state) return;
-    stateRef = state;
-
-    // Mission (top-left).
-    var mText = (state.mission && state.mission.text) || missionText || 'Sunset Bay';
-    var mSub = (state.mission && state.mission.sub) || missionSub || '';
-    if (els.mission && els.mission.textContent !== mText) els.mission.textContent = mText;
-    if (els.missionSub && els.missionSub.textContent !== mSub) els.missionSub.textContent = mSub;
-
-    // Money / REP / rank.
-    if (els.money && state.money !== lastMoney) {
-      els.money.textContent = fmtMoney(state.money);
-      lastMoney = state.money;
-    }
-    if (els.rep) els.rep.textContent = 'REP ' + Math.floor(state.rep || 0);
-    var rank = state.respectRank || rankFor(state.respect || 0);
-    if (els.rank && rank !== lastRank) {
-      els.rank.textContent = rank;
-      els.rank.style.color = RANK_COLORS[rankIndex(rank)];
-      lastRank = rank;
-    }
-    if (els.rankFill) {
-      var thresholds = [0, 150, 500, 900, 1400];
-      var ri = rankIndex(rank);
-      var lo = thresholds[ri], hi = thresholds[ri + 1] || 1400;
-      var pct = Math.max(0, Math.min(100, ((state.respect || 0) - lo) / (hi - lo) * 100));
-      els.rankFill.style.width = pct + '%';
-    }
-
-    // Wanted stars.
-    var w = Math.max(0, Math.min(5, Math.floor(state.wanted || 0)));
-    if (w !== lastWanted && els.stars) {
-      var stars = '';
-      var s;
-      for (s = 0; s < 5; s++) {
-        stars += s < w
-          ? '<span>★</span>'
-          : '<span class="sb-off">☆</span>';
-      }
-      els.stars.innerHTML = stars;
-      els.stars.style.color = w >= 3 ? '#ff3b30' : '#ffd166';
-      lastWanted = w;
-    }
-
-    // Heat.
-    var heat = Math.max(0, Math.min(100, Math.floor(state.heat || 0)));
-    if (heat !== lastHeat) {
-      if (els.heat) els.heat.textContent = 'HEAT ' + heat + (heat >= 70 ? ' — LAY LOW' : '');
-      if (els.heatFill) els.heatFill.style.width = heat + '%';
-      lastHeat = heat;
-    }
-
-    // Clock + radio.
-    var clock = fmtClock(state.timeOfDay) + (state.day ? '  ·  Day ' + state.day : '');
-    if (clock !== lastClock && els.clock) { els.clock.textContent = clock; lastClock = clock; }
-    var stIdx = (typeof state.radio === 'number') ? state.radio : 0;
-    if (stIdx !== lastStation && els.radio) {
-      var names = (window.SB && window.SB.Audio && window.SB.Audio.stations) || [];
-      els.radio.textContent = '♪ ' + (names[stIdx] || ('Radio ' + (stIdx + 1)));
-      lastStation = stIdx;
-    }
-
-    // Route hint under the minimap.
-    var target = missionTarget(state);
-    if (els.route) {
-      if (target && state.mission && state.mission.id) {
-        els.route.style.display = 'inline-block';
-        var dist = state.player
-          ? Math.round(Math.hypot((target.x || 0) - (state.player.x || 0),
-              (target.z || 0) - (state.player.z || 0)))
-          : 0;
-        els.route.textContent = '➤ ' + (state.mission.text || 'Mission') + ' — ' + dist + 'm';
-      } else {
-        els.route.style.display = 'none';
-      }
-    }
-
-    // Busted state follows wanted + hp.
-    if (state.player && state.player.hp <= 0 && !bustedShown) showBusted(true);
+// ---------------------------------------------------------------------------
+// update(state): called every frame by SB.Game.frame(dt). Cheap on purpose:
+// text nodes are only rewritten when their value actually changed, and
+// the minimap redraws every frame (it is a small canvas).
+// ---------------------------------------------------------------------------
+function update(state) {
+  if (!root || !state) { return; }
+  stateRef = state;
+  var now = (typeof performance !== 'undefined') ? performance.now() : 0;
+  if (now - lastUpdate < 50 && now > lastUpdate) {
+    // Still redraw the minimap every frame; throttle only text writes.
     minimap(state);
+    return;
+  }
+  lastUpdate = now;
+  blipPulse += 0.05;
+
+  // Money / wanted / health / armour.
+  if (state.money !== undefined && state.money !== money) { setMoney(state.money); }
+  if (state.wanted !== undefined && state.wanted !== wanted) { setWanted(state.wanted); }
+  if (state.player) {
+    if (state.player.hp !== undefined && state.player.hp !== health) {
+      if (state.player.hp < health) { damageFlash = 1; }
+      health = state.player.hp;
+      el.hpFill.style.width = Math.max(0, Math.min(100, health)) + '%';
+    }
+    if (state.player.armor !== undefined && state.player.armor !== armor) {
+      armor = state.player.armor;
+      el.armorFill.style.width = Math.max(0, Math.min(100, armor)) + '%';
+    }
+  }
+  if (typeof state.ammo === 'number' && state.ammo !== ammo) { setAmmo(state.ammo); }
+  if (typeof state.weapon === 'number' && state.weapon !== weapon) {
+    weapon = state.weapon;
+    setAmmo(ammo);
   }
 
-  function showMission(text, sub) {
-    missionText = text || '';
-    missionSub = sub || '';
-    if (els.mission) els.mission.textContent = missionText;
-    if (els.missionSub) els.missionSub.textContent = missionSub;
-    if (text) showToast('★ ' + text);
+  // Clock / day / weather / heat / radio.
+  var clock = fmtClock(state.timeOfDay || 18.33);
+  if (clock !== clockCache) {
+    clockCache = clock;
+    el.clock.textContent = clock;
+    var tod = state.timeOfDay || 18.33;
+    var phase = 'Golden Hour';
+    if (tod >= 20 || tod < 5) { phase = 'Night — neon city'; }
+    else if (tod >= 5 && tod < 8) { phase = 'Sunrise'; }
+    else if (tod >= 8 && tod < 17) { phase = 'Daytime'; }
+    else if (tod >= 17 && tod < 20) { phase = 'Golden Hour'; }
+    el.day.textContent = 'Day ' + (state.day || 1) + ' — ' + phase;
+  }
+  if (state.weather) {
+    var rain = state.weather.rain || 0;
+    var wtext = rain > 0.6 ? 'Heavy rain' : rain > 0.15 ? 'Light rain' : 'Clear skies';
+    if (state.weather.clouds > 0.7) { wtext = 'Overcast'; }
+    if (el.weather.textContent !== wtext) { el.weather.textContent = wtext; }
+    var heat = Math.round(state.heat || 0);
+    el.heatFill.style.width = heat + '%';
+    el.heatLabel.textContent = 'HEAT ' + heat;
+  }
+  if (window.SB && window.SB.Audio) {
+    var label = '♪ ' + window.SB.Audio.stationLabel();
+    if (el.radio.textContent !== label) { el.radio.textContent = label; }
   }
 
-  function setWanted(n) {
-    if (stateRef) stateRef.wanted = Math.max(0, Math.min(5, Math.floor(n || 0)));
-    lastWanted = -1; // force refresh on next update
-    if (stateRef) update(stateRef);
+  // Speed (driving) or on-foot state.
+  if (state.player && state.player.vehicle) {
+    el.speed.textContent = Math.round(speedKmh) + ' km/h';
+    el.cross.style.display = 'none';
+  } else {
+    el.speed.textContent = '';
+    el.cross.style.display = (weapon > 0 || ammo > 0) ? 'block' : 'none';
   }
 
-  function setMoney(n) {
-    if (stateRef) stateRef.money = Math.floor(n || 0);
-    lastMoney = -1;
-    if (stateRef) update(stateRef);
+  // Damage vignette decay.
+  if (damageFlash > 0) {
+    damageFlash = Math.max(0, damageFlash - 0.02);
+    el.vignette.style.opacity = String(damageFlash * 0.9);
   }
 
-  function showBusted(show) {
-    bustedShown = !!show;
-    if (els.busted) els.busted.style.display = show ? 'flex' : 'none';
-    if (show) {
-      if (window.SB && window.SB.Audio) window.SB.Audio.sfx('busted');
+  // Banner lifetime.
+  if (bannerTimer > 0) {
+    bannerTimer -= 1;
+    if (bannerTimer <= 0) { bannerNode.style.display = 'none'; }
+  }
+
+  // Expire old toasts.
+  var t = now;
+  var i;
+  for (i = toasts.length - 1; i >= 0; i--) {
+    if (t > toasts[i].until) {
+      if (toasts[i].node.parentNode) { toasts[i].node.parentNode.removeChild(toasts[i].node); }
+      toasts.splice(i, 1);
     }
   }
 
-  function showPause(show) {
-    pausedShown = !!show;
-    if (els.pause) els.pause.style.display = show ? 'flex' : 'none';
-    return pausedShown;
+  minimap(state);
+}
+
+// Set the driving speed shown under the minimap (km/h, set by Vehicles).
+function setSpeed(kmh) { speedKmh = kmh || 0; }
+
+// ---------------------------------------------------------------------------
+// setMoney(n): update the cash readout (and shared state). Green flash on
+// gain, red flash on loss — feedback the player reads at a glance.
+// ---------------------------------------------------------------------------
+function setMoney(n) {
+  var before = money;
+  money = Math.floor(n);
+  if (stateRef) { stateRef.money = money; }
+  if (!el.money) { return money; }
+  el.money.textContent = fmtMoney(money);
+  if (money > before) {
+    el.money.style.color = '#8dff9a';
+    window.setTimeout(function () { el.money.style.color = '#7dff8a'; }, 600);
+  } else if (money < before) {
+    el.money.style.color = '#ff8a7a';
+    window.setTimeout(function () { el.money.style.color = '#7dff8a'; }, 600);
+  }
+  return money;
+}
+
+// ---------------------------------------------------------------------------
+// setWanted(n): 0-5 stars. Pulses red at 3+, plays the wanted sting via
+// the audio module, and tints the minimap border while the heat is on.
+// ---------------------------------------------------------------------------
+function setWanted(n) {
+  var before = wanted;
+  wanted = Math.max(0, Math.min(5, n | 0));
+  if (stateRef) { stateRef.wanted = wanted; }
+  if (!el.wanted) { return wanted; }
+  el.wanted.textContent = stars(wanted);
+  el.wanted.className = 'hud-wanted' + (wanted >= 3 ? ' hot' : '');
+  if (minimapCanvas) {
+    minimapCanvas.style.borderColor = wanted >= 3
+      ? 'rgba(255,70,50,.9)' : 'rgba(255,255,255,.65)';
+  }
+  if (window.SB && window.SB.Audio) {
+    if (wanted > before) { window.SB.Audio.sfx('wantedUp'); }
+    else if (wanted < before) { window.SB.Audio.sfx('wantedDown'); }
+  }
+  return wanted;
+}
+
+// Ammo readout: "SMG — ammo 48".
+function setAmmo(n) {
+  ammo = Math.max(0, n | 0);
+  if (stateRef) { stateRef.ammo = ammo; }
+  if (!el.ammo) { return ammo; }
+  el.ammo.textContent = WEAPON_NAMES[weapon] + ' — ammo ' + ammo;
+  return ammo;
+}
+
+function setWeapon(w) {
+  weapon = Math.max(0, Math.min(3, w | 0));
+  if (stateRef) { stateRef.weapon = weapon; }
+  setAmmo(ammo);
+  return weapon;
+}
+
+// ---------------------------------------------------------------------------
+// showMission(text): set the objective line in the bottom-left tracker.
+// showToast(text, kind): stack a short message above the tracker;
+// kind is '', 'good', 'bad' or 'info'. Max 4 visible at once.
+// ---------------------------------------------------------------------------
+function showMission(text) {
+  missionText = String(text || '');
+  missionVisible = missionText.length > 0;
+  if (!el.mission) { return missionText; }
+  el.mission.innerHTML = '';
+  var obj = document.createElement('span');
+  obj.className = 'obj';
+  obj.textContent = '◆ ';
+  el.mission.appendChild(obj);
+  el.mission.appendChild(document.createTextNode(missionText));
+  return missionText;
+}
+
+function showToast(text, kind) {
+  if (!el.toasts) { return 0; }
+  var node = mk('div', 'toast' + (kind ? ' ' + kind : ''), String(text || ''));
+  el.toasts.appendChild(node);
+  var until = (typeof performance !== 'undefined' ? performance.now() : 0) + 5000;
+  toasts.push({ node: node, until: until });
+  while (toasts.length > 4) {
+    var old = toasts.shift();
+    if (old.node.parentNode) { old.node.parentNode.removeChild(old.node); }
+  }
+  return toasts.length;
+}
+
+// Big centre banner: mission start / completed / failed.
+function showBanner(title, sub, seconds) {
+  if (!bannerNode) { return; }
+  el.bannerTitle.textContent = String(title || '');
+  el.bannerSub.textContent = String(sub || '');
+  bannerNode.style.display = 'block';
+  bannerTimer = Math.max(1, Math.round((seconds || 3) * 20));
+}
+
+// Contextual hint line under the toasts ("Hold E to steal the car").
+function setHint(text) {
+  if (el.hint) { el.hint.textContent = String(text || ''); }
+}
+
+// Flash the red damage vignette (called by Player.takeDamage).
+function flashDamage(amount) {
+  damageFlash = Math.min(1, damageFlash + 0.25 + (amount || 0) / 100);
+}
+
+// Set the active route polyline for the minimap (world coords).
+function setRoute(points) {
+  routePoints = (points || []).slice();
+}
+
+// ---------------------------------------------------------------------------
+// minimap(state): draw the round minimap. The world is ~1200x1200 units;
+// the map shows a 360-unit window centred on the player, north-up.
+// Drawn layers: sea, beach, streets grid, district tint, route line,
+// mission marker (pulsing gold diamond), player arrow, police blips,
+// wanted red zone when wanted >= 3.
+// ---------------------------------------------------------------------------
+function minimap(state) {
+  if (!minimapCtx || !state || !state.player) { return; }
+  var c = minimapCtx;
+  var W = 168, H = 168, cx = W / 2, cy = H / 2;
+  var range = 360;              // world units across the minimap
+  var scale = W / range;
+  var px = state.player.x || 0;
+  var pz = state.player.z || 0;
+
+  function wx(x) { return cx + (x - px) * scale; }
+  function wz(z) { return cy + (z - pz) * scale; }
+
+  // Clip to the circle.
+  c.save();
+  c.beginPath();
+  c.arc(cx, cy, 82, 0, Math.PI * 2);
+  c.clip();
+
+  // Sea background, then land mass.
+  c.fillStyle = '#0d3a5c';
+  c.fillRect(0, 0, W, H);
+  c.fillStyle = '#173a2c';
+  c.fillRect(wx(-600), wz(-600), 1200 * scale, 1200 * scale);
+  // Beach strip along the west edge (x < -460).
+  c.fillStyle = '#c9b183';
+  c.fillRect(wx(-600), wz(-600), 140 * scale, 1200 * scale);
+  // Harbour water pocket at the south-east.
+  c.fillStyle = '#0d3a5c';
+  c.fillRect(wx(320), wz(280), 280 * scale, 320 * scale);
+
+  // Street grid: avenues every 120 units, streets every 90.
+  c.strokeStyle = 'rgba(255,255,255,.28)';
+  c.lineWidth = 2;
+  var gx, gz;
+  for (gx = -600; gx <= 600; gx += 120) {
+    c.beginPath(); c.moveTo(wx(gx), wz(-600)); c.lineTo(wx(gx), wz(600)); c.stroke();
+  }
+  for (gz = -600; gz <= 600; gz += 90) {
+    c.beginPath(); c.moveTo(wx(-600), wz(gz)); c.lineTo(wx(600), wz(gz)); c.stroke();
+  }
+  // Coast road (highlighted, follows the beach).
+  c.strokeStyle = '#ffd23e';
+  c.lineWidth = 3;
+  c.beginPath(); c.moveTo(wx(-460), wz(-600)); c.lineTo(wx(-460), wz(600)); c.stroke();
+  // Bridge over the harbour mouth.
+  c.strokeStyle = '#ff9a3c';
+  c.lineWidth = 3;
+  c.beginPath(); c.moveTo(wx(320), wz(280)); c.lineTo(wx(600), wz(280)); c.stroke();
+
+  // District tint: a soft dot at each known district centre.
+  if (window.SB && window.SB.City && window.SB.City.districts) {
+    var i, d;
+    for (i = 0; i < window.SB.City.districts.length; i++) {
+      d = window.SB.City.districts[i];
+      if (typeof d === 'string') { continue; }
+      c.fillStyle = DISTRICT_COLORS[d.name] || 'rgba(255,255,255,.25)';
+      c.globalAlpha = 0.35;
+      c.beginPath();
+      c.arc(wx(d.x || 0), wz(d.z || 0), 10, 0, Math.PI * 2);
+      c.fill();
+      c.globalAlpha = 1;
+    }
   }
 
-  function hideOverlays() {
-    showBusted(false);
-    showPause(false);
+  // Wanted red zone: a pulsing ring around the player at wanted >= 3.
+  if ((state.wanted || 0) >= 3) {
+    c.strokeStyle = 'rgba(255,60,40,' + (0.5 + 0.4 * Math.sin(blipPulse * 2)) + ')';
+    c.lineWidth = 3;
+    c.beginPath();
+    c.arc(cx, cy, 46 + 6 * Math.sin(blipPulse * 2), 0, Math.PI * 2);
+    c.stroke();
   }
 
-  window.SB.HUD = {
-    init: init,
-    update: update,
-    showMission: showMission,
-    showToast: showToast,
-    showPrompt: showPrompt,
-    setWanted: setWanted,
-    setMoney: setMoney,
-    minimap: minimap,
-    showBusted: showBusted,
-    showPause: showPause,
-    hideOverlays: hideOverlays,
-    flashDamage: flashDamage,
-    get busted() { return bustedShown; },
-    get paused() { return pausedShown; }
-  };
+  // Route polyline (gold, dashed).
+  if (routePoints.length > 1) {
+    c.strokeStyle = '#ffd23e';
+    c.lineWidth = 3;
+    c.setLineDash([7, 5]);
+    c.beginPath();
+    c.moveTo(wx(routePoints[0].x), wz(routePoints[0].z));
+    var r;
+    for (r = 1; r < routePoints.length; r++) {
+      c.lineTo(wx(routePoints[r].x), wz(routePoints[r].z));
+    }
+    c.stroke();
+    c.setLineDash([]);
+  }
+
+  // Mission marker: pulsing gold diamond at the active objective.
+  var mx = null, mz = null;
+  if (state.mission && state.mission.id && window.SB && window.SB.Jobs) {
+    var target = window.SB.Jobs.missionTarget
+      ? window.SB.Jobs.missionTarget()
+      : null;
+    if (target) { mx = target.x; mz = target.z; }
+  }
+  if (mx === null && state.mission && typeof state.mission.x === 'number') {
+    mx = state.mission.x; mz = state.mission.z;
+  }
+  if (mx !== null) {
+    var pulse = 7 + 3 * Math.sin(blipPulse * 3);
+    var mxp = wx(mx), mzp = wz(mz);
+    c.fillStyle = '#ffd23e';
+    c.beginPath();
+    c.moveTo(mxp, mzp - pulse);
+    c.lineTo(mxp + pulse, mzp);
+    c.lineTo(mxp, mzp + pulse);
+    c.lineTo(mxp - pulse, mzp);
+    c.closePath();
+    c.fill();
+    c.strokeStyle = '#7a5b00';
+    c.lineWidth = 1.5;
+    c.stroke();
+  }
+
+  // Police blips (blue) when wanted.
+  if ((state.wanted || 0) > 0 && window.SB && window.SB.Police && window.SB.Police.cops) {
+    c.fillStyle = '#4aa8ff';
+    var cops = window.SB.Police.cops;
+    for (var k = 0; k < cops.length; k++) {
+      c.beginPath();
+      c.arc(wx(cops[k].x || 0), wz(cops[k].z || 0), 3, 0, Math.PI * 2);
+      c.fill();
+    }
+    // AIR-1 helicopter blip.
+    if (window.SB.Police.heli) {
+      c.fillStyle = '#ff5340';
+      c.beginPath();
+      c.arc(wx(window.SB.Police.heli.x || 0), wz(window.SB.Police.heli.z || 0), 4, 0, Math.PI * 2);
+      c.fill();
+    }
+  }
+
+  // Player arrow (white, rotated by heading).
+  var ang = (state.player.angle || 0);
+  c.save();
+  c.translate(cx, cy);
+  c.rotate(-ang);
+  c.fillStyle = '#ffffff';
+  c.strokeStyle = '#111111';
+  c.lineWidth = 1.5;
+  c.beginPath();
+  c.moveTo(0, -9);
+  c.lineTo(6, 7);
+  c.lineTo(0, 3);
+  c.lineTo(-6, 7);
+  c.closePath();
+  c.fill();
+  c.stroke();
+  c.restore();
+
+  // North tick.
+  c.fillStyle = '#ffffff';
+  c.font = 'bold 11px Arial';
+  c.textAlign = 'center';
+  c.fillText('N', cx, 14);
+
+  c.restore();
+
+  // Outer ring is drawn by CSS border; add a soft inner shadow ring.
+  c.strokeStyle = 'rgba(0,0,0,.35)';
+  c.lineWidth = 4;
+  c.beginPath();
+  c.arc(cx, cy, 80, 0, Math.PI * 2);
+  c.stroke();
+}
+
+// Tear the HUD down (used when returning to the start screen).
+function destroy() {
+  if (root && root.parentNode) { root.parentNode.removeChild(root); }
+  root = null;
+  el = {};
+  minimapCtx = null;
+  minimapCanvas = null;
+  toasts = [];
+}
+
+// Current mission text, for other modules that need to echo it.
+function currentMission() { return missionText; }
+
+window.SB.HUD = {
+  init: init,
+  update: update,
+  showMission: showMission,
+  showToast: showToast,
+  setWanted: setWanted,
+  setMoney: setMoney,
+  minimap: minimap,
+  showBanner: showBanner,
+  setHint: setHint,
+  setAmmo: setAmmo,
+  setWeapon: setWeapon,
+  setSpeed: setSpeed,
+  setRoute: setRoute,
+  flashDamage: flashDamage,
+  currentMission: currentMission,
+  destroy: destroy,
+  fmtMoney: fmtMoney,
+  fmtClock: fmtClock
+};
 })();

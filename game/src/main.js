@@ -1,475 +1,547 @@
 window.SB = window.SB || {};
-// main.js — Sunset Bay v12 (Builder B: graphics engine)
-// Boot + game loop + input. Satu-satunya tugas file ini:
-//   1. init canvas & panggil SB.Game.init()
-//   2. requestAnimationFrame dengan dt ter-clamp
-//   3. kumpulkan input keyboard/mouse/touch -> SB.input
-//   4. panggil SB.Game.frame(dt) tiap frame
-// Logika game TIDAK ada di sini — semuanya di SB.Game & modul lain.
-(function () {
-  'use strict';
+(function(){ 'use strict';
+// ============================================================================
+// main.js — boot + input + game loop untuk Sunset Bay
+// Tugas file ini SAJA:
+//   1. Boot: tunggu DOM, cari kanvas, panggil SB.Game.init().
+//   2. Input: keyboard, mouse, tombol sentuh (data-key di index.html).
+//   3. Loop: requestAnimationFrame, dt dijepit, panggil SB.Game.frame(dt).
+// File ini TIDAK menggambar scene / mengupdate modul — itu milik SB.Game.
+// Input diekspos lewat SB.Input agar SB.Player / SB.Vehicles membacanya.
+// ============================================================================
 
-  // ------------------------------------------------------------------
-  // Input bersama — dibaca SB.Game.frame -> modul (khususnya Player)
-  // ------------------------------------------------------------------
-  // SB.input: { keys:Set kode tombol, axes:{x,y}, mouse:{x,y,dx,dy,down},
-  //   pressed:Set (sekali per frame), touch:{...}, sprint, brake }
-  var input = {
-    keys: {},
-    pressed: {},
-    axes: { x: 0, y: 0 },       // -1..1, dari WASD / panah
-    mouse: { x: 0, y: 0, dx: 0, dy: 0, down: false, moved: false },
-    touch: { active: false, sx: 0, sy: 0, x: 0, y: 0 },
-    sprint: false,
-    brake: false,
-    interact: false,            // E ditekan (edge)
-    shootHeld: false,
-    wheel: 0,
-    anyKey: false
-  };
+var canvas = null;
+var started = false;
+var running = false;
+var paused = false;
+var rafId = 0;
+var lastTime = 0;
+var elapsed = 0;
+var frameNumber = 0;
+var fpsSamples = [];
+var fpsValue = 0;
+var fpsTimer = 0;
+var bootError = null;
+var bootDone = false;
+var saveAvailable = false;
+var pointerLocked = false;
+var mouseDX = 0;
+var mouseDY = 0;
+var mouseDown = false;
+var mouseX = 0;
+var mouseY = 0;
+var wheelDelta = 0;
+var lastSaveCheck = 0;
 
-  // Peta kode tombol -> aksi (dipakai game.js untuk aksi sekali tekan).
-  var ACTION_KEYS = {
-    KeyE: 'interact',       // curi mobil / masuk kendaraan
-    KeyF: 'enterExit',      // keluar kendaraan (alternatif E)
-    KeyR: 'radio',          // ganti stasiun radio
-    KeyM: 'missions',       // buka/tutup panel misi
-    KeyQ: 'weaponPrev',     // senjata sebelumnya
-    Digit1: 'weapon0', Digit2: 'weapon1', Digit3: 'weapon2', Digit4: 'weapon3',
-    KeyB: 'buyAmmo',        // beli amunisi $50/+24
-    KeyC: 'camera',         // ganti sudut kamera
-    KeyH: 'horn',           // klakson
-    KeyP: 'pause',          // pause (alternatif Esc)
-    KeyG: 'crewCommand',    // perintah crew (siklus)
-    KeyT: 'phone',          // ponsel / peta cepat
-    KeyL: 'lights'          // lampu mobil
-  };
+// --- Input state (dibaca modul lain lewat SB.Input / SB.state.input) --------
+var keys = {};            // code -> true bila ditekan
+var keysPressed = {};     // code -> true hanya pada frame ditekan
+var keysReleased = {};    // code -> true hanya pada frame dilepas
+var touchKeys = {};       // code -> true bila tombol sentuh aktif
 
-  var started = false;
-  var booted = false;
-  var lastTime = 0;
-  var fpsSamples = [];
-  var fps = 0;
-  var fpsBadgeEl = null;
-  var pausedByVisibility = false;
+var KEY_ALIASES = {
+  'ArrowUp': 'KeyW', 'ArrowDown': 'KeyS',
+  'ArrowLeft': 'KeyA', 'ArrowRight': 'KeyD'
+};
 
-  // Alias tombol huruf kecil — modul Player/Vehicles/Water membaca
-  // input.keys dengan kunci 'w'/'a'/'s'/'d'/'space'/'shift'/'arrow*',
-  // sementara keydown menyimpan e.code ('KeyW', 'Space', ...).
-  // Tanpa alias ini WASD di keyboard nyata tidak menggerakkan apa pun.
-  var KEY_ALIASES = {
-    KeyW: 'w', KeyA: 'a', KeyS: 's', KeyD: 'd',
-    Space: 'space', ShiftLeft: 'shift', ShiftRight: 'shift',
-    ArrowUp: 'arrowup', ArrowDown: 'arrowdown',
-    ArrowLeft: 'arrowleft', ArrowRight: 'arrowright'
-  };
-  function setKeyAliases(code, down) {
-    var a = KEY_ALIASES[code];
-    if (a) input.keys[a] = down;
-    if (code === 'Space') input.keys[' '] = down;
+// Aksi yang dipetakan dari tombol (dipakai SB.Player / SB.Game).
+var ACTION_KEYS = {
+  forward: ['KeyW'], back: ['KeyS'], left: ['KeyA'], right: ['KeyD'],
+  run: ['ShiftLeft', 'ShiftRight'], jump: ['Space'],
+  interact: ['KeyE'], shoot: ['KeyF', 'Mouse0'],
+  camera: ['KeyC'], radio: ['KeyM'], pause: ['KeyP', 'Escape'],
+  horn: ['KeyH'], reload: ['KeyR'], weapon1: ['Digit1'],
+  weapon2: ['Digit2'], weapon3: ['Digit3'], weapon4: ['Digit4'],
+  map: ['KeyM'], mute: ['KeyN'], screenshot: ['KeyG']
+};
+
+function isDown(code) {
+  return !!(keys[code] || touchKeys[code]);
+}
+
+function isPressed(code) {
+  return !!keysPressed[code];
+}
+
+function isReleased(code) {
+  return !!keysReleased[code];
+}
+
+function actionDown(name) {
+  var list = ACTION_KEYS[name] || [];
+  for (var i = 0; i < list.length; i++) {
+    if (isDown(list[i])) { return true; }
   }
+  return false;
+}
 
-  // ------------------------------------------------------------------
-  // Boot
-  // ------------------------------------------------------------------
-  function boot() {
-    if (booted) return;
-    booted = true;
-
-    var canvas = document.getElementById('game-canvas');
-    if (!canvas) {
-      showFatal('Canvas #game-canvas tidak ditemukan.');
-      return;
-    }
-
-    // Cek modul wajib sudah termuat (urutan script di index.html).
-    var missing = [];
-    ['Math3', 'Rng', 'GL', 'Game'].forEach(function (name) {
-      if (!window.SB[name]) missing.push(name);
-    });
-    if (missing.length) {
-      showFatal('Modul belum termuat: ' + missing.join(', ') +
-        '. Periksa urutan <script> di index.html.');
-      return;
-    }
-
-    // Ekspos input ke namespace agar modul bisa membacanya.
-    window.SB.input = input;
-
-    // Init WebGL lewat SB.GL, lalu game lewat SB.Game.init.
-    var glOk = true;
-    try {
-      glOk = window.SB.GL.init(canvas);
-    } catch (err) {
-      glOk = false;
-      showFatal('WebGL gagal start: ' + (err && err.message ? err.message : err));
-      return;
-    }
-    if (glOk === false) {
-      showFatal('WebGL tidak tersedia di browser ini. Coba browser lain.');
-      return;
-    }
-
-    try {
-      window.SB.Game.init(canvas);
-    } catch (err) {
-      showFatal('Game.init gagal: ' + (err && err.message ? err.message : err));
-      return;
-    }
-
-    bindInput(canvas);
-    bindButtons();
-    bindResize();
-
-    fpsBadgeEl = document.getElementById('fps-badge');
-
-    // Muat save lama (kalau ada) supaya tombol CONTINUE bisa aktif.
-    var hasSave = false;
-    try {
-      hasSave = !!window.localStorage.getItem('sunset-bay-save-v12');
-    } catch (e) { hasSave = false; }
-    var contBtn = document.getElementById('continue-btn');
-    if (contBtn && !hasSave) {
-      contBtn.style.opacity = '0.45';
-      contBtn.title = 'Belum ada save v12 di browser ini';
-    }
-
-    // Loop mulai berjalan begitu tombol START ditekan; sebelum itu
-    // game.js menggambar adegan latar (attract mode) di belakang overlay.
-    lastTime = performance.now();
-    requestAnimationFrame(loop);
+function actionPressed(name) {
+  var list = ACTION_KEYS[name] || [];
+  for (var i = 0; i < list.length; i++) {
+    if (isPressed(list[i])) { return true; }
   }
+  return false;
+}
 
-  function showFatal(msg) {
-    var note = document.getElementById('loading-note');
-    if (note) {
-      note.textContent = msg;
-      note.style.color = '#ff8a96';
-    }
-    if (typeof console !== 'undefined' && console.error) {
-      console.error('[SB.main] ' + msg);
-    }
+// Sumbu gerak -1..1 dari WASD / panah (x = kanan, y = maju).
+function moveAxis() {
+  var x = 0, y = 0;
+  if (actionDown('right')) { x += 1; }
+  if (actionDown('left')) { x -= 1; }
+  if (actionDown('forward')) { y += 1; }
+  if (actionDown('back')) { y -= 1; }
+  return { x: x, y: y };
+}
+
+function clearPressed() {
+  keysPressed = {};
+  keysReleased = {};
+  mouseDX = 0;
+  mouseDY = 0;
+  wheelDelta = 0;
+}
+
+function getMouseDelta() {
+  var d = { x: mouseDX, y: mouseDY };
+  mouseDX = 0;
+  mouseDY = 0;
+  return d;
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+function $(id) {
+  return document.getElementById(id);
+}
+
+function hideLoading() {
+  var el = $('hud-loading');
+  if (el) { el.style.display = 'none'; }
+}
+
+function showStart() {
+  var el = $('screen-start');
+  if (el) { el.style.display = 'flex'; }
+  var pauseEl = $('screen-pause');
+  if (pauseEl) { pauseEl.style.display = 'none'; }
+  var endEl = $('screen-end');
+  if (endEl) { endEl.style.display = 'none'; }
+}
+
+function showPause() {
+  var el = $('screen-pause');
+  if (el) { el.style.display = 'flex'; }
+}
+
+function hidePause() {
+  var el = $('screen-pause');
+  if (el) { el.style.display = 'none'; }
+}
+
+
+function updateContinueButton() {
+  var btn = $('btn-continue');
+  if (!btn) { return; }
+  try {
+    saveAvailable = !!window.localStorage.getItem('sunset-bay-save-v1');
+  } catch (e) {
+    saveAvailable = false;
   }
+  btn.style.display = saveAvailable ? '' : 'none';
+  btn.disabled = !saveAvailable;
+}
 
-  // ------------------------------------------------------------------
-  // Game loop — dt di-clamp agar tab yang lama tidak aktif tidak
-  // melempar simulasi (maks 50 ms per frame).
-  // ------------------------------------------------------------------
-  function loop(now) {
-    requestAnimationFrame(loop);
-    var dt = (now - lastTime) / 1000;
-    lastTime = now;
-    if (!(dt > 0)) dt = 0.016;
-    if (dt > 0.05) dt = 0.05;      // clamp: maks 50 ms
-    if (dt < 0.001) dt = 0.001;
-
-    trackFps(now, dt);
-
-    // Update axes dari tombol yang sedang ditekan.
-    updateAxes();
-
-    // Klik kiri ditahan = tembak. Player.shoot() punya cooldown
-    // sendiri per senjata, jadi menahan klik = tembak otomatis.
-    // (Sebelumnya shootHeld tidak pernah dibaca siapa pun.)
-    if (input.shootHeld && window.SB.Player && window.SB.Player.shoot) {
-      try { window.SB.Player.shoot(); } catch (err) { /* abaikan */ }
-    }
-
-    try {
-      if (window.SB.Game && window.SB.Game.frame) {
-        window.SB.Game.frame(dt);
-      }
-    } catch (err) {
-      // Jangan matikan loop karena satu frame error; laporkan sekali.
-      if (!loop._reported) {
-        loop._reported = true;
-        if (typeof console !== 'undefined' && console.error) {
-          console.error('[SB.main] frame error:', err);
-        }
-      }
-    }
-
-    // Bersihkan edge-trigger per frame SETELAH game membacanya.
-    clearPressed();
-    input.mouse.dx = 0;
-    input.mouse.dy = 0;
-    input.mouse.moved = false;
-    input.wheel = 0;
+function reportBootError(msg) {
+  bootError = msg;
+  hideLoading();
+  var el = $('screen-start');
+  if (el) {
+    el.style.display = 'flex';
+    var sub = el.querySelector('.game-sub');
+    if (sub) { sub.textContent = 'Gagal memuat: ' + msg + ' — coba muat ulang halaman.'; }
   }
-
-  function trackFps(now, dt) {
-    fpsSamples.push(1 / Math.max(dt, 0.001));
-    if (fpsSamples.length > 40) fpsSamples.shift();
-    if (fpsSamples.length === 40) {
-      var sum = 0;
-      for (var i = 0; i < fpsSamples.length; i++) sum += fpsSamples[i];
-      fps = Math.round(sum / fpsSamples.length);
-      if (fpsBadgeEl) {
-        fpsBadgeEl.textContent = fps + ' fps · v12';
-      }
-      fpsSamples.length = 0;
-    }
+  if (typeof console !== 'undefined' && console.error) {
+    console.error('[Sunset Bay] boot gagal: ' + msg);
   }
+}
 
-  // ------------------------------------------------------------------
-  // Input keyboard
-  // ------------------------------------------------------------------
-  function bindInput(canvas) {
-    window.addEventListener('keydown', function (e) {
-      // Tab dipakai untuk peta — cegah fokus pindah.
-      if (e.code === 'Tab') e.preventDefault();
-      // Space scroll halaman — cegah.
-      if (e.code === 'Space') e.preventDefault();
-      // F5 / Ctrl+R biarkan lewat (reload).
-      if (e.ctrlKey || e.metaKey) return;
-
-      var code = e.code;
-      if (!input.keys[code]) {
-        input.pressed[code] = true;
-        input.anyKey = true;
-        handleActionPress(code);
-      }
-      input.keys[code] = true;
-      setKeyAliases(code, true);
-
-      // Esc: pause toggle langsung di sini (game.js juga menanganinya).
-      // KeyP TIDAK di sini: sudah dipetakan di ACTION_KEYS -> queueAction
-      // ('pause') -> game.js togglePause. Dua jalur = toggle dua kali
-      // (pause langsung batal lagi), jadi P dulu tidak pernah pause.
-      if (code === 'Escape') {
-        if (started && window.SB.Game && window.SB.Game.togglePause) {
-          window.SB.Game.togglePause();
-        }
-      }
-    });
-
-    window.addEventListener('keyup', function (e) {
-      input.keys[e.code] = false;
-      setKeyAliases(e.code, false);
-    });
-
-    window.addEventListener('blur', function () {
-      // Lepas semua tombol saat jendela kehilangan fokus.
-      input.keys = {};
-      input.shootHeld = false;
-      input.mouse.down = false;
-    });
-
-    // ---- Mouse: arahkan kamera (drag) + tembak (klik kiri) ----
-    canvas.addEventListener('mousedown', function (e) {
-      input.mouse.down = true;
-      input.mouse.x = e.clientX;
-      input.mouse.y = e.clientY;
-      if (e.button === 0) {
-        input.shootHeld = true;
-        input.pressed.MouseLeft = true;
-      }
-      if (e.button === 2) input.pressed.MouseRight = true;
-    });
-    window.addEventListener('mouseup', function (e) {
-      if (e.button === 0) input.shootHeld = false;
-      input.mouse.down = false;
-    });
-    window.addEventListener('mousemove', function (e) {
-      var nx = e.clientX, ny = e.clientY;
-      input.mouse.dx = nx - input.mouse.x;
-      input.mouse.dy = ny - input.mouse.y;
-      input.mouse.x = nx;
-      input.mouse.y = ny;
-      input.mouse.moved = true;
-    });
-    canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
-    canvas.addEventListener('wheel', function (e) {
-      input.wheel += (e.deltaY > 0 ? 1 : -1);
-      e.preventDefault();
-    }, { passive: false });
-
-    // ---- Touch: joystick virtual kiri + drag kamera kanan ----
-    var touchStart = null;
-    canvas.addEventListener('touchstart', function (e) {
-      e.preventDefault();
-      for (var i = 0; i < e.changedTouches.length; i++) {
-        var t = e.changedTouches[i];
-        if (t.clientX < window.innerWidth * 0.45 && !input.touch.active) {
-          input.touch.active = true;
-          input.touch.sx = t.clientX; input.touch.sy = t.clientY;
-          input.touch.x = t.clientX; input.touch.y = t.clientY;
-        } else {
-          touchStart = { x: t.clientX, y: t.clientY, id: t.identifier };
-        }
-      }
-    }, { passive: false });
-    canvas.addEventListener('touchmove', function (e) {
-      e.preventDefault();
-      for (var i = 0; i < e.changedTouches.length; i++) {
-        var t = e.changedTouches[i];
-        if (input.touch.active && t.clientX < window.innerWidth * 0.5) {
-          input.touch.x = t.clientX; input.touch.y = t.clientY;
-        } else if (touchStart && t.identifier === touchStart.id) {
-          input.mouse.dx += t.clientX - touchStart.x;
-          input.mouse.dy += t.clientY - touchStart.y;
-          input.mouse.moved = true;
-          touchStart.x = t.clientX; touchStart.y = t.clientY;
-        }
-      }
-    }, { passive: false });
-    canvas.addEventListener('touchend', function (e) {
-      for (var i = 0; i < e.changedTouches.length; i++) {
-        var t = e.changedTouches[i];
-        if (touchStart && t.identifier === touchStart.id) touchStart = null;
-      }
-      if (e.touches.length === 0) {
-        input.touch.active = false;
-        input.touch.x = input.touch.sx; input.touch.y = input.touch.sy;
-      }
-    });
-
-    // Pause otomatis saat tab disembunyikan (hemat baterai & adil).
-    document.addEventListener('visibilitychange', function () {
-      if (document.hidden && started && window.SB.Game) {
-        if (window.SB.Game.pause && !window.SB.Game.isPaused()) {
-          window.SB.Game.pause();
-          pausedByVisibility = true;
-        }
-      } else if (!document.hidden && pausedByVisibility && window.SB.Game) {
-        pausedByVisibility = false;
-        // Jangan auto-resume: biarkan pemain menekan RESUME sendiri.
-      }
-    });
+function checkModules() {
+  var missing = [];
+  var need = ['Math3', 'Rng', 'GL', 'Meshes', 'City', 'Water', 'Vehicles',
+    'Player', 'NPC', 'Police', 'Crew', 'Economy', 'Races', 'Weather',
+    'FX', 'Audio', 'HUD', 'Jobs', 'Shots', 'Game'];
+  for (var i = 0; i < need.length; i++) {
+    if (!window.SB[need[i]]) { missing.push(need[i]); }
   }
+  return missing;
+}
 
-  // Aksi sekali tekan: teruskan ke game.js lewat antrian aksi.
-  function handleActionPress(code) {
-    var action = ACTION_KEYS[code];
-    if (!action) return;
-    if (window.SB.Game && window.SB.Game.queueAction) {
-      window.SB.Game.queueAction(action);
-    }
-    if (action === 'interact') input.interact = true;
+function boot() {
+  if (bootDone) { return; }
+  bootDone = true;
+  canvas = $('game-canvas');
+  if (!canvas) { reportBootError('kanvas game tidak ditemukan'); return; }
+  var missing = checkModules();
+  if (missing.length) {
+    reportBootError('modul belum termuat: ' + missing.join(', '));
+    return;
   }
-
-  // Hitung axes gerak dari tombol yang sedang ditekan.
-  function updateAxes() {
-    var k = input.keys;
-    var x = 0, y = 0;
-    if (k.KeyW || k.ArrowUp) y += 1;
-    if (k.KeyS || k.ArrowDown) y -= 1;
-    if (k.KeyA || k.ArrowLeft) x -= 1;
-    if (k.KeyD || k.ArrowRight) x += 1;
-    // Joystick sentuh menimpa keyboard bila aktif.
-    if (input.touch.active) {
-      var dx = input.touch.x - input.touch.sx;
-      var dy = input.touch.y - input.touch.sy;
-      var dead = 14;
-      if (Math.abs(dx) > dead || Math.abs(dy) > dead) {
-        x = Math.max(-1, Math.min(1, dx / 60));
-        y = Math.max(-1, Math.min(1, -dy / 60));
-      }
-    }
-    input.axes.x = x;
-    input.axes.y = y;
-    input.sprint = !!(k.ShiftLeft || k.ShiftRight);
-    input.brake = !!(k.Space);
+  var ok = false;
+  try {
+    ok = window.SB.Game.init();
+  } catch (err) {
+    reportBootError('SB.Game.init() error: ' + (err && err.message ? err.message : err));
+    return;
   }
-
-  function clearPressed() {
-    input.pressed = {};
-    input.interact = false;
-    input.anyKey = false;
+  if (ok === false) {
+    reportBootError('SB.Game.init() mengembalikan false (WebGL mungkin tidak tersedia)');
+    return;
   }
+  bindInput();
+  bindButtons();
+  updateContinueButton();
+  hideLoading();
+  showStart();
+  lastTime = performance.now();
+  // Loop berjalan di latar agar layar start sudah menampilkan scene
+  // (kota golden hour di belakang judul) sebelum pemain menekan MULAI.
+  running = true;
+  rafId = requestAnimationFrame(loop);
+}
 
-  // ------------------------------------------------------------------
-  // Tombol overlay (START / CONTINUE / RESUME / SAVE)
-  // ------------------------------------------------------------------
-  function bindButtons() {
-    var startBtn = document.getElementById('start-btn');
-    if (startBtn) {
-      startBtn.addEventListener('click', function () {
-        startGame(false);
-      });
-    }
-    var contBtn = document.getElementById('continue-btn');
-    if (contBtn) {
-      contBtn.addEventListener('click', function () {
-        startGame(true);
-      });
-    }
-    var resumeBtn = document.getElementById('resume-btn');
-    if (resumeBtn) {
-      resumeBtn.addEventListener('click', function () {
-        if (window.SB.Game && window.SB.Game.resume) window.SB.Game.resume();
-      });
-    }
-    var saveBtn = document.getElementById('save-btn');
-    if (saveBtn) {
-      saveBtn.addEventListener('click', function () {
-        if (window.SB.Game && window.SB.Game.save) {
-          var ok = window.SB.Game.save();
-          saveBtn.textContent = ok ? 'SAVED ✓' : 'SAVE FAILED';
-          setTimeout(function () { saveBtn.textContent = 'SAVE GAME'; }, 1600);
-        }
-      });
-    }
-    // Enter di layar start = mulai.
-    window.addEventListener('keydown', function (e) {
-      if (!started && e.code === 'Enter') startGame(false);
-    });
+// ---------------------------------------------------------------------------
+// Input: keyboard
+// ---------------------------------------------------------------------------
+
+function onKeyDown(e) {
+  var code = KEY_ALIASES[e.code] || e.code;
+  if (!keys[code]) { keysPressed[code] = true; }
+  keys[code] = true;
+  if (code === 'Space' || code === 'ArrowUp' || code === 'ArrowDown') {
+    if (e.target === document.body || e.target === canvas) { e.preventDefault(); }
   }
-
-  function startGame(continueSave) {
-    var overlay = document.getElementById('start-overlay');
-    if (overlay) overlay.classList.add('hidden');
-    started = true;
-    window.SB.started = true;
-    if (continueSave && window.SB.Game && window.SB.Game.load) {
-      window.SB.Game.load();
-    }
-    if (window.SB.Game && window.SB.Game.resume) {
-      window.SB.Game.resume();
-    }
-    // Audio butuh gestur pengguna: init/resume konteks audio di sini.
-    if (window.SB.Audio && window.SB.Audio.unlock) {
-      try { window.SB.Audio.unlock(); } catch (e) { /* abaikan */ }
-    }
-    var canvas = document.getElementById('game-canvas');
-    if (canvas) canvas.focus();
+  // Pause toggle: P atau Escape (hanya setelah game dimulai).
+  if ((code === 'KeyP' || code === 'Escape') && started && !e.repeat) {
+    togglePause();
   }
+  // M: ganti radio — diteruskan ke SB.Game lewat keysPressed.
+  // R: isi ulang amunisi, G: screenshot — ditangani SB.Game.frame.
+  // Enter di layar start = mulai.
+  if (code === 'Enter' && !started) { startGame(false); }
+  if (code === 'Enter' && paused) { resumeGame(); }
+}
 
-  // ------------------------------------------------------------------
-  // Resize: canvas fullscreen mengikuti jendela
-  // ------------------------------------------------------------------
-  function bindResize() {
-    var t = null;
-    window.addEventListener('resize', function () {
-      if (t) clearTimeout(t);
-      t = setTimeout(function () {
-        if (window.SB.GL && window.SB.GL.resize) window.SB.GL.resize();
-        if (window.SB.Game && window.SB.Game.onResize) window.SB.Game.onResize();
-      }, 80);
-    });
-    window.addEventListener('orientationchange', function () {
-      setTimeout(function () {
-        if (window.SB.GL && window.SB.GL.resize) window.SB.GL.resize();
-      }, 200);
-    });
+function onKeyUp(e) {
+  var code = KEY_ALIASES[e.code] || e.code;
+  keys[code] = false;
+  keysReleased[code] = true;
+}
+
+function onBlur() {
+  // Kehilangan fokus = semua tombol dilepas (hindari pemain "nyangkut").
+  keys = {};
+  touchKeys = {};
+  mouseDown = false;
+  if (started && !paused) {
+    // Auto-pause saat tab ditinggalkan? Tidak otomatis — hanya catat.
   }
+}
 
-  // ------------------------------------------------------------------
-  // Ekspor kecil (debug / game.js)
-  // ------------------------------------------------------------------
-  window.SB.Main = {
-    boot: boot,
-    get input() { return input; },
-    get fps() { return fps; },
-    get started() { return started; },
-    startGame: startGame
-  };
+// ---------------------------------------------------------------------------
+// Input: mouse + pointer lock
+// ---------------------------------------------------------------------------
 
-  // Boot saat DOM siap (script dimuat di akhir body, jadi biasanya
-  // DOM sudah siap; tetap jaga jalur readyState).
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot);
+function onMouseMove(e) {
+  mouseX = e.clientX;
+  mouseY = e.clientY;
+  if (pointerLocked) {
+    mouseDX += e.movementX || 0;
+    mouseDY += e.movementY || 0;
   } else {
-    boot();
+    mouseDX += e.movementX || 0;
+    mouseDY += e.movementY || 0;
   }
+}
+
+function onMouseDown(e) {
+  mouseDown = true;
+  keys['Mouse' + e.button] = true;
+  keysPressed['Mouse' + e.button] = true;
+  if (started && !paused && canvas) {
+    // Klik pertama mengunci pointer agar kamera bisa digerakkan mouse.
+    requestPointerLock();
+  }
+}
+
+function onMouseUp(e) {
+  mouseDown = false;
+  keys['Mouse' + e.button] = false;
+  keysReleased['Mouse' + e.button] = true;
+}
+
+function onWheel(e) {
+  wheelDelta += e.deltaY || 0;
+  if (e.target === canvas) { e.preventDefault(); }
+}
+
+function onContextMenu(e) {
+  if (e.target === canvas) { e.preventDefault(); }
+}
+
+function requestPointerLock() {
+  if (!canvas || pointerLocked) { return; }
+  try {
+    if (canvas.requestPointerLock) {
+      var p = canvas.requestPointerLock();
+      if (p && p.catch) { p.catch(function() { /* pointer lock ditolak: abaikan */ }); }
+    }
+  } catch (err) { /* abaikan */ }
+}
+
+function exitPointerLock() {
+  try {
+    if (document.pointerLockElement && document.exitPointerLock) {
+      document.exitPointerLock();
+    }
+  } catch (err) { /* abaikan */ }
+}
+
+function onPointerLockChange() {
+  pointerLocked = (document.pointerLockElement === canvas);
+}
+
+// ---------------------------------------------------------------------------
+// Input: tombol sentuh (layar sentuh / mobile)
+// ---------------------------------------------------------------------------
+
+function bindTouchButtons() {
+  var btns = document.querySelectorAll('#touch-controls .tbtn');
+  for (var i = 0; i < btns.length; i++) {
+    (function(btn) {
+      var code = btn.getAttribute('data-key');
+      if (!code) { return; }
+      function press(e) {
+        if (e) { e.preventDefault(); }
+        if (!touchKeys[code]) { keysPressed[code] = true; }
+        touchKeys[code] = true;
+      }
+      function release(e) {
+        if (e) { e.preventDefault(); }
+        touchKeys[code] = false;
+        keysReleased[code] = true;
+      }
+      btn.addEventListener('touchstart', press, { passive: false });
+      btn.addEventListener('touchend', release, { passive: false });
+      btn.addEventListener('touchcancel', release, { passive: false });
+    })(btns[i]);
+  }
+}
+
+function bindInput() {
+  window.addEventListener('keydown', onKeyDown, false);
+  window.addEventListener('keyup', onKeyUp, false);
+  window.addEventListener('blur', onBlur, false);
+  document.addEventListener('mousemove', onMouseMove, false);
+  if (canvas) {
+    canvas.addEventListener('mousedown', onMouseDown, false);
+    canvas.addEventListener('mouseup', onMouseUp, false);
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    canvas.addEventListener('contextmenu', onContextMenu, false);
+  }
+  document.addEventListener('pointerlockchange', onPointerLockChange, false);
+  document.addEventListener('visibilitychange', onVisibilityChange, false);
+  window.addEventListener('resize', onResize, false);
+  bindTouchButtons();
+}
+
+function onVisibilityChange() {
+  if (document.hidden && started && !paused) {
+    // Tab disembunyikan: jeda otomatis agar pemain tidak dirugikan.
+    pauseGame();
+  }
+}
+
+function onResize() {
+  if (window.SB.GL && window.SB.GL.resize) { window.SB.GL.resize(); }
+}
+
+// ---------------------------------------------------------------------------
+// Tombol layar (start / pause / end)
+// ---------------------------------------------------------------------------
+
+function bindButtons() {
+  var startBtn = $('btn-start');
+  if (startBtn) { startBtn.addEventListener('click', function() { startGame(false); }); }
+  var contBtn = $('btn-continue');
+  if (contBtn) { contBtn.addEventListener('click', function() { startGame(true); }); }
+  var resumeBtn = $('btn-resume');
+  if (resumeBtn) { resumeBtn.addEventListener('click', function() { resumeGame(); }); }
+  var saveBtn = $('btn-save-quit');
+  if (saveBtn) {
+    saveBtn.addEventListener('click', function() {
+      if (window.SB.Game && window.SB.Game.save) { window.SB.Game.save(); }
+      paused = false;
+      hidePause();
+      exitPointerLock();
+      showStart();
+      updateContinueButton();
+    });
+  }
+  var againBtn = $('btn-again');
+  if (againBtn) { againBtn.addEventListener('click', function() { startGame(false); }); }
+}
+
+function startGame(fromSave) {
+  if (started && !paused) { return; }
+  started = true;
+  paused = false;
+  hidePause();
+  var startEl = $('screen-start');
+  if (startEl) { startEl.style.display = 'none'; }
+  var endEl = $('screen-end');
+  if (endEl) { endEl.style.display = 'none'; }
+  if (fromSave) {
+    try {
+      if (window.SB.Game && window.SB.Game.load) { window.SB.Game.load(); }
+    } catch (err) { /* save rusak: lanjut dengan state baru */ }
+  } else {
+    // Mulai baru: reset progress bila game sudah pernah berjalan.
+    if (window.SB.Game && window.SB.Game.reset && frameNumber > 10) {
+      window.SB.Game.reset();
+    }
+  }
+  if (window.SB.Game && window.SB.Game.resume) { window.SB.Game.resume(); }
+  if (window.SB.Audio && window.SB.Audio.init) {
+    // AudioContext butuh gestur pengguna; init dipanggil di sini (klik).
+    try { window.SB.Audio.init(window.SB.state); } catch (err) { /* abaikan */ }
+  }
+  requestPointerLock();
+  lastTime = performance.now();
+}
+
+function pauseGame() {
+  if (!started || paused) { return; }
+  paused = true;
+  if (window.SB.Game && window.SB.Game.pause) { window.SB.Game.pause(); }
+  showPause();
+  exitPointerLock();
+}
+
+function resumeGame() {
+  if (!started || !paused) { return; }
+  paused = false;
+  hidePause();
+  if (window.SB.Game && window.SB.Game.resume) { window.SB.Game.resume(); }
+  requestPointerLock();
+  lastTime = performance.now();
+}
+
+function togglePause() {
+  if (paused) { resumeGame(); } else { pauseGame(); }
+}
+
+
+// ---------------------------------------------------------------------------
+// Game loop
+// ---------------------------------------------------------------------------
+
+function loop(now) {
+  if (!running) { return; }
+  rafId = requestAnimationFrame(loop);
+  var t = (typeof now === 'number') ? now : performance.now();
+  var rawDt = (t - lastTime) / 1000;
+  lastTime = t;
+  // Jepit dt: tab yang ditinggal lama tidak membuat simulasi melompat.
+  // 0.05 = 20 fps minimum; di bawah itu game melambat, bukan melompat.
+  var dt = rawDt;
+  if (!(dt > 0)) { dt = 0; }
+  if (dt > 0.05) { dt = 0.05; }
+  if (dt < 0.0001 && started && !paused) { dt = 0.0001; }
+  elapsed += dt;
+  frameNumber++;
+  // FPS: rata-rata bergerak dari 30 sampel terakhir.
+  fpsTimer += rawDt;
+  fpsSamples.push(rawDt > 0 ? 1 / rawDt : 60);
+  if (fpsSamples.length > 30) { fpsSamples.shift(); }
+  if (fpsTimer >= 0.5) {
+    var sum = 0;
+    for (var i = 0; i < fpsSamples.length; i++) { sum += fpsSamples[i]; }
+    fpsValue = fpsSamples.length ? Math.round(sum / fpsSamples.length) : 0;
+    fpsTimer = 0;
+    updateFpsHud();
+  }
+  // Frame game (hanya bila tidak pause; saat pause, Game.frame dilewati
+  // agar simulasi berhenti tapi loop tetap jalan untuk overlay).
+  if (started && !paused) {
+    try {
+      window.SB.Game.frame(dt);
+    } catch (err) {
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('[Sunset Bay] frame error: ' + (err && err.message ? err.message : err));
+      }
+      // Satu frame gagal tidak boleh mematikan loop: lanjut frame berikut.
+    }
+  } else if (!started) {
+    // Layar start: render scene latar (attract mode) dengan dt kecil.
+    try {
+      window.SB.Game.frame(dt * 0.25);
+    } catch (err) { /* abaikan di attract mode */ }
+  }
+  // Input per-frame dibersihkan SETELAH Game.frame membacanya.
+  clearPressed();
+  // Autosave ringan tiap ~60 detik saat bermain.
+  if (started && !paused && elapsed - lastSaveCheck > 60) {
+    lastSaveCheck = elapsed;
+    try {
+      if (window.SB.Game && window.SB.Game.save) { window.SB.Game.save(); }
+    } catch (err) { /* autosave gagal: abaikan */ }
+  }
+}
+
+function updateFpsHud() {
+  var el = $('hud-fps');
+  if (!el) { return; }
+  el.textContent = fpsValue + ' fps';
+}
+
+
+function getFps() { return fpsValue; }
+function isStarted() { return started; }
+function isPaused() { return paused; }
+
+// ---------------------------------------------------------------------------
+// Util: pindah layar & status (dipakai HUD / Game)
+// ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// Ekspor input (SB.Input) + mulai boot saat DOM siap
+// ---------------------------------------------------------------------------
+window.SB.Input = {
+  isDown: isDown, isPressed: isPressed, isReleased: isReleased,
+  actionDown: actionDown, actionPressed: actionPressed,
+  moveAxis: moveAxis, getMouseDelta: getMouseDelta,
+  getMousePos: function() { return { x: mouseX, y: mouseY }; },
+  isMouseDown: function() { return mouseDown; },
+  getWheelDelta: function() { return wheelDelta; },
+  isPointerLocked: function() { return pointerLocked; },
+  requestPointerLock: requestPointerLock, exitPointerLock: exitPointerLock,
+  keys: keys
+};
+
+window.SB.Main = {
+  boot: boot, startGame: startGame, pauseGame: pauseGame,
+  resumeGame: resumeGame, togglePause: togglePause,
+  getFps: getFps, isStarted: isStarted, isPaused: isPaused,
+  showStart: showStart, showPause: showPause,
+  hidePause: hidePause
+};
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', boot, false);
+} else {
+  boot();
+}
 })();

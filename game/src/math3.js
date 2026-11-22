@@ -1,492 +1,477 @@
 window.SB = window.SB || {};
-// math3.js — Sunset Bay v12 (Builder B: graphics engine)
-// Matematika 3D mandiri, tanpa library eksternal.
-// Konvensi:
-//  - vec3 adalah OBJECT {x, y, z} — BUKAN array. (Pelajaran bug v8:
-//    mat4LookAt yang menerima array menghasilkan matriks nol dan
-//    layar hanya menampilkan langit.)
-//  - mat4 adalah Float32Array(16) column-major, konvensi WebGL.
-//  - Semua fungsi mat4 mengembalikan matriks BARU kecuali yang
-//    namanya berakhiran "Into" atau menerima matriks tujuan.
-(function () {
-  'use strict';
+(function(){ 'use strict';
+// ============================================================================
+// SB.Math3 — matematika 3D untuk Sunset Bay (game open-world GTA-like)
+// Semua vektor adalah OBJECT {x, y, z} (bukan array) — pelajaran bug v8:
+// mat4LookAt(eye, look, up) menerima object, dan vec3 mengembalikan object.
+// Matriks adalah Float32Array(16) column-major, sesuai konvensi WebGL.
+// File ini murni matematika: tidak ada DOM, tidak ada WebGL, tidak ada I/O.
+// ============================================================================
 
-  // ------------------------------------------------------------------
-  // Skalar
-  // ------------------------------------------------------------------
+var EPSILON = 0.000001;
+var PI = Math.PI;
+var TAU = Math.PI * 2;
 
-  // Batasi v ke [a, b]. NaN dilewatkan sebagai a (fail-safe).
-  function clamp(v, a, b) {
-    if (typeof v !== 'number' || isNaN(v)) return a;
-    if (v < a) return a;
-    if (v > b) return b;
-    return v;
-  }
+// ---------------------------------------------------------------------------
+// Vektor 3D
+// ---------------------------------------------------------------------------
 
-  // Interpolasi linear a -> b pada t (t tidak di-clamp di sini agar
-  // pemanggil bisa memakai ekstrapolasi bila perlu).
-  function lerp(a, b, t) {
-    return a + (b - a) * t;
-  }
-
-  // Interpolasi linear dengan t di-clamp ke [0, 1].
-  function lerpClamped(a, b, t) {
-    return lerp(a, b, clamp(t, 0, 1));
-  }
-
-  // Interpolasi sudut (radian) lewat jalur terpendek.
-  function lerpAngle(a, b, t) {
-    var d = b - a;
-    while (d > Math.PI) d -= Math.PI * 2;
-    while (d < -Math.PI) d += Math.PI * 2;
-    return a + d * clamp(t, 0, 1);
-  }
-
-  // Smoothstep klasik 0..1.
-  function smoothstep(edge0, edge1, x) {
-    var t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
-    return t * t * (3 - 2 * t);
-  }
-
-  // Derajat <-> radian.
-  function degToRad(d) { return d * Math.PI / 180; }
-  function radToDeg(r) { return r * 180 / Math.PI; }
-
-  // Perbedaan sudut terpendek, hasil di (-PI, PI].
-  function angleDiff(a, b) {
-    var d = b - a;
-    while (d > Math.PI) d -= Math.PI * 2;
-    while (d <= -Math.PI) d += Math.PI * 2;
-    return d;
-  }
-
-  // Normalisasi sudut ke (-PI, PI].
-  function wrapAngle(a) {
-    while (a > Math.PI) a -= Math.PI * 2;
-    while (a <= -Math.PI) a += Math.PI * 2;
-    return a;
-  }
-
-  // Jarak 2D (bidang XZ, yang dipakai gameplay) dan 3D.
-  function dist2D(ax, az, bx, bz) {
-    var dx = bx - ax, dz = bz - az;
-    return Math.sqrt(dx * dx + dz * dz);
-  }
-  function dist3D(a, b) {
-    var dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
-    return Math.sqrt(dx * dx + dy * dy + dz * dz);
-  }
-
-  // ------------------------------------------------------------------
-  // vec3 — object {x, y, z}
-  // ------------------------------------------------------------------
-
-  function vec3(x, y, z) {
-    return { x: x || 0, y: y || 0, z: z || 0 };
-  }
-
-  function vec3Zero() { return { x: 0, y: 0, z: 0 }; }
-  function vec3Up() { return { x: 0, y: 1, z: 0 }; }
-  function vec3Forward() { return { x: 0, y: 0, z: -1 }; }
-
-  // Salinan baru dari v. Gagal aman: input tak valid -> {0,0,0}.
-  function vec3Copy(v) {
-    if (!v || typeof v.x !== 'number') return vec3Zero();
-    return { x: v.x, y: v.y, z: v.z };
-  }
-
-  // Pastikan sebuah nilai berbentuk vec3 object; terima juga array
-  // [x, y, z] sebagai input toleran — TAPI internal game selalu
-  // memakai object. Konversi ini hanya pengaman, bukan jalur utama.
-  function vec3From(v) {
-    if (!v) return vec3Zero();
-    if (Array.isArray(v)) return { x: v[0] || 0, y: v[1] || 0, z: v[2] || 0 };
-    return { x: v.x || 0, y: v.y || 0, z: v.z || 0 };
-  }
-
-  function vec3Add(a, b) {
-    return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
-  }
-  function vec3Sub(a, b) {
-    return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
-  }
-  function vec3Scale(v, s) {
-    return { x: v.x * s, y: v.y * s, z: v.z * s };
-  }
-  function vec3Neg(v) {
-    return { x: -v.x, y: -v.y, z: -v.z };
-  }
-
-  function dot(a, b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-  }
-
-  function cross(a, b) {
-    return {
-      x: a.y * b.z - a.z * b.y,
-      y: a.z * b.x - a.x * b.z,
-      z: a.x * b.y - a.y * b.x
-    };
-  }
-
-  function length(v) {
-    return Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-  }
-
-  function lengthSq(v) {
-    return v.x * v.x + v.y * v.y + v.z * v.z;
-  }
-
-  // Normalisasi; vektor nol -> {0,0,0} (bukan NaN).
-  function normalize(v) {
-    var len = length(v);
-    if (len < 1e-8) return vec3Zero();
-    return { x: v.x / len, y: v.y / len, z: v.z / len };
-  }
-
-  function vec3Lerp(a, b, t) {
-    return {
-      x: lerp(a.x, b.x, t),
-      y: lerp(a.y, b.y, t),
-      z: lerp(a.z, b.z, t)
-    };
-  }
-
-  // Jarak titik p ke segmen garis a-b (berguna untuk checkpoint balapan).
-  function distPointSegment(p, a, b) {
-    var ab = vec3Sub(b, a);
-    var denom = dot(ab, ab);
-    if (denom < 1e-8) return dist3D(p, a);
-    var t = clamp(dot(vec3Sub(p, a), ab) / denom, 0, 1);
-    var closest = { x: a.x + ab.x * t, y: a.y + ab.y * t, z: a.z + ab.z * t };
-    return dist3D(p, closest);
-  }
-
-  // Vektor arah dari sudut yaw (radian) di bidang XZ.
-  // yaw 0 -> menghadap -Z (konvensi kamera WebGL).
-  function dirFromYaw(yaw) {
-    return { x: -Math.sin(yaw), y: 0, z: -Math.cos(yaw) };
-  }
-
-  // Yaw (radian) dari sebuah vektor arah di bidang XZ.
-  function yawFromDir(dx, dz) {
-    return Math.atan2(-dx, -dz);
-  }
-
-  // ------------------------------------------------------------------
-  // mat4 — Float32Array(16), column-major (konvensi WebGL)
-  //
-  // Indeks (kolom c, baris r) -> m[c * 4 + r]:
-  //   m[0]  m[4]  m[8]   m[12]
-  //   m[1]  m[5]  m[9]   m[13]
-  //   m[2]  m[6]  m[10]  m[14]
-  //   m[3]  m[7]  m[11]  m[15]
-  // ------------------------------------------------------------------
-
-  function mat4Identity() {
-    var m = new Float32Array(16);
-    m[0] = 1; m[5] = 1; m[10] = 1; m[15] = 1;
-    return m;
-  }
-
-  function mat4Copy(m) {
-    return new Float32Array(m);
-  }
-
-  // Perkalian a * b (kolom-mayor). Urutan penting: hasil = a diterapkan
-  // SETELAH b. Untuk transformasi model: M = T * R * S.
-  function mat4Multiply(a, b) {
-    var out = new Float32Array(16);
-    var a00 = a[0],  a01 = a[1],  a02 = a[2],  a03 = a[3];
-    var a10 = a[4],  a11 = a[5],  a12 = a[6],  a13 = a[7];
-    var a20 = a[8],  a21 = a[9],  a22 = a[10], a23 = a[11];
-    var a30 = a[12], a31 = a[13], a32 = a[14], a33 = a[15];
-    var b00 = b[0],  b01 = b[1],  b02 = b[2],  b03 = b[3];
-    var b10 = b[4],  b11 = b[5],  b12 = b[6],  b13 = b[7];
-    var b20 = b[8],  b21 = b[9],  b22 = b[10], b23 = b[11];
-    var b30 = b[12], b31 = b[13], b32 = b[14], b33 = b[15];
-    out[0]  = a00 * b00 + a10 * b01 + a20 * b02 + a30 * b03;
-    out[1]  = a01 * b00 + a11 * b01 + a21 * b02 + a31 * b03;
-    out[2]  = a02 * b00 + a12 * b01 + a22 * b02 + a32 * b03;
-    out[3]  = a03 * b00 + a13 * b01 + a23 * b02 + a33 * b03;
-    out[4]  = a00 * b10 + a10 * b11 + a20 * b12 + a30 * b13;
-    out[5]  = a01 * b10 + a11 * b11 + a21 * b12 + a31 * b13;
-    out[6]  = a02 * b10 + a12 * b11 + a22 * b12 + a32 * b13;
-    out[7]  = a03 * b10 + a13 * b11 + a23 * b12 + a33 * b13;
-    out[8]  = a00 * b20 + a10 * b21 + a20 * b22 + a30 * b23;
-    out[9]  = a01 * b20 + a11 * b21 + a21 * b22 + a31 * b23;
-    out[10] = a02 * b20 + a12 * b21 + a22 * b22 + a32 * b23;
-    out[11] = a03 * b20 + a13 * b21 + a23 * b22 + a33 * b23;
-    out[12] = a00 * b30 + a10 * b31 + a20 * b32 + a30 * b33;
-    out[13] = a01 * b30 + a11 * b31 + a21 * b32 + a31 * b33;
-    out[14] = a02 * b30 + a12 * b31 + a22 * b32 + a32 * b33;
-    out[15] = a03 * b30 + a13 * b31 + a23 * b32 + a33 * b33;
-    return out;
-  }
-
-  // Matriks proyeksi perspektif. fov dalam radian (vertikal).
-  function mat4Perspective(fov, aspect, near, far) {
-    var m = new Float32Array(16);
-    var f = 1.0 / Math.tan(fov / 2);
-    var nf = 1 / (near - far);
-    m[0] = f / aspect;
-    m[5] = f;
-    m[10] = (far + near) * nf;
-    m[11] = -1;
-    m[14] = 2 * far * near * nf;
-    return m;
-  }
-
-  // Matriks proyeksi ortografik (dipakai shadow map directional).
-  function mat4Ortho(left, right, bottom, top, near, far) {
-    var m = new Float32Array(16);
-    var lr = 1 / (left - right);
-    var bt = 1 / (bottom - top);
-    var nf = 1 / (near - far);
-    m[0] = -2 * lr;
-    m[5] = -2 * bt;
-    m[10] = 2 * nf;
-    m[12] = (left + right) * lr;
-    m[13] = (top + bottom) * bt;
-    m[14] = (far + near) * nf;
-    m[15] = 1;
-    return m;
-  }
-
-  // Matriks view look-at.
-  // eye, look, up WAJIB object {x, y, z} — BUKAN array.
-  // Bug v8: pemakaian array membuat semua akses .x undefined,
-  // cross/dot menghasilkan NaN, matriks view menjadi nol, dan
-  // yang terlihat di layar hanya langit.
-  function mat4LookAt(eye, look, up) {
-    // Pengaman eksplisit: bila ada yang masih mengirim array,
-    // konversi dulu daripada menghasilkan matriks rusak diam-diam.
-    var e = vec3From(eye);
-    var c = vec3From(look);
-    var u = vec3From(up);
-    if (length(u) < 1e-8) u = { x: 0, y: 1, z: 0 };
-
-    var zAxis = normalize(vec3Sub(e, c));       // kamera menghadap -Z
-    // Jika eye == look, zAxis nol -> fallback menghadap -Z dunia.
-    if (lengthSq(zAxis) < 1e-8) zAxis = { x: 0, y: 0, z: 1 };
-    var xAxis = normalize(cross(u, zAxis));
-    if (lengthSq(xAxis) < 1e-8) xAxis = { x: 1, y: 0, z: 0 };
-    var yAxis = cross(zAxis, xAxis);
-
-    var m = new Float32Array(16);
-    m[0] = xAxis.x; m[4] = xAxis.y; m[8]  = xAxis.z; m[12] = -dot(xAxis, e);
-    m[1] = yAxis.x; m[5] = yAxis.y; m[9]  = yAxis.z; m[13] = -dot(yAxis, e);
-    m[2] = zAxis.x; m[6] = zAxis.y; m[10] = zAxis.z; m[14] = -dot(zAxis, e);
-    m[3] = 0;       m[7] = 0;       m[11] = 0;       m[15] = 1;
-    return m;
-  }
-
-  // Translasi: mengembalikan m * T(x, y, z).
-  function mat4Translate(m, x, y, z) {
-    var t = mat4Identity();
-    t[12] = x; t[13] = y; t[14] = z;
-    return mat4Multiply(m, t);
-  }
-
-  // Skala: mengembalikan m * S(sx, sy, sz).
-  function mat4Scale(m, sx, sy, sz) {
-    var s = mat4Identity();
-    s[0] = sx; s[5] = sy; s[10] = sz;
-    return mat4Multiply(m, s);
-  }
-
-  // Skala seragam.
-  function mat4ScaleUniform(m, s) {
-    return mat4Scale(m, s, s, s);
-  }
-
-  // Rotasi sumbu X (radian): m * Rx(a).
-  function mat4RotateX(m, a) {
-    var c = Math.cos(a), s = Math.sin(a);
-    var r = mat4Identity();
-    r[5] = c;  r[6] = s;
-    r[9] = -s; r[10] = c;
-    return mat4Multiply(m, r);
-  }
-
-  // Rotasi sumbu Y (radian): m * Ry(a).
-  function mat4RotateY(m, a) {
-    var c = Math.cos(a), s = Math.sin(a);
-    var r = mat4Identity();
-    r[0] = c;  r[2] = -s;
-    r[8] = s;  r[10] = c;
-    return mat4Multiply(m, r);
-  }
-
-  // Rotasi sumbu Z (radian): m * Rz(a).
-  function mat4RotateZ(m, a) {
-    var c = Math.cos(a), s = Math.sin(a);
-    var r = mat4Identity();
-    r[0] = c;  r[1] = s;
-    r[4] = -s; r[5] = c;
-    return mat4Multiply(m, r);
-  }
-
-  // Rotasi di sekitar sumbu sembarang (axis object {x,y,z}, radian).
-  function mat4RotateAxis(m, axis, a) {
-    var n = normalize(vec3From(axis));
-    var c = Math.cos(a), s = Math.sin(a), t = 1 - c;
-    var x = n.x, y = n.y, z = n.z;
-    var r = mat4Identity();
-    r[0] = t * x * x + c;     r[4] = t * x * y - s * z; r[8]  = t * x * z + s * y;
-    r[1] = t * x * y + s * z; r[5] = t * y * y + c;     r[9]  = t * y * z - s * x;
-    r[2] = t * x * z - s * y; r[6] = t * y * z + s * x; r[10] = t * z * z + c;
-    return mat4Multiply(m, r);
-  }
-
-  // Terapkan matriks ke sebuah titik vec3 (w = 1), kembalikan vec3 baru.
-  function mat4TransformPoint(m, v) {
-    var x = v.x, y = v.y, z = v.z;
-    var w = m[3] * x + m[7] * y + m[11] * z + m[15];
-    if (Math.abs(w) < 1e-8) w = 1;
-    return {
-      x: (m[0] * x + m[4] * y + m[8]  * z + m[12]) / w,
-      y: (m[1] * x + m[5] * y + m[9]  * z + m[13]) / w,
-      z: (m[2] * x + m[6] * y + m[10] * z + m[14]) / w
-    };
-  }
-
-  // Terapkan matriks ke sebuah arah (w = 0, tanpa translasi).
-  function mat4TransformDir(m, v) {
-    return {
-      x: m[0] * v.x + m[4] * v.y + m[8]  * v.z,
-      y: m[1] * v.x + m[5] * v.y + m[9]  * v.z,
-      z: m[2] * v.x + m[6] * v.y + m[10] * v.z
-    };
-  }
-
-  // Matriks model lengkap dari posisi + yaw + skala seragam.
-  // Dipakai hampir semua modul draw() untuk menaruh mesh di dunia.
-  function mat4Model(x, y, z, yaw, scale) {
-    var m = mat4Identity();
-    m = mat4Translate(m, x, y, z);
-    if (yaw) m = mat4RotateY(m, yaw);
-    if (scale && scale !== 1) m = mat4ScaleUniform(m, scale);
-    return m;
-  }
-
-  // Matriks model dengan skala non-seragam.
-  function mat4ModelScale(x, y, z, yaw, sx, sy, sz) {
-    var m = mat4Identity();
-    m = mat4Translate(m, x, y, z);
-    if (yaw) m = mat4RotateY(m, yaw);
-    m = mat4Scale(m, sx, sy, sz);
-    return m;
-  }
-
-  // Transpos matriks (berguna untuk normal matrix 3x3 bagian atas).
-  function mat4Transpose(m) {
-    var out = new Float32Array(16);
-    for (var c = 0; c < 4; c++) {
-      for (var r = 0; r < 4; r++) {
-        out[c * 4 + r] = m[r * 4 + c];
-      }
-    }
-    return out;
-  }
-
-  // Invers matriks 4x4 umum (algoritma adjugate). Mengembalikan
-  // matriks identitas bila matriks singular.
-  function mat4Inverse(m) {
-    var a00 = m[0],  a01 = m[1],  a02 = m[2],  a03 = m[3];
-    var a10 = m[4],  a11 = m[5],  a12 = m[6],  a13 = m[7];
-    var a20 = m[8],  a21 = m[9],  a22 = m[10], a23 = m[11];
-    var a30 = m[12], a31 = m[13], a32 = m[14], a33 = m[15];
-    var b00 = a00 * a11 - a01 * a10;
-    var b01 = a00 * a12 - a02 * a10;
-    var b02 = a00 * a13 - a03 * a10;
-    var b03 = a01 * a12 - a02 * a11;
-    var b04 = a01 * a13 - a03 * a11;
-    var b05 = a02 * a13 - a03 * a12;
-    var b06 = a20 * a31 - a21 * a30;
-    var b07 = a20 * a32 - a22 * a30;
-    var b08 = a20 * a33 - a23 * a30;
-    var b09 = a21 * a32 - a22 * a31;
-    var b10 = a21 * a33 - a23 * a31;
-    var b11 = a22 * a33 - a23 * a32;
-    var det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
-    if (Math.abs(det) < 1e-12) return mat4Identity();
-    var invDet = 1 / det;
-    var out = new Float32Array(16);
-    out[0]  = (a11 * b11 - a12 * b10 + a13 * b09) * invDet;
-    out[1]  = (a02 * b10 - a01 * b11 - a03 * b09) * invDet;
-    out[2]  = (a31 * b05 - a32 * b04 + a33 * b03) * invDet;
-    out[3]  = (a22 * b04 - a21 * b05 - a23 * b03) * invDet;
-    out[4]  = (a12 * b08 - a10 * b11 - a13 * b07) * invDet;
-    out[5]  = (a00 * b11 - a02 * b08 + a03 * b07) * invDet;
-    out[6]  = (a32 * b02 - a30 * b05 - a33 * b01) * invDet;
-    out[7]  = (a20 * b05 - a22 * b02 + a23 * b01) * invDet;
-    out[8]  = (a10 * b10 - a11 * b08 + a13 * b06) * invDet;
-    out[9]  = (a01 * b08 - a00 * b10 - a03 * b06) * invDet;
-    out[10] = (a30 * b04 - a31 * b02 + a33 * b00) * invDet;
-    out[11] = (a21 * b02 - a20 * b04 - a23 * b00) * invDet;
-    out[12] = (a11 * b07 - a10 * b09 - a12 * b06) * invDet;
-    out[13] = (a00 * b09 - a01 * b07 + a02 * b06) * invDet;
-    out[14] = (a31 * b01 - a30 * b03 - a32 * b00) * invDet;
-    out[15] = (a20 * b03 - a21 * b01 + a22 * b00) * invDet;
-    return out;
-  }
-
-  // ------------------------------------------------------------------
-  // Warna (dipakai gl.js untuk tint / fog / emissive)
-  // ------------------------------------------------------------------
-
-  // Konversi hex "#rrggbb" -> [r, g, b] float 0..1.
-  function hexToRgb(hex) {
-    var h = String(hex || '#ffffff').replace('#', '');
-    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
-    var n = parseInt(h, 16);
-    if (isNaN(n)) return [1, 1, 1];
-    return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
-  }
-
-  // Campur dua warna [r,g,b] dengan t 0..1.
-  function mixColor(a, b, t) {
-    t = clamp(t, 0, 1);
-    return [
-      lerp(a[0], b[0], t),
-      lerp(a[1], b[1], t),
-      lerp(a[2], b[2], t)
-    ];
-  }
-
-  // ------------------------------------------------------------------
-  // Ekspor namespace
-  // ------------------------------------------------------------------
-  window.SB.Math3 = {
-    // skalar
-    clamp: clamp, lerp: lerp, lerpClamped: lerpClamped,
-    lerpAngle: lerpAngle, smoothstep: smoothstep,
-    degToRad: degToRad, radToDeg: radToDeg,
-    angleDiff: angleDiff, wrapAngle: wrapAngle,
-    dist2D: dist2D, dist3D: dist3D,
-    // vec3
-    vec3: vec3, vec3Zero: vec3Zero, vec3Up: vec3Up,
-    vec3Forward: vec3Forward, vec3Copy: vec3Copy,
-    vec3From: vec3From, vec3Add: vec3Add, vec3Sub: vec3Sub,
-    vec3Scale: vec3Scale, vec3Neg: vec3Neg,
-    dot: dot, cross: cross, length: length, lengthSq: lengthSq,
-    normalize: normalize, vec3Lerp: vec3Lerp,
-    distPointSegment: distPointSegment,
-    dirFromYaw: dirFromYaw, yawFromDir: yawFromDir,
-    // mat4
-    mat4Identity: mat4Identity, mat4Copy: mat4Copy,
-    mat4Multiply: mat4Multiply, mat4Perspective: mat4Perspective,
-    mat4Ortho: mat4Ortho, mat4LookAt: mat4LookAt,
-    mat4Translate: mat4Translate, mat4Scale: mat4Scale,
-    mat4ScaleUniform: mat4ScaleUniform,
-    mat4RotateX: mat4RotateX, mat4RotateY: mat4RotateY,
-    mat4RotateZ: mat4RotateZ, mat4RotateAxis: mat4RotateAxis,
-    mat4TransformPoint: mat4TransformPoint,
-    mat4TransformDir: mat4TransformDir,
-    mat4Model: mat4Model, mat4ModelScale: mat4ModelScale,
-    mat4Transpose: mat4Transpose, mat4Inverse: mat4Inverse,
-    // warna
-    hexToRgb: hexToRgb, mixColor: mixColor
+// Membuat vektor {x, y, z}. Argumen yang hilang default 0.
+function vec3(x, y, z) {
+  return {
+    x: (typeof x === 'number' && isFinite(x)) ? x : 0,
+    y: (typeof y === 'number' && isFinite(y)) ? y : 0,
+    z: (typeof z === 'number' && isFinite(z)) ? z : 0
   };
+}
+
+// Salinan vektor (tidak mengubah aslinya).
+function vec3Clone(v) {
+  if (!v) { return vec3(0, 0, 0); }
+  return vec3(v.x || 0, v.y || 0, v.z || 0);
+}
+
+// Vektor nol.
+function vec3Zero() {
+  return vec3(0, 0, 0);
+}
+
+// Vektor dari a menuju b: b - a.
+function vec3FromTo(a, b) {
+  return vec3((b.x || 0) - (a.x || 0), (b.y || 0) - (a.y || 0), (b.z || 0) - (a.z || 0));
+}
+
+
+// a + b (vektor baru).
+function vec3Add(a, b) {
+  return vec3((a.x || 0) + (b.x || 0), (a.y || 0) + (b.y || 0), (a.z || 0) + (b.z || 0));
+}
+
+// a - b (vektor baru).
+function vec3Sub(a, b) {
+  return vec3((a.x || 0) - (b.x || 0), (a.y || 0) - (b.y || 0), (a.z || 0) - (b.z || 0));
+}
+
+// a * s (skalar).
+function vec3Scale(a, s) {
+  return vec3((a.x || 0) * s, (a.y || 0) * s, (a.z || 0) * s);
+}
+
+
+// Negasi vektor.
+function vec3Negate(a) {
+  return vec3(-(a.x || 0), -(a.y || 0), -(a.z || 0));
+}
+
+// Dot product a . b.
+function vec3Dot(a, b) {
+  return (a.x || 0) * (b.x || 0) + (a.y || 0) * (b.y || 0) + (a.z || 0) * (b.z || 0);
+}
+
+// Cross product a x b.
+function vec3Cross(a, b) {
+  var ax = a.x || 0, ay = a.y || 0, az = a.z || 0;
+  var bx = b.x || 0, by = b.y || 0, bz = b.z || 0;
+  return vec3(ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx);
+}
+
+// Panjang (magnitude) vektor.
+function vec3Length(a) {
+  var x = a.x || 0, y = a.y || 0, z = a.z || 0;
+  return Math.sqrt(x * x + y * y + z * z);
+}
+
+// Kuadrat panjang (lebih murah bila hanya untuk perbandingan).
+function vec3LengthSq(a) {
+  var x = a.x || 0, y = a.y || 0, z = a.z || 0;
+  return x * x + y * y + z * z;
+}
+
+// Jarak antara a dan b.
+function vec3Distance(a, b) {
+  return vec3Length(vec3Sub(a, b));
+}
+
+// Kuadrat jarak antara a dan b.
+function vec3DistanceSq(a, b) {
+  return vec3LengthSq(vec3Sub(a, b));
+}
+
+// Normalisasi: vektor satuan searah a. Vektor nol tetap nol.
+function vec3Normalize(a) {
+  var len = vec3Length(a);
+  if (len < EPSILON) { return vec3(0, 0, 0); }
+  return vec3Scale(a, 1 / len);
+}
+
+// Interpolasi linear antar vektor: a + (b - a) * t.
+function vec3Lerp(a, b, t) {
+  var tt = clamp(t, 0, 1);
+  return vec3(
+    (a.x || 0) + ((b.x || 0) - (a.x || 0)) * tt,
+    (a.y || 0) + ((b.y || 0) - (a.y || 0)) * tt,
+    (a.z || 0) + ((b.z || 0) - (a.z || 0)) * tt
+  );
+}
+
+
+
+
+
+// Arah dari yaw (radian, 0 = menghadap -Z) menjadi vektor depan di bidang XZ.
+function vec3FromYaw(yaw) {
+  return vec3(-Math.sin(yaw), 0, -Math.cos(yaw));
+}
+
+// Yaw (radian) dari sebuah vektor arah di bidang XZ.
+function yawFromVec3(v) {
+  return Math.atan2(-(v.x || 0), -(v.z || 0));
+}
+
+// ---------------------------------------------------------------------------
+// Skalar: clamp & lerp (bagian dari API wajib SB.Math3)
+// ---------------------------------------------------------------------------
+
+// Batasi v ke rentang [a, b]. Bila a > b, batas ditukar dulu.
+function clamp(v, a, b) {
+  var lo = a, hi = b;
+  if (lo > hi) { var tmp = lo; lo = hi; hi = tmp; }
+  if (v < lo) { return lo; }
+  if (v > hi) { return hi; }
+  return v;
+}
+
+// Interpolasi linear skalar: a + (b - a) * t.
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+
+
+
+// Selisih sudut terpendek (radian) antara a dan b, dalam (-PI, PI].
+function angleDelta(a, b) {
+  var d = (b - a) % TAU;
+  if (d > PI) { d -= TAU; }
+  if (d <= -PI) { d += TAU; }
+  return d;
+}
+
+// Interpolasi sudut mengikuti jalur terpendek.
+function lerpAngle(a, b, t) {
+  return a + angleDelta(a, b) * clamp(t, 0, 1);
+}
+
+// Derajat ke radian dan sebaliknya.
+function degToRad(deg) { return deg * PI / 180; }
+function radToDeg(rad) { return rad * 180 / PI; }
+
+// Bungkus sudut ke rentang [0, TAU).
+function wrapAngle(a) {
+  var r = a % TAU;
+  if (r < 0) { r += TAU; }
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// Matriks 4x4 (Float32Array(16), column-major — konvensi WebGL / gl-matrix)
+// Indeks: m[col * 4 + row].
+// ---------------------------------------------------------------------------
+
+// Matriks identitas 4x4.
+function mat4Identity() {
+  var m = new Float32Array(16);
+  m[0] = 1; m[5] = 1; m[10] = 1; m[15] = 1;
+  return m;
+}
+
+// Salinan matriks.
+function mat4Clone(m) {
+  var out = new Float32Array(16);
+  for (var i = 0; i < 16; i++) { out[i] = m[i]; }
+  return out;
+}
+
+// Matriks perspektif. fov dalam radian, aspect = lebar/tinggi.
+function mat4Perspective(fov, aspect, near, far) {
+  var m = new Float32Array(16);
+  var f = 1 / Math.tan(fov / 2);
+  var nf = 1 / (near - far);
+  m[0] = f / aspect;
+  m[5] = f;
+  m[10] = (far + near) * nf;
+  m[11] = -1;
+  m[14] = 2 * far * near * nf;
+  m[15] = 0;
+  return m;
+}
+
+// Matriks ortografik (dipakai untuk bayangan / shadow map).
+function mat4Ortho(left, right, bottom, top, near, far) {
+  var m = new Float32Array(16);
+  var lr = 1 / (right - left);
+  var bt = 1 / (top - bottom);
+  var nf = 1 / (far - near);
+  m[0] = 2 * lr;
+  m[5] = 2 * bt;
+  m[10] = -2 * nf;
+  m[12] = -(right + left) * lr;
+  m[13] = -(top + bottom) * bt;
+  m[14] = -(far + near) * nf;
+  m[15] = 1;
+  return m;
+}
+
+// Matriks look-at. eye, look (target), up adalah OBJECT {x, y, z}.
+// BUKAN array — pelajaran bug v8: pemanggil mengirim object, jadi di sini
+// kita membaca .x/.y/.z dan TIDAK pernah mengindeks [0]/[1]/[2].
+function mat4LookAt(eye, look, up) {
+  var ex = eye.x || 0, ey = eye.y || 0, ez = eye.z || 0;
+  var lx = look.x || 0, ly = look.y || 0, lz = look.z || 0;
+  var ux = (up && typeof up.x === 'number') ? up.x : 0;
+  var uy = (up && typeof up.y === 'number') ? up.y : 1;
+  var uz = (up && typeof up.z === 'number') ? up.z : 0;
+  // Sumbu Z kamera = eye - look (menjauhi target), dinormalisasi.
+  var zx = ex - lx, zy = ey - ly, zz = ez - lz;
+  var zl = Math.sqrt(zx * zx + zy * zy + zz * zz);
+  if (zl < EPSILON) { zx = 0; zy = 0; zz = 1; zl = 1; }
+  zx /= zl; zy /= zl; zz /= zl;
+  // Sumbu X = up x Z.
+  var xx = uy * zz - uz * zy, xy = uz * zx - ux * zz, xz = ux * zy - uy * zx;
+  var xl = Math.sqrt(xx * xx + xy * xy + xz * xz);
+  if (xl < EPSILON) { xx = 1; xy = 0; xz = 0; xl = 1; }
+  xx /= xl; xy /= xl; xz /= xl;
+  // Sumbu Y = Z x X.
+  var yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  var m = new Float32Array(16);
+  m[0] = xx; m[1] = yx; m[2] = zx; m[3] = 0;
+  m[4] = xy; m[5] = yy; m[6] = zy; m[7] = 0;
+  m[8] = xz; m[9] = yz; m[10] = zz; m[11] = 0;
+  m[12] = -(xx * ex + xy * ey + xz * ez);
+  m[13] = -(yx * ex + yy * ey + yz * ez);
+  m[14] = -(zx * ex + zy * ey + zz * ez);
+  m[15] = 1;
+  return m;
+}
+
+// Perkalian matriks: out = a * b (column-major, vektor kolom).
+function mat4Multiply(a, b) {
+  var out = new Float32Array(16);
+  var a00 = a[0], a01 = a[1], a02 = a[2], a03 = a[3];
+  var a10 = a[4], a11 = a[5], a12 = a[6], a13 = a[7];
+  var a20 = a[8], a21 = a[9], a22 = a[10], a23 = a[11];
+  var a30 = a[12], a31 = a[13], a32 = a[14], a33 = a[15];
+  var b0, b1, b2, b3;
+  b0 = b[0]; b1 = b[1]; b2 = b[2]; b3 = b[3];
+  out[0] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
+  out[1] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
+  out[2] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
+  out[3] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
+  b0 = b[4]; b1 = b[5]; b2 = b[6]; b3 = b[7];
+  out[4] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
+  out[5] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
+  out[6] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
+  out[7] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
+  b0 = b[8]; b1 = b[9]; b2 = b[10]; b3 = b[11];
+  out[8] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
+  out[9] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
+  out[10] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
+  out[11] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
+  b0 = b[12]; b1 = b[13]; b2 = b[14]; b3 = b[15];
+  out[12] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
+  out[13] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
+  out[14] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
+  out[15] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
+  return out;
+}
+
+// Translasi: out = m * T(x, y, z) (matriks baru, m tidak diubah).
+function mat4Translate(m, x, y, z) {
+  var out = mat4Clone(m);
+  out[12] = m[0] * x + m[4] * y + m[8] * z + m[12];
+  out[13] = m[1] * x + m[5] * y + m[9] * z + m[13];
+  out[14] = m[2] * x + m[6] * y + m[10] * z + m[14];
+  out[15] = m[3] * x + m[7] * y + m[11] * z + m[15];
+  return out;
+}
+
+// Rotasi terhadap sumbu Y: out = m * Ry(a).
+function mat4RotateY(m, a) {
+  var s = Math.sin(a), c = Math.cos(a);
+  var out = mat4Clone(m);
+  var m0 = m[0], m1 = m[1], m2 = m[2], m3 = m[3];
+  var m8 = m[8], m9 = m[9], m10 = m[10], m11 = m[11];
+  out[0] = m0 * c - m8 * s;
+  out[1] = m1 * c - m9 * s;
+  out[2] = m2 * c - m10 * s;
+  out[3] = m3 * c - m11 * s;
+  out[8] = m0 * s + m8 * c;
+  out[9] = m1 * s + m9 * c;
+  out[10] = m2 * s + m10 * c;
+  out[11] = m3 * s + m11 * c;
+  return out;
+}
+
+// Rotasi terhadap sumbu X: out = m * Rx(a).
+function mat4RotateX(m, a) {
+  var s = Math.sin(a), c = Math.cos(a);
+  var out = mat4Clone(m);
+  var m4 = m[4], m5 = m[5], m6 = m[6], m7 = m[7];
+  var m8 = m[8], m9 = m[9], m10 = m[10], m11 = m[11];
+  out[4] = m4 * c + m8 * s;
+  out[5] = m5 * c + m9 * s;
+  out[6] = m6 * c + m10 * s;
+  out[7] = m7 * c + m11 * s;
+  out[8] = m8 * c - m4 * s;
+  out[9] = m9 * c - m5 * s;
+  out[10] = m10 * c - m6 * s;
+  out[11] = m11 * c - m7 * s;
+  return out;
+}
+
+// Rotasi terhadap sumbu Z: out = m * Rz(a).
+function mat4RotateZ(m, a) {
+  var s = Math.sin(a), c = Math.cos(a);
+  var out = mat4Clone(m);
+  var m0 = m[0], m1 = m[1], m2 = m[2], m3 = m[3];
+  var m4 = m[4], m5 = m[5], m6 = m[6], m7 = m[7];
+  out[0] = m0 * c + m4 * s;
+  out[1] = m1 * c + m5 * s;
+  out[2] = m2 * c + m6 * s;
+  out[3] = m3 * c + m7 * s;
+  out[4] = m4 * c - m0 * s;
+  out[5] = m5 * c - m1 * s;
+  out[6] = m6 * c - m2 * s;
+  out[7] = m7 * c - m3 * s;
+  return out;
+}
+
+// Skala: out = m * S(x, y, z).
+function mat4Scale(m, x, y, z) {
+  var out = mat4Clone(m);
+  out[0] = m[0] * x; out[1] = m[1] * x; out[2] = m[2] * x; out[3] = m[3] * x;
+  out[4] = m[4] * y; out[5] = m[5] * y; out[6] = m[6] * y; out[7] = m[7] * y;
+  out[8] = m[8] * z; out[9] = m[9] * z; out[10] = m[10] * z; out[11] = m[11] * z;
+  return out;
+}
+
+// Matriks model dari posisi + yaw + skala seragam (pola paling umum di game).
+function mat4FromPosYaw(pos, yaw, scale) {
+  var s = (typeof scale === 'number' && scale > 0) ? scale : 1;
+  var m = mat4Identity();
+  m = mat4Translate(m, pos.x || 0, pos.y || 0, pos.z || 0);
+  m = mat4RotateY(m, yaw || 0);
+  if (s !== 1) { m = mat4Scale(m, s, s, s); }
+  return m;
+}
+
+// Matriks model dari posisi + yaw + skala per sumbu.
+function mat4FromPosYawScale(pos, yaw, sx, sy, sz) {
+  var m = mat4Identity();
+  m = mat4Translate(m, pos.x || 0, pos.y || 0, pos.z || 0);
+  m = mat4RotateY(m, yaw || 0);
+  m = mat4Scale(m, sx || 1, sy || 1, sz || 1);
+  return m;
+}
+
+
+// Transformasi titik (x, y, z, w=1) oleh matriks -> object {x, y, z}.
+function mat4TransformPoint(m, v) {
+  var x = v.x || 0, y = v.y || 0, z = v.z || 0;
+  var w = m[3] * x + m[7] * y + m[11] * z + m[15];
+  if (Math.abs(w) < EPSILON) { w = 1; }
+  return vec3(
+    (m[0] * x + m[4] * y + m[8] * z + m[12]) / w,
+    (m[1] * x + m[5] * y + m[9] * z + m[13]) / w,
+    (m[2] * x + m[6] * y + m[10] * z + m[14]) / w
+  );
+}
+
+// Transformasi arah (w=0, tanpa translasi) oleh matriks -> object {x, y, z}.
+function mat4TransformDirection(m, v) {
+  var x = v.x || 0, y = v.y || 0, z = v.z || 0;
+  return vec3(
+    m[0] * x + m[4] * y + m[8] * z,
+    m[1] * x + m[5] * y + m[9] * z,
+    m[2] * x + m[6] * y + m[10] * z
+  );
+}
+
+// Invers matriks 4x4 umum. Bila singular, kembalikan identitas.
+function mat4Invert(m) {
+  var a00 = m[0], a01 = m[1], a02 = m[2], a03 = m[3];
+  var a10 = m[4], a11 = m[5], a12 = m[6], a13 = m[7];
+  var a20 = m[8], a21 = m[9], a22 = m[10], a23 = m[11];
+  var a30 = m[12], a31 = m[13], a32 = m[14], a33 = m[15];
+  var b00 = a00 * a11 - a01 * a10, b01 = a00 * a12 - a02 * a10;
+  var b02 = a00 * a13 - a03 * a10, b03 = a01 * a12 - a02 * a11;
+  var b04 = a01 * a13 - a03 * a11, b05 = a02 * a13 - a03 * a12;
+  var b06 = a20 * a31 - a21 * a30, b07 = a20 * a32 - a22 * a30;
+  var b08 = a20 * a33 - a23 * a30, b09 = a21 * a32 - a22 * a31;
+  var b10 = a21 * a33 - a23 * a31, b11 = a22 * a33 - a23 * a32;
+  var det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+  if (Math.abs(det) < EPSILON) { return mat4Identity(); }
+  var inv = 1 / det;
+  var out = new Float32Array(16);
+  out[0] = (a11 * b11 - a12 * b10 + a13 * b09) * inv;
+  out[1] = (a02 * b10 - a01 * b11 - a03 * b09) * inv;
+  out[2] = (a31 * b05 - a32 * b04 + a33 * b03) * inv;
+  out[3] = (a22 * b04 - a21 * b05 - a23 * b03) * inv;
+  out[4] = (a12 * b08 - a10 * b11 - a13 * b07) * inv;
+  out[5] = (a00 * b11 - a02 * b08 + a03 * b07) * inv;
+  out[6] = (a32 * b02 - a30 * b05 - a33 * b01) * inv;
+  out[7] = (a20 * b05 - a22 * b02 + a23 * b01) * inv;
+  out[8] = (a10 * b10 - a11 * b08 + a13 * b06) * inv;
+  out[9] = (a01 * b08 - a00 * b10 - a03 * b06) * inv;
+  out[10] = (a30 * b04 - a31 * b02 + a33 * b00) * inv;
+  out[11] = (a21 * b02 - a20 * b04 - a23 * b00) * inv;
+  out[12] = (a11 * b07 - a10 * b09 - a12 * b06) * inv;
+  out[13] = (a00 * b09 - a01 * b07 + a02 * b06) * inv;
+  out[14] = (a31 * b01 - a30 * b03 - a32 * b00) * inv;
+  out[15] = (a20 * b03 - a21 * b01 + a22 * b00) * inv;
+  return out;
+}
+
+
+// ---------------------------------------------------------------------------
+// Warna (dipakai renderer + HUD): [r, g, b] 0..1 dan hex.
+// ---------------------------------------------------------------------------
+
+
+
+
+
+// ---------------------------------------------------------------------------
+// Util acak deterministik ringan (bukan pengganti SB.Rng — hanya helper math).
+// ---------------------------------------------------------------------------
+
+
+
+// ---------------------------------------------------------------------------
+// Ekspor API
+// ---------------------------------------------------------------------------
+window.SB.Math3 = {
+  vec3: vec3, vec3Clone: vec3Clone, vec3Zero: vec3Zero,
+  vec3FromTo: vec3FromTo, vec3Add: vec3Add, vec3Sub: vec3Sub,
+  vec3Scale: vec3Scale, vec3Negate: vec3Negate,
+  vec3Dot: vec3Dot, vec3Cross: vec3Cross, vec3Length: vec3Length,
+  vec3LengthSq: vec3LengthSq, vec3Distance: vec3Distance,
+  vec3DistanceSq: vec3DistanceSq, vec3Normalize: vec3Normalize,
+  vec3Lerp: vec3Lerp,
+  vec3FromYaw: vec3FromYaw, yawFromVec3: yawFromVec3,
+  mat4Identity: mat4Identity, mat4Clone: mat4Clone,
+  mat4Perspective: mat4Perspective, mat4Ortho: mat4Ortho,
+  mat4LookAt: mat4LookAt, mat4Multiply: mat4Multiply,
+  mat4Translate: mat4Translate, mat4RotateY: mat4RotateY,
+  mat4RotateX: mat4RotateX, mat4RotateZ: mat4RotateZ,
+  mat4Scale: mat4Scale, mat4FromPosYaw: mat4FromPosYaw,
+  mat4FromPosYawScale: mat4FromPosYawScale,
+  mat4TransformPoint: mat4TransformPoint,
+  mat4TransformDirection: mat4TransformDirection,
+  mat4Invert: mat4Invert,
+  clamp: clamp, lerp: lerp,
+  angleDelta: angleDelta, lerpAngle: lerpAngle,
+  degToRad: degToRad, radToDeg: radToDeg, wrapAngle: wrapAngle,
+  EPSILON: EPSILON, PI: PI, TAU: TAU
+};
 })();

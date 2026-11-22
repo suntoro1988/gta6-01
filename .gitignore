@@ -1,55 +1,53 @@
-# Sunset Bay v12 — files git must never track.
-#
-# Rule of thumb: if a machine made it, or only one machine needs it,
-# it stays out of the repository. The entry is source + screenshots.
+# Sunset Bay v13 — .gitignore
+# Build output & artefak lokal (jangan pernah di-commit)
 
-# --- build output ---
+# Output build main.ts
 /output/
-/dist/
-/build/
+/output
+dist/
+build/
+out/
 
-# --- dependencies & package managers ---
+# Dependensi Node
 node_modules/
-.pnp
-.pnp.*
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/versions
-.npm/
-.bun/
-
-# --- scratch & temporary files ---
-/tmp/
-tmp/
-*.tmp
-*.temp
-*.swp
-*.swo
-*~
-
-# --- logs & crash reports ---
-*.log
-logs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
 
-# --- OS & editor clutter ---
+# Cache & tooling
+.cache/
+*.tsbuildinfo
+.eslintcache
+
+# Sistem operasi
 .DS_Store
 .DS_Store?
+._*
 Thumbs.db
 ehthumbs.db
 Desktop.ini
-.idea/
-.vscode/
-*.sublime-project
-*.sublime-workspace
 
-# --- environment & secrets ---
+# Editor & IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+
+# Log & file sementara
+*.log
+logs/
+
+# Rahasia & kredensial (JANGAN di-commit)
 .env
 .env.*
 !.env.example
 *.pem
 *.key
+credentials.json
+secrets.json

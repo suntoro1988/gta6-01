@@ -1,329 +1,354 @@
 window.SB = window.SB || {};
-(function () {
-  'use strict';
-  // SB.Crew — Sunset Bay v12. Recruit 4 specialists, give orders, trigger
-  // each member's unique active ability. Crew follows on foot, joins
-  // missions and street races, and fights beside the player. All cross-
-  // module calls are guarded: SB.Player/Vehicles/City/HUD/Audio/Police
-  // may not be loaded yet when this module runs.
-  var ROSTER = [
-    { id: 'rico', name: 'Rico', nickname: 'El Volante', role: 'driver',
-      skill: 'Driving', skillLevel: 92, cost: 200, respectNeeded: 0,
-      ability: 'drift-boost', abilityName: 'Drift Boost', cooldown: 45, color: '#ff9a3c',
-      abilityDesc: '10s extra grip + top speed while driving. Perfect getaway.',
-      bio: 'Ex-street racer from Ocean Drive. Never lost a getaway.' },
-    { id: 'maya', name: 'Maya', nickname: 'La Bala', role: 'shooter',
-      skill: 'Shooting', skillLevel: 95, cost: 250, respectNeeded: 100,
-      ability: 'deadeye', abilityName: 'Deadeye', cooldown: 40, color: '#ff4d6d',
-      abilityDesc: '+40% shooting accuracy and +25% damage for 15s.',
-      bio: 'Former range instructor. One shot, one problem solved.' },
-    { id: 'dex', name: 'Dex', nickname: 'Ghost', role: 'hacker',
-      skill: 'Hacking', skillLevel: 88, cost: 300, respectNeeded: 250,
-      ability: 'ghost-signal', abilityName: 'Ghost Signal', cooldown: 60, color: '#4dd0ff',
-      abilityDesc: 'Instantly drops wanted by 1 star and cools Heat by 30.',
-      bio: 'Can mute a camera grid before the guard blinks.' },
-    { id: 'luna', name: 'Luna', nickname: 'Ojo', role: 'lookout',
-      skill: 'Awareness', skillLevel: 90, cost: 250, respectNeeded: 150,
-      ability: 'eagle-eye', abilityName: 'Eagle Eye', cooldown: 50, color: '#b8ff5e',
-      abilityDesc: 'Marks every police unit on the minimap for 30s.',
-      bio: 'Sees the cops three blocks before the cops see you.' }
-  ];
-  // Orders: English + Indonesian (spec: ikut/serang/tunggu/bersembunyi).
-  var COMMANDS = {
-    follow: ['follow', 'ikut', 'follow me', 'ikut aku'],
-    attack: ['attack', 'serang', 'serang mereka', 'engage'],
-    wait: ['wait', 'tunggu', 'tunggu di sini', 'hold'],
-    hide: ['hide', 'bersembunyi', 'sembunyi', 'low profile']
+(function(){
+'use strict';
+
+// ---------------------------------------------------------------------------
+// SB.Crew — sistem kru / rekan tim Sunset Bay
+//
+// Empat anggota bisa direkrut, masing-masing punya peran, kemampuan unik,
+// dan perilaku mengikuti pemain. Perintah kru: ikut (follow), serang
+// (attack), tunggu (wait). Anggota kru ikut bertarung, menyetir, menyembuh,
+// dan memberi bonus pasif selama mereka aktif di lapangan.
+// ---------------------------------------------------------------------------
+
+var FOLLOW_DIST = 3.2;    // jarak ideal anggota di belakang pemain
+var CATCHUP_DIST = 26;    // di atas jarak ini anggota berlari mengejar
+var TELEPORT_DIST = 60;   // di atas jarak ini anggota "menyusul" (teleport)
+var COMBAT_RANGE = 34;    // jarak anggota menyerang musuh terdekat
+var HEAL_TICK = 1.0;      // interval penyembuhan Tasha (detik)
+
+// Definisi empat anggota yang bisa direkrut. `cost` adalah biaya rekrut
+// sekali bayar; `unlock` adalah syarat respect minimum (0 = terbuka).
+var ROSTER = [
+  {
+    name: 'Rico', role: 'Wheelman', color: 0xd94f30,
+    cost: 300, unlock: 0, hp: 120,
+    bio: 'Pembalap jalanan Sunset Bay. Pernah menang 14 balapan liar.',
+    ability: 'Slipstream',
+    abilityDesc: 'Slipstream: +25% kecepatan kendaraan saat Rico ikut di mobil.',
+    passive: 'Kendaraan pemain +12% akselerasi selama Rico aktif.'
+  },
+  {
+    name: 'Lena', role: 'Hacker', color: 0x3fa7d6,
+    cost: 500, unlock: 150, hp: 90,
+    bio: 'Peretas sistem kota. Bisa mematikan kamera dan membuka kunci.',
+    ability: 'Blackout',
+    abilityDesc: 'Blackout: matikan lampu jalan & kamera 30 detik, wanted -1.',
+    passive: 'Wanted naik 20% lebih lambat selama Lena aktif.'
+  },
+  {
+    name: 'Marcus', role: 'Muscle', color: 0x8a5a2b,
+    cost: 450, unlock: 100, hp: 200,
+    bio: 'Mantan petinju pelabuhan. Satu pukulan cukup untuk kebanyakan orang.',
+    ability: 'Haymaker',
+    abilityDesc: 'Haymaker: pukulan dahsyat, damage 3x ke target terdekat.',
+    passive: 'Damage jarak dekat pemain +25% selama Marcus aktif.'
+  },
+  {
+    name: 'Tasha', role: 'Medic', color: 0x7bc47f,
+    cost: 400, unlock: 200, hp: 100,
+    bio: 'Perawat lapangan. Selalu bawa tas medis dan kopi dingin.',
+    ability: 'Field Dressing',
+    abilityDesc: 'Field Dressing: pulihkan 40 HP pemain seketika.',
+    passive: 'Regenerasi +2 HP/detik selama Tasha aktif.'
+  }
+];
+
+// Cooldown tiap ability (detik).
+var ABILITY_COOLDOWN = {
+  Slipstream: 20,
+  Blackout: 45,
+  Haymaker: 12,
+  'Field Dressing': 30
+};
+
+var stateRef = null;      // referensi SB.state (dibuat game.js)
+var members = [];         // anggota aktif (subset ROSTER + status runtime)
+var order = 'follow';     // perintah aktif: 'follow' | 'attack' | 'wait'
+var healTimer = 0;        // timer regenerasi Tasha
+var combatTimer = 0;      // timer serangan kru
+var recruitLog = [];      // riwayat rekrut (untuk HUD / statistik)
+
+// ---------------------------------------------------------------------------
+// Util kecil (lokal, tanpa dependensi modul lain)
+// ---------------------------------------------------------------------------
+
+function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
+
+function dist2d(ax, az, bx, bz){
+  var dx = ax - bx, dz = az - bz;
+  return Math.sqrt(dx * dx + dz * dz);
+}
+
+function findRoster(name){
+  for (var i = 0; i < ROSTER.length; i++){
+    if (ROSTER[i].name === name) return ROSTER[i];
+  }
+  return null;
+}
+
+function findMember(name){
+  for (var i = 0; i < members.length; i++){
+    if (members[i].name === name) return members[i];
+  }
+  return null;
+}
+
+function toast(text){
+  if (window.SB && window.SB.HUD && typeof window.SB.HUD.showToast === 'function'){
+    window.SB.HUD.showToast(text);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// init(state)
+// ---------------------------------------------------------------------------
+
+function init(state){
+  stateRef = state;
+  // JANGAN reassign `members`: SB.Crew.members diekspor sebagai referensi
+  // ke array ini, jadi kosongkan di tempat agar referensi tetap hidup.
+  members.length = 0;
+  order = 'follow';
+  healTimer = 0;
+  combatTimer = 0;
+  recruitLog.length = 0;
+  if (state){
+    state.crew = members;
+    if (!state.flags) state.flags = {};
+    state.flags.crewOrder = order;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// recruit(name) — rekrut anggota dari ROSTER
+// ---------------------------------------------------------------------------
+
+function recruit(name){
+  if (!stateRef) return false;
+  var def = findRoster(name);
+  if (!def) return false;
+  if (findMember(name)) { toast(name + ' sudah bergabung dengan kru.'); return false; }
+  if (members.length >= 4) { toast('Kru sudah penuh (4 anggota).'); return false; }
+  if ((stateRef.respect || 0) < def.unlock){
+    toast(name + ' butuh respect ' + def.unlock + ' (sekarang ' + (stateRef.respect || 0) + ').');
+    return false;
+  }
+  if ((stateRef.money || 0) < def.cost){
+    toast('Butuh $' + def.cost + ' untuk merekrut ' + name + '.');
+    return false;
+  }
+
+  stateRef.money -= def.cost;
+  var m = {
+    name: def.name, role: def.role, color: def.color,
+    hp: def.hp, maxHp: def.hp,
+    ability: def.ability, abilityDesc: def.abilityDesc,
+    passive: def.passive,
+    x: stateRef.player.x + 2, y: 0, z: stateRef.player.z + 2,
+    angle: stateRef.player.angle || 0,
+    mode: 'follow',            // follow | attack | wait (per anggota)
+    cooldown: 0,               // cooldown ability
+    active: true,
+    kills: 0,
+    joinedDay: stateRef.day || 1
   };
-  var FORMATION = [{ dx: -2.2, dz: 1.6 }, { dx: 2.2, dz: 1.6 },
-                   { dx: -2.2, dz: -1.8 }, { dx: 2.2, dz: -1.8 }];
-  var stateRef = null, members = [], currentCommand = 'follow';
-  var abilityTimers = {}, effectTimers = {};
-  var markedUntil = 0, driftBoostUntil = 0, deadeyeUntil = 0;
-  var combatTarget = null, shoutCooldown = 0, initialized = false;
-  function now() { return stateRef ? stateRef.time : 0; }
-  function findTemplate(name) {
-    if (!name) return null;
-    var key = String(name).trim().toLowerCase();
-    for (var i = 0; i < ROSTER.length; i++) {
-      var t = ROSTER[i];
-      if (t.id === key || t.name.toLowerCase() === key || t.nickname.toLowerCase() === key ||
-          t.role === key || t.ability === key || t.abilityName.toLowerCase() === key) return t;
-    }
-    return null;
+  members.push(m);
+  stateRef.crew = members;
+  recruitLog.push({ name: name, day: stateRef.day || 1, cost: def.cost });
+  toast(name + ' (' + def.role + ') bergabung! Ability: ' + def.ability + '.');
+  if (stateRef.flags) stateRef.flags['crew_' + name.toLowerCase()] = true;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// command(cmd) — perintah ke seluruh kru
+//   'follow' / 'ikut'  : ikuti pemain
+//   'attack' / 'serang': serang musuh terdekat
+//   'wait'   / 'tunggu': diam di tempat
+// ---------------------------------------------------------------------------
+
+function command(cmd){
+  var c = String(cmd || '').toLowerCase();
+  var norm = null;
+  if (c === 'follow' || c === 'ikut' || c === 'follow me') norm = 'follow';
+  else if (c === 'attack' || c === 'serang' || c === 'fight') norm = 'attack';
+  else if (c === 'wait' || c === 'tunggu' || c === 'hold' || c === 'stay') norm = 'wait';
+  if (!norm) return false;
+  order = norm;
+  for (var i = 0; i < members.length; i++) members[i].mode = norm;
+  if (stateRef && stateRef.flags) stateRef.flags.crewOrder = norm;
+  var label = norm === 'follow' ? 'Ikut aku!' : (norm === 'attack' ? 'Serang!' : 'Tunggu di sini.');
+  toast('Kru: ' + label);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// ability(name) — aktifkan ability anggota bernama `name`
+// ---------------------------------------------------------------------------
+
+function ability(name){
+  if (!stateRef) return false;
+  var m = findMember(name);
+  if (!m || !m.active) return false;
+  if (m.cooldown > 0) return false;
+  var p = stateRef.player;
+  var cd = ABILITY_COOLDOWN[m.ability] || 20;
+  m.cooldown = cd;
+
+  if (m.ability === 'Slipstream'){
+    if (stateRef.flags) stateRef.flags.slipstreamUntil = (stateRef.time || 0) + 20;
+    toast('Rico: Slipstream! Kendaraan +25% kecepatan 20 detik.');
+  } else if (m.ability === 'Blackout'){
+    if (stateRef.flags) stateRef.flags.blackoutUntil = (stateRef.time || 0) + 30;
+    stateRef.wanted = Math.max(0, (stateRef.wanted || 0) - 1);
+    if (window.SB.HUD && window.SB.HUD.setWanted) window.SB.HUD.setWanted(stateRef.wanted);
+    toast('Lena: Blackout! Kamera mati 30 detik, wanted -1.');
+  } else if (m.ability === 'Haymaker'){
+    if (stateRef.flags) stateRef.flags.haymakerUntil = (stateRef.time || 0) + 5;
+    toast('Marcus: Haymaker! Damage jarak dekat 3x selama 5 detik.');
+  } else if (m.ability === 'Field Dressing'){
+    p.hp = clamp((p.hp || 0) + 40, 0, 100);
+    toast('Tasha: Field Dressing! +40 HP.');
   }
-  function findMember(name) {
-    if (!name) return null;
-    var key = String(name).trim().toLowerCase();
-    for (var i = 0; i < members.length; i++) {
-      var m = members[i];
-      if (m.id === key || m.name.toLowerCase() === key ||
-          m.nickname.toLowerCase() === key || m.role === key) return m;
-    }
-    return null;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Perilaku anggota (dipanggil dari update)
+// ---------------------------------------------------------------------------
+
+function stepFollow(m, dt, p){
+  var d = dist2d(m.x, m.z, p.x, p.z);
+  if (d > TELEPORT_DIST){
+    m.x = p.x + 2; m.z = p.z + 2; m.y = 0;
+    return;
   }
-  function toast(text) { if (window.SB && SB.HUD && SB.HUD.showToast) SB.HUD.showToast(text); }
-  function sfx(name) { if (window.SB && SB.Audio && SB.Audio.sfx) SB.Audio.sfx(name); }
-  function spawnMember(t) {
-    var px = 0, pz = 0, angle = 0;
-    if (stateRef && stateRef.player) {
-      px = stateRef.player.x || 0; pz = stateRef.player.z || 0; angle = stateRef.player.angle || 0;
-    }
-    var off = FORMATION[members.length % FORMATION.length];
-    return { id: t.id, name: t.name, nickname: t.nickname, role: t.role,
-      skill: t.skill, skillLevel: t.skillLevel, ability: t.ability,
-      abilityName: t.abilityName, abilityDesc: t.abilityDesc, cooldown: t.cooldown,
-      color: t.color, x: px + off.dx, y: 0, z: pz + off.dz, angle: angle,
-      hp: 100, maxHp: 100, alive: true, following: true, inVehicle: false,
-      kills: 0, missionsWith: 0, racesWith: 0, cooldownLeft: 0, morale: 80, state: 'follow' };
-  }
-  function syncState() {
-    if (!stateRef) return;
-    stateRef.crew = members;
-    stateRef.flags = stateRef.flags || {};
-    stateRef.flags.crewCommand = currentCommand;
-    stateRef.flags.driftBoost = now() < driftBoostUntil;
-    stateRef.flags.deadeye = now() < deadeyeUntil;
-    stateRef.flags.eagleEye = now() < markedUntil;
-    stateRef.flags.crewPerks = crewPerks();
-  }
-  function applyFormationTarget(m, i, dt) {
-    if (!stateRef || !stateRef.player) return;
-    var p = stateRef.player, off = FORMATION[i % FORMATION.length];
-    var cos = Math.cos(p.angle || 0), sin = Math.sin(p.angle || 0);
-    var tx = p.x + off.dx * cos - off.dz * sin, tz = p.z + off.dx * sin + off.dz * cos;
-    var dx = tx - m.x, dz = tz - m.z, dist = Math.sqrt(dx * dx + dz * dz);
-    if (dist < 0.4) return;
-    var speed = dist > 8 ? 9.5 : 5.2;
-    if (currentCommand === 'attack') speed = 10.5;
-    var step = Math.min(dist, speed * dt);
-    m.x += (dx / dist) * step; m.z += (dz / dist) * step;
+  if (d > FOLLOW_DIST){
+    var speed = d > CATCHUP_DIST ? 9.0 : 5.0;
+    var dx = p.x - m.x, dz = p.z - m.z;
+    var len = Math.sqrt(dx * dx + dz * dz) || 1;
+    var step = Math.min(speed * dt, d - FOLLOW_DIST * 0.5);
+    m.x += (dx / len) * step;
+    m.z += (dz / len) * step;
     m.angle = Math.atan2(dx, dz);
-    m.state = dist > 8 ? 'running' : 'follow';
   }
-  function updateCombat(dt) {
-    if (currentCommand !== 'attack') { combatTarget = null; return; }
-    if (!stateRef || !stateRef.player) return;
-    var target = null, best = 26;
-    if (window.SB && SB.Police && SB.Police.cops) {
-      var cops = SB.Police.cops;
-      for (var i = 0; i < cops.length; i++) {
-        var dx = cops[i].x - stateRef.player.x, dz = cops[i].z - stateRef.player.z;
-        var d = Math.sqrt(dx * dx + dz * dz);
-        if (d < best) { best = d; target = cops[i]; }
-      }
-    }
-    combatTarget = target;
-    if (!target) return;
-    for (var j = 0; j < members.length; j++) {
-      var m = members[j];
-      if (!m.alive) continue;
-      var dmg = m.role === 'shooter' ? 22 : 8;
-      var hitChance = m.role === 'shooter' ? 0.55 : 0.25;
-      if (now() < deadeyeUntil) { dmg *= 1.25; hitChance += 0.40; }
-      if (Math.random() < hitChance * dt * 2) {
-        target.hp = (target.hp == null ? 100 : target.hp) - dmg;
-        if (target.hp <= 0 && !target.down) {
-          target.down = true; m.kills++;
-          if (stateRef.stats) stateRef.stats.kills++;
-          toast(m.name + ' took down a cop!');
-        }
-      }
+}
+
+function stepWait(m, dt){
+  // Diam di tempat; hanya sedikit menghadap arah pemain.
+  if (!stateRef) return;
+  var p = stateRef.player;
+  var dx = p.x - m.x, dz = p.z - m.z;
+  if (Math.abs(dx) + Math.abs(dz) > 0.01) m.angle = Math.atan2(dx, dz);
+}
+
+function stepAttack(m, dt){
+  // Cari "musuh" terdekat: polisi terdekat bila wanted > 0, atau titik
+  // panas terakhir. Tanpa modul police, kru bergerak ke arah depan pemain
+  // dan menyerang target dalam jangkauan.
+  var p = stateRef.player;
+  var target = null, best = COMBAT_RANGE;
+  if (window.SB.Police && window.SB.Police.cops){
+    var cops = window.SB.Police.cops;
+    for (var i = 0; i < cops.length; i++){
+      var d = dist2d(m.x, m.z, cops[i].x, cops[i].z);
+      if (d < best){ best = d; target = cops[i]; }
     }
   }
-  function updateCooldowns(dt) {
-    for (var i = 0; i < members.length; i++) {
-      var m = members[i];
-      if (m.cooldownLeft > 0) m.cooldownLeft = Math.max(0, m.cooldownLeft - dt);
+  if (target){
+    var dx = target.x - m.x, dz = target.z - m.z;
+    var len = Math.sqrt(dx * dx + dz * dz) || 1;
+    if (best > 2.0){
+      m.x += (dx / len) * 7.0 * dt;
+      m.z += (dz / len) * 7.0 * dt;
+    } else if (combatTimer <= 0){
+      target.hp = (target.hp || 50) - (m.role === 'Muscle' ? 25 : 12);
+      m.kills += 0; // kill dihitung saat target tumbang oleh police/npc
+      if (stateRef.flags) stateRef.flags.crewHit = (stateRef.flags.crewHit || 0) + 1;
     }
-    for (var k in abilityTimers) if (abilityTimers[k] > 0) abilityTimers[k] = Math.max(0, abilityTimers[k] - dt);
-    for (var k2 in effectTimers) if (effectTimers[k2] > 0) effectTimers[k2] = Math.max(0, effectTimers[k2] - dt);
-    if (shoutCooldown > 0) shoutCooldown -= dt;
-  }
-  function updateMorale(dt) {
-    for (var i = 0; i < members.length; i++) {
-      var m = members[i];
-      if (!m.alive) continue;
-      var target = 80;
-      if (stateRef && stateRef.wanted >= 3) target = 65;
-      if (stateRef && stateRef.stats && stateRef.stats.racesWon > 0) target = 88;
-      m.morale += (target - m.morale) * Math.min(1, dt * 0.05);
-      if (m.hp < 100) m.hp = Math.min(100, m.hp + dt * 2.0);
+    m.angle = Math.atan2(dx, dz);
+  } else {
+    // Tidak ada musuh: maju sedikit ke depan pemain (formasi serang).
+    var fx = Math.sin(p.angle || 0), fz = Math.cos(p.angle || 0);
+    var tx = p.x + fx * 6, tz = p.z + fz * 6;
+    var d2 = dist2d(m.x, m.z, tx, tz);
+    if (d2 > 1.5){
+      var ex = tx - m.x, ez = tz - m.z;
+      var l2 = Math.sqrt(ex * ex + ez * ez) || 1;
+      m.x += (ex / l2) * 6.0 * dt;
+      m.z += (ez / l2) * 6.0 * dt;
+      m.angle = Math.atan2(ex, ez);
     }
   }
-  function abilityDriftBoost() {
-    driftBoostUntil = now() + 10; effectTimers['drift-boost'] = 10;
-    toast('Rico: DRIFT BOOST! 10 detik gas pol!'); sfx('boost'); return true;
+}
+
+function applyPassives(dt){
+  if (!stateRef) return;
+  var p = stateRef.player;
+  var hasTasha = false, hasRico = false, hasMarcus = false, hasLena = false;
+  for (var i = 0; i < members.length; i++){
+    if (!members[i].active) continue;
+    if (members[i].name === 'Tasha') hasTasha = true;
+    if (members[i].name === 'Rico') hasRico = true;
+    if (members[i].name === 'Marcus') hasMarcus = true;
+    if (members[i].name === 'Lena') hasLena = true;
   }
-  function abilityDeadeye() {
-    deadeyeUntil = now() + 15; effectTimers['deadeye'] = 15;
-    toast('Maya: DEADEYE — akurasi +40% selama 15 detik!'); sfx('deadeye'); return true;
-  }
-  function abilityGhostSignal() {
-    if (!stateRef) return false;
-    if (stateRef.wanted <= 0) { toast('Dex: tidak ada wanted untuk dihapus.'); return false; }
-    stateRef.wanted = Math.max(0, stateRef.wanted - 1);
-    stateRef.heat = Math.max(0, (stateRef.heat || 0) - 30);
-    if (window.SB && SB.Police && SB.Police.setWanted) SB.Police.setWanted(stateRef.wanted);
-    if (window.SB && SB.HUD && SB.HUD.setWanted) SB.HUD.setWanted(stateRef.wanted);
-    toast('Dex: GHOST SIGNAL — wanted turun 1 bintang!'); sfx('hack'); return true;
-  }
-  function abilityEagleEye() {
-    markedUntil = now() + 30; effectTimers['eagle-eye'] = 30;
-    if (window.SB && SB.Police && SB.Police.cops) {
-      for (var i = 0; i < SB.Police.cops.length; i++) {
-        SB.Police.cops[i].marked = true; SB.Police.cops[i].markedUntil = markedUntil;
-      }
+  if (hasTasha){
+    healTimer += dt;
+    if (healTimer >= HEAL_TICK){
+      healTimer = 0;
+      p.hp = clamp((p.hp || 0) + 2, 0, 100);
     }
-    toast('Luna: EAGLE EYE — semua polisi ditandai di minimap 30 detik!'); sfx('ping'); return true;
   }
-  // Passive perks: each recruited member quietly helps the whole crew.
-  // Vehicles / Player read these through state.flags.crewPerks.
-  var PERKS = {
-    driver: { speedBonus: 0.05, desc: '+5% top speed mobil' },
-    shooter: { damageBonus: 0.10, desc: '+10% damage senjata' },
-    hacker: { heatDecay: 1.5, desc: 'Heat turun 1,5/detik lebih cepat' },
-    lookout: { policeRadius: 25, desc: 'Polisi terlihat 25m lebih jauh' }
-  };
-  function crewPerks() {
-    var perks = { speedBonus: 0, damageBonus: 0, heatDecay: 0, policeRadius: 0 };
-    for (var i = 0; i < members.length; i++) {
-      var perk = PERKS[members[i].role];
-      if (!perk) continue;
-      perks.speedBonus += perk.speedBonus || 0;
-      perks.damageBonus += perk.damageBonus || 0;
-      perks.heatDecay += perk.heatDecay || 0;
-      perks.policeRadius += perk.policeRadius || 0;
-    }
-    return perks;
+  if (stateRef.flags){
+    stateRef.flags.crewRicoActive = hasRico;
+    stateRef.flags.crewMarcusActive = hasMarcus;
+    stateRef.flags.crewLenaActive = hasLena;
+    stateRef.flags.crewTashaActive = hasTasha;
+    stateRef.flags.crewCount = members.length;
   }
-  function healMember(name, amount) {
-    var m = findMember(name);
-    if (!m || !m.alive) return false;
-    m.hp = Math.min(100, m.hp + (amount || 25));
-    return true;
+}
+
+// ---------------------------------------------------------------------------
+// update(dt, state)
+// ---------------------------------------------------------------------------
+
+function update(dt, state){
+  if (!state) return;
+  stateRef = state;
+  var p = state.player;
+  if (!p) return;
+
+  combatTimer -= dt;
+  for (var i = 0; i < members.length; i++){
+    var m = members[i];
+    if (!m.active) continue;
+    if (m.cooldown > 0) m.cooldown -= dt;
+    // Regenerasi HP anggota pelan-pelan saat tidak bertarung.
+    if (m.hp < m.maxHp && m.mode !== 'attack') m.hp = Math.min(m.maxHp, m.hp + 3 * dt);
+    if (m.mode === 'follow') stepFollow(m, dt, p);
+    else if (m.mode === 'wait') stepWait(m, dt);
+    else if (m.mode === 'attack') stepAttack(m, dt);
   }
-  function trainMember(name) {
-    // Missions and races slowly raise a member's skill (cap 99).
-    var m = findMember(name);
-    if (!m) return null;
-    m.skillLevel = Math.min(99, m.skillLevel + 1);
-    m.morale = Math.min(100, m.morale + 5);
-    return m.skillLevel;
-  }
-  window.SB.Crew = {
-    members: members,
-    roster: ROSTER,
-    commandName: function () { return currentCommand; },
-    isAbilityActive: function (id) {
-      if (id === 'drift-boost') return now() < driftBoostUntil;
-      if (id === 'deadeye') return now() < deadeyeUntil;
-      if (id === 'eagle-eye') return now() < markedUntil;
-      return (effectTimers[id] || 0) > 0;
-    },
-    init: function (state) {
-      stateRef = state || null;
-      members.length = 0; currentCommand = 'follow';
-      abilityTimers = {}; effectTimers = {};
-      markedUntil = 0; driftBoostUntil = 0; deadeyeUntil = 0;
-      combatTarget = null; shoutCooldown = 0; initialized = true;
-      if (stateRef) { stateRef.crew = members; stateRef.flags = stateRef.flags || {}; }
-      if (stateRef && Array.isArray(stateRef.crewSaved)) {
-        for (var i = 0; i < stateRef.crewSaved.length; i++) {
-          var t = findTemplate(stateRef.crewSaved[i]);
-          if (t && !findMember(t.id)) members.push(spawnMember(t));
-        }
-      }
-      syncState(); return members;
-    },
-    update: function (dt, state) {
-      if (!initialized) this.init(state);
-      if (state) stateRef = state;
-      if (!stateRef) return;
-      dt = Math.max(0, Math.min(dt || 0, 0.1));
-      updateCooldowns(dt); updateMorale(dt); updateCombat(dt);
-      for (var i = 0; i < members.length; i++) {
-        var m = members[i];
-        if (!m.alive) continue;
-        if (currentCommand === 'wait') { m.state = 'wait'; continue; }
-        if (currentCommand === 'hide') {
-          m.state = 'hide';
-          var px = stateRef.player ? stateRef.player.x : m.x;
-          var pz = stateRef.player ? stateRef.player.z : m.z;
-          var dx = px - m.x, dz = pz - m.z, d = Math.sqrt(dx * dx + dz * dz);
-          if (d > 1.2) { m.x += (dx / d) * Math.min(d, 3 * dt); m.z += (dz / d) * Math.min(d, 3 * dt); }
-          continue;
-        }
-        applyFormationTarget(m, i, dt);
-        if (currentCommand === 'attack' && combatTarget) m.state = 'attack';
-      }
-      if (shoutCooldown <= 0 && members.length > 0 && Math.random() < dt * 0.02) {
-        var shouts = ['Siap, bos!', 'Kita di belakangmu!', 'Sunset Bay milik kita!'];
-        toast(members[Math.floor(Math.random() * members.length)].name + ': ' +
-          shouts[Math.floor(Math.random() * shouts.length)]);
-        shoutCooldown = 25;
-      }
-      syncState();
-    },
-    recruit: function (name) {
-      if (!stateRef) return null;
-      var template = findTemplate(name);
-      if (!template) { toast('Tidak ada anggota crew bernama "' + name + '". Coba: Rico, Maya, Dex, Luna.'); return null; }
-      if (findMember(template.id)) { toast(template.name + ' sudah bergabung dengan crew.'); return findMember(template.id); }
-      if (members.length >= 4) { toast('Crew sudah penuh (maks 4 anggota).'); return null; }
-      if ((stateRef.respect || 0) < template.respectNeeded) {
-        toast(template.name + ' butuh respect ' + template.respectNeeded + ' (kamu: ' + (stateRef.respect || 0) + ').'); return null;
-      }
-      if ((stateRef.money || 0) < template.cost) {
-        toast('Rekrut ' + template.name + ' butuh $' + template.cost + ' (kamu: $' + (stateRef.money || 0) + ').'); return null;
-      }
-      stateRef.money -= template.cost;
-      var member = spawnMember(template);
-      members.push(member);
-      if (window.SB && SB.HUD && SB.HUD.setMoney) SB.HUD.setMoney(stateRef.money);
-      toast(template.name + ' "' + template.nickname + '" bergabung! (' + template.role + ' — ' + template.skill + ' ' + template.skillLevel + ')');
-      sfx('recruit'); syncState(); return member;
-    },
-    command: function (cmd) {
-      var key = String(cmd || '').trim().toLowerCase(), resolved = null;
-      for (var c in COMMANDS) if (COMMANDS[c].indexOf(key) >= 0 || c === key) { resolved = c; break; }
-      if (!resolved) { toast('Perintah tidak dikenal: "' + cmd + '". Pakai: ikut / serang / tunggu / bersembunyi.'); return currentCommand; }
-      currentCommand = resolved;
-      var labels = { follow: 'Ikut aku!', attack: 'Serang!', wait: 'Tunggu di sini.', hide: 'Bersembunyi, jangan kelihatan.' };
-      toast('Crew: ' + labels[resolved]); sfx('order'); syncState(); return currentCommand;
-    },
-    ability: function (name) {
-      var member = findMember(name);
-      if (!member) {
-        var template = findTemplate(name);
-        if (template && !findMember(template.id)) { toast(template.name + ' belum direkrut. Rekrut dulu lewat SB.Crew.recruit("' + template.name + '").'); return false; }
-        toast('Ability tidak dikenal: "' + name + '".'); return false;
-      }
-      if (!member.alive) { toast(member.name + ' sedang down, tidak bisa memakai ability.'); return false; }
-      if (member.cooldownLeft > 0) { toast(member.abilityName + ' cooldown ' + Math.ceil(member.cooldownLeft) + ' detik lagi.'); return false; }
-      var ok = false;
-      if (member.ability === 'drift-boost') ok = abilityDriftBoost();
-      else if (member.ability === 'deadeye') ok = abilityDeadeye();
-      else if (member.ability === 'ghost-signal') ok = abilityGhostSignal();
-      else if (member.ability === 'eagle-eye') ok = abilityEagleEye();
-      if (ok) { member.cooldownLeft = member.cooldown; abilityTimers[member.ability] = member.cooldown; }
-      syncState(); return ok;
-    },
-    dismiss: function (name) {
-      var m = findMember(name);
-      if (!m) return false;
-      members.splice(members.indexOf(m), 1);
-      toast(m.name + ' keluar dari crew.'); syncState(); return true;
-    },
-    reviveAll: function () {
-      for (var i = 0; i < members.length; i++) { members[i].alive = true; members[i].hp = 100; }
-      syncState();
-    },
-    onMissionStart: function () { for (var i = 0; i < members.length; i++) members[i].missionsWith++; syncState(); },
-    onRaceStart: function () { for (var i = 0; i < members.length; i++) members[i].racesWith++; syncState(); },
-    count: function () { return members.length; },
-    perks: function () { return crewPerks(); },
-    heal: function (name, amount) { var ok = healMember(name, amount); syncState(); return ok; },
-    train: function (name) { var lvl = trainMember(name); syncState(); return lvl; }
-  };
+  applyPassives(dt);
+  state.crew = members;
+}
+
+// ---------------------------------------------------------------------------
+// API publik
+// ---------------------------------------------------------------------------
+
+window.SB.Crew = {
+  init: init,
+  update: update,
+  recruit: recruit,
+  command: command,
+  members: members,
+  ability: ability,
+  roster: ROSTER,
+  order: function(){ return order; },
+  count: function(){ return members.length; }
+};
+
 })();

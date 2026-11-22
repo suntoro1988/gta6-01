@@ -1,427 +1,332 @@
 window.SB = window.SB || {};
-(function () {
-  'use strict';
+(function(){ 'use strict';
 
   // ---------------------------------------------------------------------------
-  // SB.FX — sistem partikel pooled (TANPA alokasi per-frame) + efek dunia.
-  // Sunset Bay v12. Ditulis dari nol dari design spec; tidak membaca modul lain.
-  // Pool tetap: MAX partikel dialokasikan sekali di init, lalu dipakai ulang.
-  // Semua akses ke modul lain dijaga guard (SB.GL / SB.Math3 / SB.Meshes /
-  // SB.Weather / SB.Water).
+  // SB.FX — efek partikel Sunset Bay (v13, fresh).
+  // Ledakan, asap, api, percikan, partikel atmosfer (debu/kunang/ember),
+  // wake perahu, ombak, dan cipratan hujan.
+  //
+  // ATURAN ARRAY (pelajaran v12): array partikel TIDAK PERNAH diganti dengan
+  // array baru setelah init. init() memakai kembali array yang sama bila
+  // sudah ada (hanya dikosongkan), dan update() menghapus partikel mati
+  // secara in-place (swap-remove). Referensi SB.FX.particles selalu valid.
   // ---------------------------------------------------------------------------
 
-  var MAX = 512;              // ukuran pool partikel
-  var MAX_RINGS = 24;         // shockwave ring (ledakan)
-  var MAX_EMITTERS = 32;      // emitter kontinu (api, asap knalpot, rokok)
+  var MAX_PARTICLES = 600;      // batas keras — buang yang tertua bila penuh
+  var MAX_WAKES = 40;           // jejak wake perahu
+  var MAX_WAVES = 24;           // puncak ombak di pantai
 
-  // Tipe partikel.
-  var T_FLAME = 0, T_SMOKE = 1, T_SPARK = 2, T_DEBRIS = 3,
-      T_DUST = 4, T_SPLASH = 5, T_EMBER = 6, T_FOAM = 7;
+  var _state = null;
+  var _t = 0;
+  var _unitMesh = null;         // mesh kubus kecil (dibuat malas via SB.Meshes)
+  var _ambientTimer = 0;        // penghitung spawn partikel atmosfer
+  var _rainSplashTimer = 0;     // penghitung cipratan hujan
 
-  var stateRef = null;
-  var particles = [];         // pool — diekspos sebagai SB.FX.particles
-  var cursor = 0;             // ring cursor untuk reuse slot
-  var rings = [];             // shockwave
-  var emitters = [];          // emitter kontinu
-  var unitMesh = null;        // mesh kotak satuan (dibuat sekali di init)
-  var quadMesh = null;        // mesh bidang datar (asap/percik)
-  var tmpColor = [1, 1, 1];
-  var tmpMat = null;
-  var timeNow = 0;
+  // Tipe partikel: 'fire' | 'smoke' | 'spark' | 'ember' | 'dust' |
+  // 'splash' | 'wake' | 'foam' | 'debris' | 'mote'.
+  // Satu partikel: {x,y,z, vx,vy,vz, life,maxLife, size, r,g,b, a,
+  //                type, grav, drag, grow, spin}
+  var particles = [];
 
-  // -- util lokal -------------------------------------------------------------
-  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
-  function lerp(a, b, t) { return a + (b - a) * t; }
-  function rand(a, b) { return a + Math.random() * (b - a); }
+  // Jejak wake: {x, z, life, maxLife, size, strength}
+  var wakes = [];
+  // Puncak ombak: {x, z, phase, speed, size}
+  var waves = [];
 
-  // Ambil slot partikel berikutnya (ring buffer — tidak pernah alokasi baru).
-  function alloc() {
-    for (var i = 0; i < MAX; i++) {
-      cursor = (cursor + 1) % MAX;
-      if (particles[cursor].life <= 0) return particles[cursor];
+  // -- util lokal ------------------------------------------------------------
+  function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, t){ return a + (b - a) * t; }
+  function rand(a, b){ return a + Math.random() * (b - a); }
+
+  // Tambah satu partikel. Bila penuh, timpa partikel tertua (index 0).
+  // TIDAK PERNAH mengganti array `particles` — hanya push / tulis ulang slot.
+  function spawn(p){
+    if (particles.length >= MAX_PARTICLES){
+      particles[0] = p;         // daur ulang slot tertua, array tetap sama
+      return p;
     }
-    // Pool penuh: timpa slot tertua (cursor saat ini).
-    cursor = (cursor + 1) % MAX;
-    return particles[cursor];
-  }
-
-  // Spawn satu partikel ke pool. Semua field ditulis ulang (tidak ada objek baru).
-  function spawn(type, x, y, z, vx, vy, vz, life, size, r, g, b, grav, drag) {
-    var p = alloc();
-    p.type = type;
-    p.x = x; p.y = y; p.z = z;
-    p.vx = vx; p.vy = vy; p.vz = vz;
-    p.life = life;
-    p.maxLife = life;
-    p.size = size;
-    p.r = r; p.g = g; p.b = b;
-    p.grav = grav;
-    p.drag = drag;
-    p.spin = rand(-3, 3);
-    p.rot = rand(0, Math.PI * 2);
-    p.grow = 0;
+    particles.push(p);
     return p;
   }
 
-  // Semburan radial: n partikel menyebar dari titik dengan kecepatan acak.
-  function burst(type, x, y, z, n, speed, up, life, size, r, g, b, grav, drag, grow) {
-    for (var i = 0; i < n; i++) {
-      var a = rand(0, Math.PI * 2);
-      var el = rand(-0.4, 1);
-      var s = speed * rand(0.3, 1);
-      var p = spawn(type, x + rand(-0.3, 0.3), y + rand(-0.2, 0.4), z + rand(-0.3, 0.3),
-        Math.cos(a) * s, up + el * s * 0.6, Math.sin(a) * s,
-        life * rand(0.6, 1.3), size * rand(0.7, 1.4), r, g, b, grav, drag);
-      p.grow = grow || 0;
-    }
+  function makeParticle(type, x, y, z, vx, vy, vz, life, size, r, g, b, grav, drag, grow){
+    return {
+      x: x, y: y, z: z,
+      vx: vx, vy: vy, vz: vz,
+      life: life, maxLife: life,
+      size: size, r: r, g: g, b: b, a: 1,
+      type: type,
+      grav: (typeof grav === 'number' ? grav : 0),
+      drag: (typeof drag === 'number' ? drag : 0),
+      grow: (typeof grow === 'number' ? grow : 0),
+      spin: rand(0, Math.PI * 2)
+    };
   }
 
-  // -- API wajib --------------------------------------------------------------
+  // -- API -------------------------------------------------------------------
 
-  function init(state) {
-    stateRef = state || null;
-    timeNow = 0;
-    cursor = 0;
-
-    // Pool dialokasikan SEKALI — objek partikel tidak pernah dibuat lagi.
-    // JANGAN reassign (particles = []) — SB.FX.particles menunjuk array
-    // asli yang diekspor saat modul dimuat; reassign membuat ekspor basi
-    // (length 0 selamanya) dan ledakan/asap tidak pernah terlihat.
+  function init(state){
+    _state = state || null;
+    _t = 0;
+    _ambientTimer = 0;
+    _rainSplashTimer = 0;
+    // PENTING: kelola array yang sama — jangan `particles = []`.
     particles.length = 0;
-    for (var i = 0; i < MAX; i++) {
-      particles.push({
-        type: T_SMOKE, x: 0, y: -999, z: 0, vx: 0, vy: 0, vz: 0,
-        life: 0, maxLife: 1, size: 1, r: 1, g: 1, b: 1,
-        grav: 0, drag: 0, spin: 0, rot: 0, grow: 0
+    wakes.length = 0;
+    waves.length = 0;
+    _unitMesh = null;
+    // Ombak pantai: deretan puncak di garis pantai (z ~ -170).
+    for (var i = 0; i < MAX_WAVES; i++){
+      waves.push({
+        x: -260 + i * 22 + rand(-6, 6),
+        z: -170 + rand(-14, 14),
+        phase: rand(0, Math.PI * 2),
+        speed: rand(0.5, 1.1),
+        size: rand(2.5, 6)
       });
     }
-    rings.length = 0;
-    for (var j = 0; j < MAX_RINGS; j++) {
-      rings.push({ x: 0, y: -999, z: 0, radius: 0, maxRadius: 10, life: 0, maxLife: 1, r: 1, g: 0.8, b: 0.4 });
-    }
-    emitters.length = 0;
-    for (var k = 0; k < MAX_EMITTERS; k++) {
-      emitters.push({ active: false, kind: '', x: 0, y: 0, z: 0, rate: 0, acc: 0, life: 0, maxLife: 0 });
-    }
-
-    // Mesh render sekali; guard bila modul belum termuat.
-    if (window.SB && SB.Meshes) {
-      if (SB.Meshes.box && !unitMesh) unitMesh = SB.Meshes.box(1, 1, 1);
-      if (SB.Meshes.plane && !quadMesh) quadMesh = SB.Meshes.plane(1, 1);
-    }
-    if (!unitMesh) {
-      // Fallback kotak satuan inline (vertices/normals/indices, CCW).
-      unitMesh = {
-        vertices: [-0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5, -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5],
-        normals: [0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1],
-        indices: [0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6]
-      };
-    }
-    if (!quadMesh) {
-      quadMesh = {
-        vertices: [-0.5, 0, -0.5, 0.5, 0, -0.5, 0.5, 0, 0.5, -0.5, 0, 0.5],
-        normals: [0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0],
-        indices: [0, 1, 2, 0, 2, 3]
-      };
-    }
+    return true;
   }
 
-  function update(dt, state) {
-    if (state) stateRef = state;
-    dt = Math.min(dt || 0.016, 0.05);
-    timeNow += dt;
-
-    // Angin dari Weather (guard) — pengaruhi asap, debu, percikan ringan.
-    var wx = 0, wz = 0, wind = 0.2;
-    if (window.SB && SB.Weather && SB.Weather.windVector) {
-      var wv = SB.Weather.windVector();
-      if (wv) { wx = wv.x; wz = wv.z; wind = wv.strength || 0.2; }
-    } else if (stateRef && stateRef.weather) {
-      wind = stateRef.weather.wind || 0.2;
-      wx = Math.cos(0.6) * wind; wz = Math.sin(0.6) * wind;
+  // Ledakan: bola api + asap tebal + percikan + puing.
+  function explosion(x, y, z){
+    var i;
+    for (i = 0; i < 26; i++){
+      var a = rand(0, Math.PI * 2), e = rand(-0.4, 1);
+      var sp = rand(4, 14);
+      spawn(makeParticle('fire', x, y, z,
+        Math.cos(a) * sp, e * sp * 0.7 + 3, Math.sin(a) * sp,
+        rand(0.4, 0.9), rand(1.2, 2.6), 1.0, rand(0.45, 0.75), 0.10,
+        -6, 1.2, 1.5));
     }
-    var rain = (stateRef && stateRef.weather) ? (stateRef.weather.rain || 0) : 0;
+    for (i = 0; i < 14; i++){
+      spawn(makeParticle('smoke', x + rand(-1, 1), y + rand(0, 2), z + rand(-1, 1),
+        rand(-1.5, 1.5), rand(2, 5), rand(-1.5, 1.5),
+        rand(1.6, 3.2), rand(2.0, 3.5), 0.16, 0.16, 0.18,
+        1.5, 0.6, 2.2));
+    }
+    for (i = 0; i < 30; i++){
+      a = rand(0, Math.PI * 2); e = rand(0, 1);
+      sp = rand(10, 26);
+      spawn(makeParticle('spark', x, y + 0.5, z,
+        Math.cos(a) * sp, e * sp, Math.sin(a) * sp,
+        rand(0.3, 0.8), rand(0.12, 0.3), 1.0, rand(0.7, 0.9), 0.25,
+        -18, 0.4, 0));
+    }
+    for (i = 0; i < 8; i++){
+      spawn(makeParticle('debris', x, y + 1, z,
+        rand(-9, 9), rand(6, 14), rand(-9, 9),
+        rand(0.8, 1.6), rand(0.3, 0.7), 0.25, 0.22, 0.20,
+        -22, 0.2, 0));
+    }
+    return true;
+  }
 
-    // -- Integrasi partikel (tanpa alokasi).
-    for (var i = 0; i < MAX; i++) {
+  // Asap: gumpalan naik pelan, membesar, memudar.
+  function smoke(x, y, z){
+    for (var i = 0; i < 6; i++){
+      spawn(makeParticle('smoke', x + rand(-0.6, 0.6), y + rand(0, 0.8), z + rand(-0.6, 0.6),
+        rand(-0.6, 0.6), rand(1.2, 2.4), rand(-0.6, 0.6),
+        rand(1.8, 3.4), rand(1.2, 2.2), 0.20, 0.20, 0.22,
+        0.8, 0.5, 1.8));
+    }
+    return true;
+  }
+
+  // Api: lidah api naik cepat, oranye -> merah, hidup singkat.
+  function fire(x, y, z){
+    for (var i = 0; i < 8; i++){
+      spawn(makeParticle('fire', x + rand(-0.7, 0.7), y + rand(0, 0.6), z + rand(-0.7, 0.7),
+        rand(-0.8, 0.8), rand(2.5, 5), rand(-0.8, 0.8),
+        rand(0.35, 0.8), rand(0.9, 1.8), 1.0, rand(0.35, 0.6), 0.08,
+        2, 1.0, 1.2));
+    }
+    return true;
+  }
+
+  // Percikan: titik terang cepat, gravitasi kuat, memantul di tanah (y=0).
+  function sparks(x, y, z){
+    for (var i = 0; i < 16; i++){
+      var a = rand(0, Math.PI * 2);
+      var sp = rand(4, 14);
+      spawn(makeParticle('spark', x, y, z,
+        Math.cos(a) * sp, rand(2, 9), Math.sin(a) * sp,
+        rand(0.25, 0.7), rand(0.1, 0.25), 1.0, rand(0.75, 0.95), 0.3,
+        -20, 0.3, 0));
+    }
+    return true;
+  }
+
+  // Wake perahu: jejak buih di permukaan air (dipanggil SB.Water / game).
+  function wake(x, z){
+    if (wakes.length >= MAX_WAKES) wakes.shift();
+    wakes.push({ x: x, z: z, life: 2.2, maxLife: 2.2, size: 1.6, strength: 1 });
+    // Buih putih kecil di sekitar wake.
+    for (var i = 0; i < 3; i++){
+      spawn(makeParticle('foam', x + rand(-1.2, 1.2), 0.15, z + rand(-1.2, 1.2),
+        rand(-0.5, 0.5), rand(0.1, 0.4), rand(-0.5, 0.5),
+        rand(0.6, 1.2), rand(0.4, 0.9), 0.95, 0.97, 1.0,
+        0, 1.5, 1.0));
+    }
+    return true;
+  }
+
+  // Ombak: dorong satu puncak ombak (untuk pantai / tabrakan perahu).
+  function splash(x, y, z, strength){
+    var n = Math.round(clamp(strength || 1, 0.2, 3) * 10);
+    for (var i = 0; i < n; i++){
+      var a = rand(0, Math.PI * 2);
+      var sp = rand(1, 4) * (strength || 1);
+      spawn(makeParticle('splash', x + rand(-0.5, 0.5), y, z + rand(-0.5, 0.5),
+        Math.cos(a) * sp, rand(2, 6), Math.sin(a) * sp,
+        rand(0.4, 0.9), rand(0.3, 0.7), 0.85, 0.92, 1.0,
+        -14, 0.6, 0));
+    }
+    return true;
+  }
+
+  function update(dt, state){
+    if (state) _state = state;
+    dt = Math.min(typeof dt === 'number' ? dt : 0.016, 0.1);
+    _t += dt;
+
+    var w = _state && _state.weather ? _state.weather : null;
+    var wind = w ? (w.wind || 0) : 0.2;
+    var windDir = w ? (w.windDir || 0) : 0;
+    var rain = w ? (w.rain || 0) : 0;
+    var night = w ? !!w.isNight : false;
+    var px = _state && _state.player ? _state.player.x : 0;
+    var pz = _state && _state.player ? _state.player.z : 0;
+
+    // 1) Partikel: integrasi in-place, hapus mati dengan swap-remove.
+    //    Array `particles` TIDAK PERNAH diganti — hanya isinya yang berubah.
+    var i = 0;
+    while (i < particles.length){
       var p = particles[i];
-      if (p.life <= 0) continue;
       p.life -= dt;
-      if (p.life <= 0) { p.y = -999; continue; }
-      var age = 1 - p.life / p.maxLife; // 0 lahir -> 1 mati
-
-      // Seret udara + gravitasi per tipe.
-      var dragF = 1 - p.drag * dt;
-      p.vx *= dragF; p.vz *= dragF;
-      p.vy = p.vy * (1 - p.drag * dt * 0.5) - p.grav * dt;
-
-      // Angin mendorong asap/debu/percikan; api hampir tidak terpengaruh.
-      var windK = (p.type === T_SMOKE || p.type === T_DUST) ? 1.0
-        : (p.type === T_SPARK || p.type === T_EMBER) ? 0.25 : 0.08;
-      p.vx += wx * windK * dt * 3;
-      p.vz += wz * windK * dt * 3;
-
+      if (p.life <= 0){
+        particles[i] = particles[particles.length - 1];
+        particles.pop();
+        continue;
+      }
+      var k = 1 - Math.min(1, p.drag * dt);
+      p.vx = p.vx * k + Math.cos(windDir) * wind * dt * 2;
+      p.vz = p.vz * k + Math.sin(windDir) * wind * dt * 2;
+      p.vy += p.grav * dt;
       p.x += p.vx * dt;
       p.y += p.vy * dt;
       p.z += p.vz * dt;
-      p.rot += p.spin * dt;
-
-      // Lantai: serpihan memantul sekali lalu diam; percikan mati di tanah.
-      if (p.y < 0.05) {
-        if (p.type === T_DEBRIS) {
-          p.y = 0.05;
-          p.vy = Math.abs(p.vy) * 0.25;
-          p.vx *= 0.6; p.vz *= 0.6;
-          if (Math.abs(p.vy) < 0.4) { p.vy = 0; p.vx = 0; p.vz = 0; p.grav = 0; }
-        } else if (p.type === T_SPARK || p.type === T_EMBER) {
-          p.life = Math.min(p.life, 0.05);
-          p.y = 0.05;
-        } else if (p.type === T_SPLASH || p.type === T_FOAM) {
-          p.life = Math.min(p.life, 0.1);
-          p.y = 0.05;
-        } else {
-          p.y = 0.05;
-          p.vy = Math.max(0, p.vy);
-        }
+      p.size += p.grow * dt;
+      p.spin += dt * 2;
+      // Percikan & puing memantul sekali di tanah.
+      if ((p.type === 'spark' || p.type === 'debris') && p.y < 0.05 && p.vy < 0){
+        p.y = 0.05;
+        p.vy = -p.vy * 0.35;
+        p.vx *= 0.6; p.vz *= 0.6;
       }
-
-      // Api mengecil, asap membesar & memudar; hujan memadamkan api/ember.
-      if (p.type === T_FLAME) {
-        p.size = Math.max(0.05, p.size * (1 - dt * 1.6));
-        if (rain > 0.3) p.life -= dt * 2;
-      } else if (p.type === T_SMOKE) {
-        p.size += p.grow * dt;
-        p.vy += 0.35 * dt; // asap naik
-      } else if (p.type === T_DUST) {
-        p.size += p.grow * dt * 0.6;
+      if (p.y < -0.5){ p.life = 0; continue; }
+      // Alpha memudar di akhir hidup; api berubah oranye -> merah gelap.
+      var frac = p.life / p.maxLife;
+      p.a = frac < 0.4 ? frac / 0.4 : 1;
+      if (p.type === 'fire'){
+        p.r = 1.0;
+        p.g = 0.15 + 0.55 * frac;
+        p.b = 0.05 + 0.10 * frac;
       }
-      void age;
+      if (p.type === 'smoke') p.a = 0.55 * (1 - frac * 0.6);
+      i++;
     }
 
-    // -- Shockwave ring membesar & memudar.
-    for (var r = 0; r < MAX_RINGS; r++) {
-      var ring = rings[r];
-      if (ring.life <= 0) continue;
-      ring.life -= dt;
-      var t = 1 - Math.max(0, ring.life) / ring.maxLife;
-      ring.radius = ring.maxRadius * (t * t * (3 - 2 * t));
-      if (ring.life <= 0) ring.y = -999;
+    // 2) Wake: memudar & membesar pelan.
+    for (i = wakes.length - 1; i >= 0; i--){
+      var wk = wakes[i];
+      wk.life -= dt;
+      wk.size += dt * 1.4;
+      wk.strength = Math.max(0, wk.life / wk.maxLife);
+      if (wk.life <= 0) wakes.splice(i, 1);
     }
 
-    // -- Emitter kontinu: api kebakaran, asap knalpot, asap rokok NPC.
-    for (var e = 0; e < MAX_EMITTERS; e++) {
-      var em = emitters[e];
-      if (!em.active) continue;
-      em.life -= dt;
-      if (em.life <= 0) { em.active = false; continue; }
-      em.acc += dt * em.rate;
-      while (em.acc >= 1) {
-        em.acc -= 1;
-        if (em.kind === 'fire') {
-          spawn(T_FLAME, em.x + rand(-0.4, 0.4), em.y, em.z + rand(-0.4, 0.4),
-            rand(-0.3, 0.3), rand(1.2, 2.6), rand(-0.3, 0.3),
-            rand(0.4, 0.9), rand(0.5, 1.0), 1.0, rand(0.45, 0.65), 0.12, -1.5, 0.6);
-          if (Math.random() < 0.4) {
-            spawn(T_EMBER, em.x, em.y + 0.3, em.z, rand(-0.8, 0.8), rand(2, 4), rand(-0.8, 0.8),
-              rand(0.6, 1.4), 0.12, 1.0, 0.55, 0.15, 3.5, 0.4);
-          }
-          if (Math.random() < 0.5) {
-            spawn(T_SMOKE, em.x, em.y + 0.8, em.z, rand(-0.2, 0.2), rand(0.8, 1.4), rand(-0.2, 0.2),
-              rand(1.5, 2.5), 0.8, 0.16, 0.15, 0.15, -0.4, 0.8);
-            particles[cursor].grow = 1.2;
-          }
-        } else if (em.kind === 'exhaust') {
-          spawn(T_SMOKE, em.x, em.y, em.z, rand(-0.2, 0.2) - wx, rand(0.4, 0.8), rand(-0.2, 0.2) - wz,
-            rand(0.7, 1.3), 0.35, 0.32, 0.32, 0.34, -0.3, 1.2);
-          particles[cursor].grow = 0.9;
-        } else if (em.kind === 'cigarette') {
-          spawn(T_SMOKE, em.x, em.y, em.z, rand(-0.05, 0.05), rand(0.25, 0.45), rand(-0.05, 0.05),
-            rand(1.2, 2.0), 0.12, 0.75, 0.75, 0.78, -0.15, 0.4);
-          particles[cursor].grow = 0.35;
-        }
+    // 3) Ombak: puncak bergerak ke pantai, fase berjalan.
+    for (i = 0; i < waves.length; i++){
+      var wv = waves[i];
+      wv.phase += dt * wv.speed;
+      wv.x += Math.sin(wv.phase * 0.5) * dt * 0.6;
+    }
+
+    // 4) Partikel atmosfer di sekitar pemain (selalu ada, murah).
+    _ambientTimer -= dt;
+    if (_ambientTimer <= 0){
+      _ambientTimer = night ? 0.25 : 0.4;
+      if (night){
+        // Kunang-kunang / ember melayang di malam hari (hangat, pelan).
+        spawn(makeParticle('mote', px + rand(-14, 14), rand(0.5, 4), pz + rand(-14, 14),
+          rand(-0.3, 0.3), rand(0.1, 0.5), rand(-0.3, 0.3),
+          rand(2, 4), rand(0.12, 0.25), 1.0, rand(0.7, 0.85), 0.3,
+          0.2, 0.2, 0));
+      } else {
+        // Debu beterbangan di udara golden hour / siang.
+        spawn(makeParticle('dust', px + rand(-12, 12), rand(0.5, 5), pz + rand(-12, 12),
+          rand(-0.4, 0.4), rand(-0.1, 0.2), rand(-0.4, 0.4),
+          rand(2, 4), rand(0.1, 0.22), 0.95, 0.85, 0.65,
+          -0.1, 0.3, 0));
+      }
+    }
+
+    // 5) Cipratan hujan di sekitar pemain bila sedang hujan.
+    if (rain > 0.15){
+      _rainSplashTimer -= dt;
+      if (_rainSplashTimer <= 0){
+        _rainSplashTimer = 0.12 / rain;
+        spawn(makeParticle('splash', px + rand(-10, 10), 0.1, pz + rand(-10, 10),
+          rand(-0.4, 0.4), rand(1.5, 3), rand(-0.4, 0.4),
+          rand(0.25, 0.5), rand(0.15, 0.35), 0.85, 0.92, 1.0,
+          -12, 0.4, 0));
       }
     }
   }
 
-  function draw(gl, state) {
-    if (state) stateRef = state;
-    if (!gl || !gl.drawMesh) return;
-    if (!window.SB || !SB.Math3) return;
-    var M = SB.Math3;
-    if (!tmpMat) tmpMat = M.mat4Identity();
-
-    // Gambar partikel hidup sebagai kotak satuan yang diskala + diwarnai.
-    // Api & percikan: kotak kecil terang. Asap/debu: bidang datar redup.
-    for (var i = 0; i < MAX; i++) {
-      var p = particles[i];
-      if (p.life <= 0) continue;
-      var fade = p.life / p.maxLife;
-      var s = p.size * (p.type === T_SMOKE || p.type === T_DUST ? (1.6 - fade * 0.6) : 1);
+  function draw(gl, state){
+    if (state) _state = state;
+    if (!gl || typeof gl.drawMesh !== 'function') return;
+    // Mesh kubus kecil — dibuat malas dari SB.Meshes bila tersedia.
+    if (!_unitMesh){
+      if (window.SB.Meshes && typeof window.SB.Meshes.box === 'function'){
+        try { _unitMesh = window.SB.Meshes.box(1, 1, 1); } catch (e){ _unitMesh = null; }
+      }
+      if (!_unitMesh) return;
+    }
+    var i, p;
+    var M = window.SB.Math3;
+    if (!M) return;
+    // Partikel: gambar sebagai kubus kecil berwarna di posisinya.
+    // Ukuran partikel diwakili lewat alpha + warna (shader titik);
+    // matriks hanya membawa posisi agar drawMesh tetap generik.
+    for (i = 0; i < particles.length; i++){
+      p = particles[i];
+      if (p.a <= 0.02) continue;
       var m = M.mat4Identity();
       m = M.mat4Translate(m, p.x, p.y, p.z);
-      if (p.type === T_SMOKE || p.type === T_DUST || p.type === T_FOAM) {
-        m = M.mat4RotateY(m, p.rot);
-      }
-      // Skala via translate matriks: pakai mat4 skala manual (kolom diagonal).
-      m[0] *= s; m[5] *= s; m[10] *= s;
-      var a = 1;
-      // Api/percikan/bara adalah SUMBER CAHAYA: warnanya di-boost agar tetap
-      // terlihat di malam hari. drawMesh memakai shader 'lit' yang mengalikan
-      // tint dengan pencahayaan scene — di malam hari ambient ~0.12 sehingga
-      // api berwarna (1.0, 0.85, 0.10) jatuh ke ~0.1 dan tidak terlihat sama
-      // sekali (dua take 4-end 21:30/19:45 tanpa ledakan yang kelihatan).
-      // Boost x4 membuat api tetap oranye terang di malam hari; di siang hari
-      // ia ter-clamp jadi putih panas (wajar untuk api). Asap/debu tetap redup.
-      if (p.type === T_FLAME) { tmpColor[0] = 4.0; tmpColor[1] = 4.0 * lerp(0.25, 0.85, fade); tmpColor[2] = 0.40 * fade; }
-      else if (p.type === T_SMOKE) { var g = 0.14 + 0.10 * fade; tmpColor[0] = g; tmpColor[1] = g; tmpColor[2] = g + 0.02; a = 0.55 * fade + 0.15; }
-      else if (p.type === T_SPARK || p.type === T_EMBER) { tmpColor[0] = 3.0; tmpColor[1] = 3.0 * lerp(0.3, 0.8, fade); tmpColor[2] = 0.36; }
-      else if (p.type === T_DUST) { tmpColor[0] = 0.72; tmpColor[1] = 0.62; tmpColor[2] = 0.48; a = 0.4 * fade + 0.1; }
-      else if (p.type === T_SPLASH || p.type === T_FOAM) { tmpColor[0] = 0.75; tmpColor[1] = 0.88; tmpColor[2] = 0.95; a = 0.7 * fade + 0.2; }
-      else { tmpColor[0] = p.r; tmpColor[1] = p.g; tmpColor[2] = p.b; } // debris: warna asli
-      void a;
-      var mesh = (p.type === T_SMOKE || p.type === T_DUST || p.type === T_FOAM) ? quadMesh : unitMesh;
-      gl.drawMesh(mesh, m, tmpColor);
+      gl.drawMesh(_unitMesh, m, [p.r, p.g, p.b, p.a]);
     }
-
-    // Shockwave: cincin datar membesar (kotak pipih).
-    for (var r = 0; r < MAX_RINGS; r++) {
-      var ring = rings[r];
-      if (ring.life <= 0) continue;
-      var f = ring.life / ring.maxLife;
-      var rm = M.mat4Identity();
-      rm = M.mat4Translate(rm, ring.x, ring.y + 0.15, ring.z);
-      var rs = Math.max(0.1, ring.radius);
-      rm[0] *= rs; rm[5] *= 0.12; rm[10] *= rs;
-      tmpColor[0] = ring.r * f + 0.4 * (1 - f);
-      tmpColor[1] = ring.g * f + 0.3 * (1 - f);
-      tmpColor[2] = ring.b * f;
-      gl.drawMesh(quadMesh, rm, tmpColor);
+    // Wake: buih datar di permukaan air.
+    for (i = 0; i < wakes.length; i++){
+      var wk = wakes[i];
+      if (wk.strength <= 0.02) continue;
+      var wm = M ? M.mat4Identity() : null;
+      if (!wm) break;
+      wm = M.mat4Translate(wm, wk.x, 0.12, wk.z);
+      gl.drawMesh(_unitMesh, wm, [0.95, 0.97, 1.0, wk.strength * 0.5]);
     }
-  }
-
-  // -- Efek sekali jalan ------------------------------------------------------
-
-  // Ledakan: bola api + asap tebal + serpihan beterbangan + shockwave.
-  function explosion(x, y, z) {
-    burst(T_FLAME, x, y + 0.5, z, 14, 4.5, 2.5, 0.7, 1.1, 1.0, 0.55, 0.15, -1.2, 0.8);
-    burst(T_SMOKE, x, y + 1.2, z, 12, 1.6, 2.2, 2.6, 1.2, 0.15, 0.14, 0.14, -0.5, 0.9, 1.4);
-    burst(T_DEBRIS, x, y + 0.6, z, 16, 9, 5.5, 1.6, 0.28, 0.35, 0.30, 0.28, 14, 0.4);
-    burst(T_SPARK, x, y + 0.5, z, 18, 11, 4, 0.9, 0.14, 1.0, 0.7, 0.2, 9, 0.3);
-    burst(T_EMBER, x, y + 0.8, z, 8, 3, 3.5, 1.8, 0.12, 1.0, 0.5, 0.12, 4, 0.5);
-    addRing(x, y + 0.3, z, 14, 0.55, 1.0, 0.75, 0.35);
-    // Api besar juga menyalakan emitter kebakaran singkat di titik ledakan.
-    startEmitter('fire', x, y, z, 26, 2.5);
-  }
-
-  // Kepulan asap sekali jalan (knalpot, cerobong, tabrakan ringan).
-  function smoke(x, y, z) {
-    burst(T_SMOKE, x, y, z, 6, 0.5, 1.0, 1.8, 0.7, 0.30, 0.30, 0.32, -0.35, 1.0, 1.0);
-  }
-
-  // Semburan api sekali jalan (tembakan senjata berat, tong meledak kecil).
-  function fire(x, y, z) {
-    burst(T_FLAME, x, y, z, 8, 1.2, 2.0, 0.55, 0.8, 1.0, 0.55, 0.12, -1.0, 0.7);
-    burst(T_EMBER, x, y + 0.2, z, 4, 2, 3, 1.0, 0.11, 1.0, 0.5, 0.12, 4, 0.5);
-  }
-
-  // Percikan: tabrakan mobil, tembakan mengenai logam/beton, gerinda.
-  function sparks(x, y, z) {
-    burst(T_SPARK, x, y, z, 12, 7, 2.5, 0.6, 0.11, 1.0, 0.75, 0.25, 10, 0.3);
-    burst(T_DEBRIS, x, y, z, 4, 4, 3, 0.8, 0.12, 0.6, 0.58, 0.55, 12, 0.5);
-  }
-
-  // -- Efek kontinu & dunia (helper, dipanggil modul lain via guard) ----------
-
-  // Debu jalan di belakang kendaraan / kaki yang berlari.
-  function dust(x, y, z, n) {
-    n = n || 4;
-    burst(T_DUST, x, y + 0.15, z, n, 0.9, 0.5, 1.1, 0.55, 0.72, 0.62, 0.48, -0.2, 1.4, 0.8);
-  }
-
-  // Ombak pecah di pantai + wake perahu: busa putih + cipratan air.
-  function splash(x, y, z, n) {
-    n = n || 6;
-    burst(T_SPLASH, x, y, z, n, 1.8, 2.2, 0.7, 0.3, 0.8, 0.9, 0.95, 7, 0.5);
-    burst(T_FOAM, x, y + 0.05, z, Math.ceil(n / 2), 0.7, 0.2, 1.6, 0.7, 0.85, 0.92, 0.96, -0.1, 1.2);
-  }
-
-  // Wake perahu: dipanggil tiap frame oleh Water lewat guard SB.FX.wake.
-  function wake(x, z) {
-    var y = 0.08;
-    spawn(T_FOAM, x + rand(-0.6, 0.6), y, z + rand(-0.6, 0.6),
-      rand(-0.3, 0.3), 0.1, rand(-0.3, 0.3), rand(1.0, 1.8), rand(0.5, 0.9),
-      0.85, 0.92, 0.96, -0.05, 1.0);
-    particles[cursor].grow = 0.7;
-    if (Math.random() < 0.5) {
-      spawn(T_SPLASH, x, y, z, rand(-0.5, 0.5), rand(0.8, 1.6), rand(-0.5, 0.5),
-        rand(0.3, 0.6), 0.18, 0.8, 0.9, 0.95, 8, 0.4);
+    // Ombak: puncak putih bergerak di garis pantai.
+    for (i = 0; i < waves.length; i++){
+      var wv = waves[i];
+      var bob = Math.sin(wv.phase) * 0.5;
+      var om = M ? M.mat4Identity() : null;
+      if (!om) break;
+      om = M.mat4Translate(om, wv.x, 0.15 + bob * 0.2, wv.z);
+      var bright = 0.75 + 0.25 * Math.max(0, Math.sin(wv.phase));
+      gl.drawMesh(_unitMesh, om, [bright, bright, 1.0, 0.45]);
     }
-  }
-
-  // Asap knalpot kontinu (kendaraan): emitter 3 detik, diperbarui tiap frame.
-  function exhaust(x, y, z) {
-    startEmitter('exhaust', x, y, z, 14, 0.6);
-  }
-
-  // Api kebakaran kontinu di satu titik (gedung/mobil terbakar).
-  function startFire(x, y, z, seconds) {
-    startEmitter('fire', x, y, z, 30, seconds || 8);
-  }
-
-  // Asap rokok NPC: emitter tipis 6 detik.
-  function cigarette(x, y, z) {
-    startEmitter('cigarette', x, y, z, 3, 6);
-  }
-
-  // -- Internal emitter -------------------------------------------------------
-  function startEmitter(kind, x, y, z, rate, seconds) {
-    // Pakai ulang emitter sejenis di posisi dekat bila ada (hemat slot).
-    for (var i = 0; i < MAX_EMITTERS; i++) {
-      var em = emitters[i];
-      if (em.active && em.kind === kind) {
-        var dx = em.x - x, dz = em.z - z;
-        if (dx * dx + dz * dz < 4) {
-          em.life = Math.max(em.life, seconds);
-          em.rate = Math.max(em.rate, rate);
-          return;
-        }
-      }
-    }
-    for (var j = 0; j < MAX_EMITTERS; j++) {
-      var e2 = emitters[j];
-      if (!e2.active) {
-        e2.active = true;
-        e2.kind = kind;
-        e2.x = x; e2.y = y; e2.z = z;
-        e2.rate = rate;
-        e2.acc = 0;
-        e2.life = seconds;
-        e2.maxLife = seconds;
-        return;
-      }
-    }
-  }
-
-  function addRing(x, y, z, maxRadius, life, r, g, b) {
-    for (var i = 0; i < MAX_RINGS; i++) {
-      var ring = rings[i];
-      if (ring.life <= 0) {
-        ring.x = x; ring.y = y; ring.z = z;
-        ring.radius = 0.5;
-        ring.maxRadius = maxRadius;
-        ring.life = life;
-        ring.maxLife = life;
-        ring.r = r; ring.g = g; ring.b = b;
-        return;
-      }
-    }
-  }
-
-  // Jumlah partikel hidup (untuk HUD/debug, tanpa alokasi).
-  function aliveCount() {
-    var n = 0;
-    for (var i = 0; i < MAX; i++) if (particles[i].life > 0) n++;
-    return n;
   }
 
   window.SB.FX = {
@@ -432,14 +337,11 @@ window.SB = window.SB || {};
     smoke: smoke,
     fire: fire,
     sparks: sparks,
-    particles: particles,
-    // helper dunia
-    dust: dust,
-    splash: splash,
     wake: wake,
-    exhaust: exhaust,
-    startFire: startFire,
-    cigarette: cigarette,
-    aliveCount: aliveCount
+    splash: splash,
+    particles: particles,
+    wakes: wakes,
+    waves: waves
   };
+
 })();

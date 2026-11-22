@@ -1,1154 +1,1179 @@
 window.SB = window.SB || {};
-// game.js — Sunset Bay v12 (Builder B: graphics engine)
-// ORCHESTRATOR. Satu-satunya file yang tahu urutan modul.
-//   - Membuat SB.state (bentuk PERSIS sesuai design spec)
-//   - init() semua modul sesuai urutan load
-//   - frame(dt): update semua modul, lalu draw semua modul
-//   - save()/load() localStorage key 'sunset-bay-save-v12'
-//   - pause()/resume(), kamera third-person, siklus siang-malam
-//
-// Aturan keras: modul dipanggil HANYA lewat API spec, dengan guard
-// `if (SB.X && SB.X.update)` — bila builder lain belum menulis
-// modulnya, game tetap jalan tanpa modul itu. TIDAK ADA adapter.
-(function () {
-  'use strict';
-
-  var M3 = null;
-  var GL = null;
-  var SAVE_KEY = 'sunset-bay-save-v12';
-  var SAVE_VERSION = 12;
-
-  // ------------------------------------------------------------------
-  // State bersama — BENTUK PERSIS SESUAI DESIGN SPEC
-  // ------------------------------------------------------------------
-  function freshState() {
-    return {
-      time: 0,               // detik sejak game mulai
-      timeOfDay: 18.33,      // jam (18:20 = golden hour default)
-      day: 1,
-      money: 500, rep: 0, respect: 0, respectRank: 'Rookie',
-      wanted: 0,             // 0-5 bintang
-      heat: 0,               // 0-100 indikator Heat
-      player: { x: 0, y: 0, z: 0, angle: 0, onFoot: true, vehicle: null, hp: 100, armor: 0 },
-      camera: { eye: { x: 0, y: 8, z: 12 }, look: { x: 0, y: 1, z: 0 } },
-      weather: { rain: 0, rainArea: null, clouds: 0.3, wind: 0.2, puddles: 0 },
-      mission: { id: null, stage: 0, text: '', reward: 0 },
-      crew: [],              // anggota crew aktif
-      districtRep: {},       // reputasi per distrik (nama distrik -> 0-100)
-      businesses: [],        // bisnis yang dimiliki
-      race: null,            // balapan aktif
-      radio: 0,              // stasiun radio aktif 0-5
-      ammo: 24, weapon: 0,   // 0=pistol 1=smg 2=shotgun 3=rifle
-      stats: { kills: 0, carsStolen: 0, drifts: 0, racesWon: 0, missionsDone: 0 },
-      flags: {}              // flag boolean bebas
-    };
-  }
-
-  var state = freshState();
-
-  // ------------------------------------------------------------------
-  // State internal game.js (bukan bagian save)
-  // ------------------------------------------------------------------
-  var canvas = null;
-  var paused = true;            // mulai paused sampai START ditekan
-  var started = false;          // true setelah tombol START/CONTINUE
-  var attractMode = true;       // kamera sinematik di belakang overlay
-  var attractAngle = 0;
-  var actionQueue = [];         // aksi sekali tekan dari main.js
-  var camMode = 0;              // 0=dekat 1=medium 2=jauh (tombol C)
-  var camYaw = 0;               // yaw kamera (drag mouse)
-  var camPitch = 0.32;
-  var camDist = 9;
-  var camTarget = { x: 0, y: 1.5, z: 0 };
-  var mapOpen = false;
-  var missionPanelOpen = false;
-  var lastAutosave = 0;
-  var frameCount = 0;
-  var missionIntroShown = false;
-  var introTimer = 0;
-  var dayLengthSec = 600;       // 1 hari game = 10 menit nyata
-  var timeScale = 24 / dayLengthSec; // jam game per detik nyata
-
-  // Kamera sinematik attract mode: titik-titik panorama kota.
-  var ATTRACT_POINTS = [
-    { x: 0, y: 26, z: 120, lx: 0, ly: 6, lz: 0 },
-    { x: -90, y: 20, z: 60, lx: 0, ly: 8, lz: -20 },
-    { x: 80, y: 14, z: -40, lx: -20, ly: 4, lz: 30 },
-    { x: 10, y: 34, z: -110, lx: 0, ly: 2, lz: 40 }
-  ];
-  var attractIdx = 0;
-  var attractBlend = 0;
-
-  // ------------------------------------------------------------------
-  // init(canvas)
-  // ------------------------------------------------------------------
-  function init(c) {
-    M3 = window.SB.Math3;
-    GL = window.SB.GL;
-    canvas = c;
-    state = freshState();
-    window.SB.state = state;
-
-    // Distrik default: reputasi 0 di semua distrik yang dikenal City.
-    // Diisi ulang setelah City.init (guard: modul boleh belum ada).
-    seedDistrictRep();
-
-    // Init semua modul sesuai URUTAN LOAD di spec.
-    // Setiap init dipanggil dengan guard — modul yang belum ditulis
-    // builder lain dilewati tanpa error.
-    callInit('City');
-    callInit('Water');
-    callInit('Vehicles');
-    callInit('Player');
-    callInit('NPC');
-    callInit('Police');
-    callInit('Crew');
-    callInit('Economy');
-    callInit('Races');
-    callInit('Weather');
-    callInit('FX');
-    callInit('Audio');
-    callInit('HUD');
-    callInit('Jobs');
-
-    // Shots tidak punya init(state) di spec — hanya take(name).
-    // HUD butuh DOM siap: init HUD terakhir sebelum frame pertama.
-    if (window.SB.HUD && window.SB.HUD.init) {
-      try { window.SB.HUD.init(state); } catch (e) { logModErr('HUD', e); }
-    }
-
-    // Misi pertama aktif sejak awal (hadiah +$200 & REP+100).
-    // ID harus sama dengan MISSIONS di jobs.js ('courier-first-light').
-    state.mission = {
-      id: 'courier-first-light',
-      stage: 0,
-      text: 'First Light Courier — Pick up the package at the diner.',
-      reward: 200
-    };
-    if (window.SB.Jobs && window.SB.Jobs.startMission) {
-      try { window.SB.Jobs.startMission('courier-first-light'); } catch (e) { logModErr('Jobs', e); }
-    }
-
-    // Kamera awal: di belakang pemain, menghadap kota saat sunset.
-    state.player.x = 0;
-    state.player.z = 24;
-    state.player.angle = Math.PI; // menghadap -Z? lihat Player: 0 = -Z
-    updateCamera(0.016, true);
-
-    paused = true;
-    attractMode = true;
-    started = false;
-    window.SB.started = false;
-
-    // Waktu: matahari golden hour dari jam 18.33.
-    if (GL && GL.setTimeOfDay) GL.setTimeOfDay(state.timeOfDay);
-
-    if (typeof console !== 'undefined' && console.info) {
-      console.info('[SB.Game] init selesai — Sunset Bay v12 siap.');
-    }
-  }
-
-  function callInit(name) {
-    var mod = window.SB[name];
-    if (mod && typeof mod.init === 'function') {
-      try { mod.init(state); } catch (e) { logModErr(name, e); }
-    }
-  }
-
-  function logModErr(name, e) {
-    if (typeof console !== 'undefined' && console.warn) {
-      console.warn('[SB.Game] modul ' + name + ' error: ' +
-        (e && e.message ? e.message : e));
-    }
-  }
-
-  function seedDistrictRep() {
-    var names = [];
-    if (window.SB.City && Array.isArray(window.SB.City.districts)) {
-      names = window.SB.City.districts;
-    } else {
-      names = ['Ocean Drive', 'Downtown', 'Harbour', 'Little Havana',
-        'Star Island', 'Vice Port', 'Bayshore', 'Coral Heights',
-        'Neon Mile', 'Palm Court', 'Fishermans Wharf', 'Sunset Strip'];
-    }
-    for (var i = 0; i < names.length; i++) {
-      if (state.districtRep[names[i]] === undefined) state.districtRep[names[i]] = 0;
-    }
-  }
-
-  // ------------------------------------------------------------------
-  // frame(dt) — dipanggil main.js tiap requestAnimationFrame
-  // ------------------------------------------------------------------
-  function frame(dt) {
-    frameCount++;
-    if (!M3 || !GL) return;
-
-    // --- Waktu game selalu berjalan (kecuali pause penuh) ---
-    if (!paused) {
-      state.time += dt;
-      advanceClock(dt);
-    } else if (attractMode) {
-      // Attract mode: waktu tetap berjalan pelan untuk langit hidup.
-      state.time += dt * 0.5;
-      advanceClock(dt * 0.25);
-    }
-
-    // --- Aksi sekali tekan dari main.js ---
-    drainActions();
-
-    // --- Update modul (URUTAN SPEC) ---
-    if (!paused) {
-      updateModules(dt);
-    } else if (attractMode) {
-      // Di balik overlay start, dunia tetap hidup secukupnya.
-      callUpdate('Weather', dt);
-      callUpdate('Water', dt);
-      callUpdate('City', dt);
-      callUpdate('NPC', dt);
-      callUpdate('FX', dt);
-    }
-
-    // --- Kamera ---
-    if (attractMode) {
-      updateAttractCamera(dt);
-    } else {
-      updateCamera(dt, false);
-    }
-
-    // --- Render ---
-    render();
-
-    // --- HUD (DOM) — cukup tiap frame, HUD modul men-throttle sendiri ---
-    if (!paused && window.SB.HUD && window.SB.HUD.update) {
-      try { window.SB.HUD.update(state); } catch (e) { logModErr('HUD', e); }
-    }
-
-    // --- Autosave tiap 60 detik saat bermain ---
-    if (!paused && state.time - lastAutosave > 60) {
-      lastAutosave = state.time;
-      save(true);
-    }
-
-    // --- Intro misi pertama (sekali) ---
-    if (started && !missionIntroShown) {
-      introTimer += dt;
-      if (introTimer > 1.2) {
-        missionIntroShown = true;
-        toast('Mission: First Light Courier — pick up the package at the diner.', 'gold');
-      }
-    }
-  }
-
-  // Jam game maju; ganti hari saat melewati 24.00.
-  function advanceClock(dt) {
-    state.timeOfDay += dt * timeScale;
-    if (state.timeOfDay >= 24) {
-      state.timeOfDay -= 24;
-      state.day += 1;
-      onNewDay();
-    }
-    if (GL && GL.setTimeOfDay) GL.setTimeOfDay(state.timeOfDay);
-  }
-
-  function onNewDay() {
-    // Pemasukan pasif bisnis masuk tiap pagi (modul Economy yang hitung).
-    if (window.SB.Economy && window.SB.Economy.collectIncome) {
-      try {
-        var inc = window.SB.Economy.collectIncome();
-        if (inc > 0) toast('Business income: +$' + inc + ' (Day ' + state.day + ')', 'green');
-      } catch (e) { logModErr('Economy', e); }
-    }
-    // Heat mendingin semalam.
-    state.heat = Math.max(0, state.heat - 25);
-    if (state.wanted > 0 && state.heat < 10) {
-      state.wanted = 0;
-      if (window.SB.Police && window.SB.Police.setWanted) {
-        try { window.SB.Police.setWanted(0); } catch (e) { logModErr('Police', e); }
-      }
-    }
-    toast('Day ' + state.day + ' — a new day in Sunset Bay.', '');
-  }
-
-  // Urutan update PERSIS spec:
-  // Weather, City, Water, Vehicles, Player, NPC, Police, Crew,
-  // Economy, Races, FX, Jobs, Audio, HUD.
-  function updateModules(dt) {
-    callUpdate('Weather', dt);
-    callUpdate('City', dt);
-    callUpdate('Water', dt);
-    callUpdate('Vehicles', dt);
-    // Player butuh input: teruskan SB.input.
-    var P = window.SB.Player;
-    if (P && typeof P.update === 'function') {
-      try { P.update(dt, state, window.SB.input || null); } catch (e) { logModErr('Player', e); }
-    }
-    callUpdate('NPC', dt);
-    callUpdate('Police', dt);
-    callUpdate('Crew', dt);
-    callUpdate('Economy', dt);
-    callUpdate('Races', dt);
-    callUpdate('FX', dt);
-    callUpdate('Jobs', dt);
-    // Audio.update tidak ada di API spec (hanya setStation/sfx/
-    // toggleMute) — panggil bila modul menyediakannya, dengan guard.
-    callUpdate('Audio', dt);
-
-    // Sinkronisasi wanted/heat dua arah dengan modul Police.
-    syncWanted();
-    // Kamera mengikuti kendaraan / pemain sudah di updateCamera.
-    // Hujan lokal memengaruhi genangan (Weather yang mengatur).
-    clampState();
-    // Sistem game.js sendiri: objektif, busted, event hari, performa.
-    updateObjective(dt);
-    updateBusted(dt);
-    updateDayEvents(dt);
-    updatePerformance(dt);
-  }
-
-  function callUpdate(name, dt) {
-    var mod = window.SB[name];
-    if (mod && typeof mod.update === 'function') {
-      try { mod.update(dt, state); } catch (e) { logModErr(name, e); }
-    }
-  }
-
-  function callDraw(name) {
-    var mod = window.SB[name];
-    if (mod && typeof mod.draw === 'function') {
-      try { mod.draw(GL, state); } catch (e) { logModErr(name, e); }
-    }
-  }
-
-  // Jaga state tetap dalam batas aman setiap frame.
-  function clampState() {
-    state.wanted = M3.clamp(Math.round(state.wanted), 0, 5);
-    state.heat = M3.clamp(state.heat, 0, 100);
-    state.money = Math.max(0, Math.floor(state.money));
-    state.rep = Math.max(0, Math.floor(state.rep));
-    state.player.hp = M3.clamp(state.player.hp, 0, 100);
-    state.player.armor = M3.clamp(state.player.armor, 0, 100);
-    state.ammo = Math.max(0, Math.floor(state.ammo));
-    state.weapon = M3.clamp(state.weapon, 0, 3);
-    state.radio = M3.clamp(state.radio, 0, 5);
-    if (state.player.hp <= 0) onPlayerDown();
-  }
-
-  function syncWanted() {
-    var Pol = window.SB.Police;
-    if (Pol && typeof Pol.setWanted === 'function') {
-      // Police adalah sumber kebenaran wanted saat kejar-kejaran aktif.
-      if (Pol.wanted !== undefined && Pol.wanted !== state.wanted) {
-        state.wanted = M3.clamp(Pol.wanted, 0, 5);
-      }
-    }
-    // Heat naik saat wanted tinggi, turun pelan saat bersih.
-    if (state.wanted > 0) {
-      state.heat = M3.clamp(state.heat + state.wanted * 0.35, 0, 100);
-    } else {
-      state.heat = M3.clamp(state.heat - 0.9, 0, 100);
-    }
-  }
-
-  function onPlayerDown() {
-    if (state.flags._down) return;
-    state.flags._down = true;
-    state.player.hp = 100;
-    state.wanted = 0;
-    state.heat = 0;
-    state.money = Math.max(0, state.money - 100);
-    state.player.x = 0; state.player.z = 24;
-    state.player.onFoot = true; state.player.vehicle = null;
-    if (window.SB.Police && window.SB.Police.setWanted) {
-      try { window.SB.Police.setWanted(0); } catch (e) { /* abaikan */ }
-    }
-    toast('WASTED — you woke up at the hospital. -$100.', 'red');
-    setTimeout(function () { state.flags._down = false; }, 3000);
-  }
-
-  // ------------------------------------------------------------------
-  // Kamera third-person
-  // ------------------------------------------------------------------
-  function updateCamera(dt, snap) {
-    var p = state.player;
-    var input = window.SB.input;
-
-    // Drag mouse mengorbit kamera di sekitar pemain.
-    if (input && input.mouse && input.mouse.moved && !attractMode) {
-      camYaw -= input.mouse.dx * 0.0042;
-      camPitch = M3.clamp(camPitch + input.mouse.dy * 0.003, 0.08, 1.15);
-    }
-    // Scroll mouse: zoom jarak kamera.
-    if (input && input.wheel) {
-      camDist = M3.clamp(camDist + input.wheel * 0.6, 5, 16);
-    }
-    // Jarak dasar per mode kamera (tombol C) + boost kejar-kejaran.
-    var baseDist = effectiveCamDist();
-    camDist = M3.lerp(camDist, baseDist, snap ? 1 : dt * 1.5);
-
-    // Target kamera: pemain (atau kendaraan bila mengemudi).
-    var tx = p.x, ty = 1.6, tz = p.z;
-    if (!p.onFoot && p.vehicle) {
-      tx = p.vehicle.x !== undefined ? p.vehicle.x : p.x;
-      tz = p.vehicle.z !== undefined ? p.vehicle.z : p.z;
-      ty = 2.0;
-    }
-    camTarget.x = M3.lerp(camTarget.x, tx, snap ? 1 : dt * 6);
-    camTarget.y = M3.lerp(camTarget.y, ty, snap ? 1 : dt * 6);
-    camTarget.z = M3.lerp(camTarget.z, tz, snap ? 1 : dt * 6);
-
-    // Yaw kamera mengikuti arah pemain bila tidak sedang di-orbit.
-    var followYaw = p.angle + Math.PI; // kamera di belakang pemain
-    if (!input || !input.mouse || !input.mouse.down) {
-      camYaw = M3.lerpAngle(camYaw, followYaw, snap ? 1 : dt * 1.8);
-    }
-
-    var eye = {
-      x: camTarget.x + Math.sin(camYaw) * Math.cos(camPitch) * camDist,
-      y: camTarget.y + Math.sin(camPitch) * camDist,
-      z: camTarget.z + Math.cos(camYaw) * Math.cos(camPitch) * camDist
-    };
-    // Sinkronkan yaw kamera ke SB.input agar Player bergerak relatif
-    // kamera (kontrak input.camAngle di player.js). Arah pandang kamera
-    // adalah kebalikan vektor eye->target, jadi +PI dari camYaw.
-    if (window.SB.input) window.SB.input.camAngle = camYaw + Math.PI;
-    // Jangan biarkan kamera masuk ke bawah tanah.
-    if (eye.y < 1.2) eye.y = 1.2;
-    var look = { x: camTarget.x, y: camTarget.y, z: camTarget.z };
-
-    if (snap) {
-      state.camera.eye = eye;
-      state.camera.look = look;
-    } else {
-      state.camera.eye.x = M3.lerp(state.camera.eye.x, eye.x, dt * 8);
-      state.camera.eye.y = M3.lerp(state.camera.eye.y, eye.y, dt * 8);
-      state.camera.eye.z = M3.lerp(state.camera.eye.z, eye.z, dt * 8);
-      state.camera.look.x = M3.lerp(state.camera.look.x, look.x, dt * 10);
-      state.camera.look.y = M3.lerp(state.camera.look.y, look.y, dt * 10);
-      state.camera.look.z = M3.lerp(state.camera.look.z, look.z, dt * 10);
-    }
-  }
-
-  // Kamera sinematik attract mode: melayang antar panorama kota.
-  function updateAttractCamera(dt) {
-    attractBlend += dt / 9; // 9 detik per titik
-    if (attractBlend >= 1) {
-      attractBlend = 0;
-      attractIdx = (attractIdx + 1) % ATTRACT_POINTS.length;
-    }
-    var a = ATTRACT_POINTS[attractIdx];
-    var b = ATTRACT_POINTS[(attractIdx + 1) % ATTRACT_POINTS.length];
-    var t = attractBlend * attractBlend * (3 - 2 * attractBlend); // smoothstep
-    var slow = state.time * 0.05;
-    state.camera.eye = {
-      x: M3.lerp(a.x, b.x, t) + Math.sin(slow) * 6,
-      y: M3.lerp(a.y, b.y, t) + Math.sin(slow * 0.7) * 2,
-      z: M3.lerp(a.z, b.z, t) + Math.cos(slow) * 6
-    };
-    state.camera.look = {
-      x: M3.lerp(a.lx, b.lx, t),
-      y: M3.lerp(a.ly, b.ly, t),
-      z: M3.lerp(a.lz, b.lz, t)
-    };
-  }
-
-  // ------------------------------------------------------------------
-  // Render: shadow pass lalu scene pass
-  // ------------------------------------------------------------------
-  function render() {
-    if (!GL) return;
-    var eye = state.camera.eye;
-    var look = state.camera.look;
-    // mat4LookAt WAJIB object {x,y,z} — BUKAN array (bug v8).
-    var view = M3.mat4LookAt(eye, look, { x: 0, y: 1, z: 0 });
-    var aspect = canvas ? canvas.width / Math.max(1, canvas.height) : 16 / 9;
-    var proj = M3.mat4Perspective(M3.degToRad(62), aspect, 0.1, 900);
-
-    // 1) Shadow pass: gambar caster ke depth map 1024. beginShadow()
-    // mengembalikan false bila bayangan mati (mis. software renderer) —
-    // jangan gambar caster tanpa guna (itu menggambar ulang seluruh dunia
-    // dengan program lit — 2x kerja per frame).
-    var shadowPass = GL.beginShadow ? GL.beginShadow() : false;
-    if (shadowPass) drawShadowCasters();
-    if (GL.endShadow) GL.endShadow();
-
-    // 2) Scene pass: langit + semua modul draw (URUTAN SPEC).
-    if (GL.beginFrame) GL.beginFrame(view, proj, eye);
-    drawModules();
-    if (GL.endFrame) GL.endFrame();
-
-    // 3) Overlay peta besar (Tab) digambar HUD modul via DOM/canvas 2D.
-    if (mapOpen && window.SB.HUD && window.SB.HUD.showMap) {
-      try { window.SB.HUD.showMap(state); } catch (e) { logModErr('HUD', e); }
-    }
-  }
-
-  // Caster bayangan: modul yang punya draw() digambar ulang ke shadow
-  // map — cukup City, Vehicles, Player, NPC, Police (FX tidak perlu).
-  function drawShadowCasters() {
-    callDraw('City');
-    callDraw('Vehicles');
-    callDraw('Player');
-    callDraw('NPC');
-    callDraw('Police');
-  }
-
-  // Urutan draw PERSIS spec: City, Water, Vehicles, Player, NPC,
-  // Police, FX. (Water & FX digambar di sini; modul lain yang tidak
-  // ada di daftar ini — mis. Crew/Economy — tidak punya draw 3D.)
-  function drawModules() {
-    callDraw('City');
-    callDraw('Water');
-    callDraw('Vehicles');
-    callDraw('Player');
-    callDraw('NPC');
-    callDraw('Police');
-    callDraw('FX');
-  }
-
-  // ------------------------------------------------------------------
-  // Aksi sekali tekan (dari main.js via queueAction)
-  // ------------------------------------------------------------------
-  function queueAction(action) {
-    if (typeof action === 'string') actionQueue.push(action);
-  }
-
-  function drainActions() {
-    if (!actionQueue.length) return;
-    var actions = actionQueue.splice(0, actionQueue.length);
-    for (var i = 0; i < actions.length; i++) {
-      handleAction(actions[i]);
-    }
-  }
-
-  function handleAction(action) {
-    if (!started && action !== 'pause') return; // overlay start aktif
-    switch (action) {
-      case 'interact': doInteract(); break;
-      case 'enterExit': doEnterExit(); break;
-      case 'radio': cycleRadio(1); break;
-      case 'missions': toggleMissionPanel(); break;
-      case 'camera': camMode = (camMode + 1) % 3; break;
-      case 'weapon0': setWeapon(0); break;
-      case 'weapon1': setWeapon(1); break;
-      case 'weapon2': setWeapon(2); break;
-      case 'weapon3': setWeapon(3); break;
-      case 'weaponPrev': setWeapon((state.weapon + 3) % 4); break;
-      case 'buyAmmo': buyAmmo(); break;
-      case 'horn': honk(); break;
-      case 'crewCommand': cycleCrewCommand(); break;
-      case 'lights': toggleLights(); break;
-      case 'pause': togglePause(); break;
-      default: break;
-    }
-  }
-
-  // E: curi mobil terdekat / masuk kendaraan / naik perahu.
-  function doInteract() {
-    var V = window.SB.Vehicles;
-    var W = window.SB.Water;
-    if (state.player.onFoot) {
-      // Coba perahu dulu bila dekat dermaga (Water.boardBoat).
-      if (W && W.boardBoat) {
-        try {
-          var boarded = W.boardBoat();
-          if (boarded) { toast('You boarded a boat.', ''); return; }
-        } catch (e) { logModErr('Water', e); }
-      }
-      if (V && V.stealCar) {
-        try {
-          // stealCar() mengembalikan BOOLEAN, bukan mobil — objek mobil
-          // sudah disimpan ke state.player.vehicle oleh Vehicles.enterCar
-          // di dalamnya. Jangan timpa dengan nilai kembaliannya (dulu:
-          // state.player.vehicle = true, merusak respray/drift/dll).
-          if (V.stealCar()) {
-            // carsStolen sudah dihitung di Vehicles.stealCar — jangan
-            // hitung dua kali di sini.
-            state.player.onFoot = false;
-            addWanted(1, 'Grand theft auto');
-            toast('Car stolen! Lose the cops.', 'red');
-            sfx('steal');
-            return;
-          }
-        } catch (e) { logModErr('Vehicles', e); }
-      }
-      toast('No car nearby. Walk to a parked car and press E.', '');
-    } else {
-      doEnterExit();
-    }
-  }
-
-  function doEnterExit() {
-    var V = window.SB.Vehicles;
-    var W = window.SB.Water;
-    if (!state.player.onFoot) {
-      if (W && W.exitBoat) {
-        try { W.exitBoat(); } catch (e) { logModErr('Water', e); }
-      }
-      if (V && V.exitCar) {
-        try { V.exitCar(); } catch (e) { logModErr('Vehicles', e); }
-      }
-      state.player.onFoot = true;
-      state.player.vehicle = null;
-    }
-  }
-
-  function cycleRadio(dir) {
-    state.radio = (state.radio + (dir || 1) + 6) % 6;
-    var A = window.SB.Audio;
-    if (A && A.setStation) {
-      try { A.setStation(state.radio); } catch (e) { logModErr('Audio', e); }
-    }
-    var name = 'Station ' + (state.radio + 1);
-    if (A && Array.isArray(A.stations) && A.stations[state.radio]) {
-      name = A.stations[state.radio];
-    }
-    toast('Radio: ' + name, '');
-  }
-
-  function toggleMissionPanel() {
-    missionPanelOpen = !missionPanelOpen;
-    if (window.SB.HUD && window.SB.HUD.toggleMissionPanel) {
-      try { window.SB.HUD.toggleMissionPanel(missionPanelOpen, state); } catch (e) { logModErr('HUD', e); }
-    }
-    if (missionPanelOpen && window.SB.Jobs && window.SB.Jobs.missions) {
-      var list = window.SB.Jobs.missions;
-      toast(list.length + ' missions available. Press M to close.', '');
-    }
-  }
-
-  var WEAPON_NAMES = ['PISTOL', 'SMG', 'SHOTGUN', 'RIFLE'];
-  function setWeapon(i) {
-    state.weapon = M3.clamp(i, 0, 3);
-    toast('Weapon: ' + WEAPON_NAMES[state.weapon], '');
-    sfx('weapon');
-    if (window.SB.HUD && window.SB.HUD.setWeapon) {
-      try { window.SB.HUD.setWeapon(state.weapon, state.ammo); } catch (e) { logModErr('HUD', e); }
-    }
-  }
-
-  // Beli amunisi: $50 / +24 (API SB.Shots.buyAmmo bila ada).
-  function buyAmmo() {
-    if (window.SB.Shots && window.SB.Shots.buyAmmo) {
-      try { window.SB.Shots.buyAmmo(); return; } catch (e) { logModErr('Shots', e); }
-    }
-    if (state.money >= 50) {
-      state.money -= 50;
-      state.ammo += 24;
-      toast('Ammo +24 ($50). Total: ' + state.ammo, 'green');
-      sfx('buy');
-    } else {
-      toast('Not enough cash for ammo ($50).', 'red');
-    }
-  }
-
-  function honk() {
-    sfx('horn');
-    // Klakson membuat NPC di dekatnya menoleh (modul NPC yang urus).
-    var N = window.SB.NPC;
-    if (N && N.cheer) {
-      try { N.cheer(state.player.x, state.player.z); } catch (e) { logModErr('NPC', e); }
-    }
-  }
-
-  var CREW_COMMANDS = ['follow', 'attack', 'wait'];
-  var crewCmdIdx = 0;
-  function cycleCrewCommand() {
-    var cmd = CREW_COMMANDS[crewCmdIdx % CREW_COMMANDS.length];
-    crewCmdIdx++;
-    var C = window.SB.Crew;
-    if (C && C.command) {
-      try { C.command(cmd); } catch (e) { logModErr('Crew', e); }
-    }
-    toast('Crew: ' + cmd.toUpperCase(), '');
-  }
-
-  function toggleLights() {
-    state.flags.lights = !state.flags.lights;
-    toast(state.flags.lights ? 'Headlights ON' : 'Headlights OFF', '');
-  }
-
-  // Tambah wanted (dipakai modul lain lewat SB.Game.addWanted).
-  function addWanted(n, reason) {
-    var before = state.wanted;
-    state.wanted = M3.clamp(state.wanted + n, 0, 5);
-    state.heat = M3.clamp(state.heat + n * 12, 0, 100);
-    if (state.wanted > before) {
-      var Pol = window.SB.Police;
-      if (Pol && Pol.setWanted) {
-        try { Pol.setWanted(state.wanted); } catch (e) { logModErr('Police', e); }
-      }
-      var stars = '';
-      for (var i = 0; i < state.wanted; i++) stars += '★';
-      toast('WANTED ' + stars + (reason ? ' — ' + reason : ''), 'red');
-      sfx('siren');
-    }
-  }
-
-  function sfx(name) {
-    var A = window.SB.Audio;
-    if (A && A.sfx) {
-      try { A.sfx(name); } catch (e) { /* abaikan */ }
-    }
-  }
-
-  function toast(text, kind) {
-    var H = window.SB.HUD;
-    if (H && H.showToast) {
-      try { H.showToast(text, kind); return; } catch (e) { /* fallback */ }
-    }
-    // Fallback DOM langsung bila modul HUD belum ada.
-    var box = document.getElementById('toasts');
-    if (!box) return;
-    var el = document.createElement('div');
-    el.className = 'toast' + (kind ? ' ' + kind : '');
-    el.textContent = text;
-    box.appendChild(el);
-    setTimeout(function () {
-      if (el.parentNode) el.parentNode.removeChild(el);
-    }, 3600);
-  }
-
-  // ------------------------------------------------------------------
-  // Pause / resume
-  // ------------------------------------------------------------------
-  function pause() {
-    if (paused) return;
-    paused = true;
-    var overlay = document.getElementById('pause-overlay');
-    if (overlay) overlay.classList.remove('hidden');
-    save(true);
-  }
-
-  function resume() {
-    paused = false;
-    attractMode = false;
-    started = true;
-    window.SB.started = true;
-    var overlay = document.getElementById('pause-overlay');
-    if (overlay) overlay.classList.add('hidden');
-    var start = document.getElementById('start-overlay');
-    if (start) start.classList.add('hidden');
-    // Snap kamera ke belakang pemain saat mulai.
-    updateCamera(0.016, true);
-  }
-
-  function togglePause() {
-    if (!started) return;
-    if (paused) resume(); else pause();
-  }
-
-  function isPaused() { return paused; }
-
-  function onResize() {
-    if (GL && GL.resize) GL.resize();
-  }
-
-  // ------------------------------------------------------------------
-  // Save / load — localStorage key 'sunset-bay-save-v12'
-  // ------------------------------------------------------------------
-  function save(silent) {
-    try {
-      var data = {
-        version: SAVE_VERSION,
-        savedAt: new Date().toISOString(),
-        state: state
-      };
-      window.localStorage.setItem(SAVE_KEY, JSON.stringify(data));
-      // Save baru dibuat (atau autosave) -> tombol CONTINUE di menu
-      // harus aktif. Sebelumnya opacity 0.45 dari boot tetap menempel
-      // meski save sudah ada, jadi CONTINUE tampak mati.
-      try {
-        var contBtn = document.getElementById('continue-btn');
-        if (contBtn) {
-          contBtn.style.opacity = '1';
-          contBtn.title = 'Lanjutkan permainan yang tersimpan';
-        }
-      } catch (e) { /* abaikan: tanpa DOM pun save tetap sah */ }
-      if (!silent) toast('Game saved.', 'green');
-      return true;
-    } catch (e) {
-      if (!silent) toast('Save failed: storage penuh / diblokir.', 'red');
-      return false;
-    }
-  }
-
-  function load() {
-    try {
-      var raw = window.localStorage.getItem(SAVE_KEY);
-      if (!raw) {
-        toast('No save found — starting fresh.', '');
-        return false;
-      }
-      var data = JSON.parse(raw);
-      if (!data || data.version !== SAVE_VERSION || !data.state) {
-        toast('Save tidak cocok dengan v12 — mulai baru.', 'red');
-        return false;
-      }
-      var s = data.state;
-      // Salin field yang dikenal saja (tahan terhadap save rusak).
-      var next = freshState();
-      var keys = Object.keys(next);
-      for (var i = 0; i < keys.length; i++) {
-        var k = keys[i];
-        if (s[k] !== undefined) next[k] = s[k];
-      }
-      state = next;
-      window.SB.state = state;
-      seedDistrictRep();
-      // Beri tahu modul bahwa state dimuat ulang (guard: opsional).
-      callInit('Jobs');
-      if (GL && GL.setTimeOfDay) GL.setTimeOfDay(state.timeOfDay);
-      if (window.SB.Police && window.SB.Police.setWanted) {
-        try { window.SB.Police.setWanted(state.wanted); } catch (e) { /* abaikan */ }
-      }
-      if (window.SB.Audio && window.SB.Audio.setStation) {
-        try { window.SB.Audio.setStation(state.radio); } catch (e) { /* abaikan */ }
-      }
-      updateCamera(0.016, true);
-      toast('Save loaded — Day ' + state.day + ', $' + state.money + '.', 'green');
-      return true;
-    } catch (e) {
-      toast('Load gagal: save rusak.', 'red');
-      return false;
-    }
-  }
-
-  function resetSave() {
-    try { window.localStorage.removeItem(SAVE_KEY); } catch (e) { /* abaikan */ }
-    state = freshState();
-    window.SB.state = state;
-    seedDistrictRep();
-    updateCamera(0.016, true);
-  }
-
-  // ------------------------------------------------------------------
-  // Respect ranks: Rookie -> Street -> Boss -> Kingpin
-  // (dipakai Economy.rankUp dan Jobs.completeMission lewat SB.Game)
-  // ------------------------------------------------------------------
-  var RESPECT_RANKS = [
-    { name: 'Rookie', min: 0 },
-    { name: 'Street', min: 250 },
-    { name: 'Boss', min: 800 },
-    { name: 'Kingpin', min: 2000 }
-  ];
-
-  function respectRankFor(rep) {
-    var rank = RESPECT_RANKS[0].name;
-    for (var i = 0; i < RESPECT_RANKS.length; i++) {
-      if (rep >= RESPECT_RANKS[i].min) rank = RESPECT_RANKS[i].name;
-    }
-    return rank;
-  }
-
-  function addRep(n, reason) {
-    var before = state.respectRank;
-    state.rep = Math.max(0, state.rep + n);
-    state.respect = state.rep;
-    state.respectRank = respectRankFor(state.rep);
-    if (state.respectRank !== before) {
-      toast('RESPECT UP — you are now ' + state.respectRank.toUpperCase() + '!', 'gold');
-      sfx('rankup');
-    } else if (n > 0) {
-      toast('REP +' + n + (reason ? ' — ' + reason : ''), 'gold');
-    }
-  }
-
-  function addMoney(n, reason) {
-    state.money = Math.max(0, state.money + n);
-    if (n > 0) toast('+$' + n + (reason ? ' — ' + reason : ''), 'green');
-    else if (n < 0) toast('-$' + (-n) + (reason ? ' — ' + reason : ''), 'red');
-    if (window.SB.HUD && window.SB.HUD.setMoney) {
-      try { window.SB.HUD.setMoney(state.money); } catch (e) { /* abaikan */ }
-    }
-  }
-
-  // Dipanggil modul Jobs saat misi selesai: hadiah + rep + wanted turun.
-  function completeMissionReward(reward, repGain) {
-    if (reward) addMoney(reward, 'Mission complete');
-    if (repGain) addRep(repGain, 'Mission complete');
-    state.stats.missionsDone++;
-    state.heat = Math.max(0, state.heat - 15);
-    save(true);
-  }
-
-  // District standing: reputasi per distrik 0-100.
-  function addDistrictRep(district, n) {
-    if (!district) return;
-    var cur = state.districtRep[district] || 0;
-    state.districtRep[district] = M3.clamp(cur + n, 0, 100);
-  }
-
-  function districtAt(x, z) {
-    var C = window.SB.City;
-    if (C && C.districtAt) {
-      try { return C.districtAt(x, z); } catch (e) { /* abaikan */ }
-    }
-    return 'Ocean Drive';
-  }
-
-  // ------------------------------------------------------------------
-  // Pelacak objektif misi — waypoint + jarak + arah kompas
-  // Dipakai HUD.minimap (rute) dan toast jarak berkala.
-  // ------------------------------------------------------------------
-  var objective = null; // {x, z, label, radius}
-  var lastObjectiveToast = 0;
-
-  // Tetapkan titik objektif aktif (dipanggil modul Jobs saat stage berubah).
-  function setObjective(x, z, label, radius) {
-    objective = {
-      x: x, z: z,
-      label: label || 'Objective',
-      radius: radius || 6
-    };
-    lastObjectiveToast = 0;
-  }
-
-  function clearObjective() { objective = null; }
-
-  function getObjective() { return objective; }
-
-  // Jarak pemain ke objektif (meter), atau -1 bila tak ada objektif.
-  function objectiveDistance() {
-    if (!objective) return -1;
-    return M3.dist2D(state.player.x, state.player.z, objective.x, objective.z);
-  }
-
-  // Arah kompas ke objektif dari sudut pandang pemain:
-  // 0 = lurus ke depan, positif = belok kanan (radian, -PI..PI).
-  function objectiveBearing() {
-    if (!objective) return 0;
-    var dx = objective.x - state.player.x;
-    var dz = objective.z - state.player.z;
-    var targetYaw = M3.yawFromDir(dx, dz);
-    return M3.angleDiff(state.player.angle, targetYaw);
-  }
-
-  function objectiveReached() {
-    if (!objective) return false;
-    return objectiveDistance() <= objective.radius;
-  }
-
-  // Dipanggil tiap frame dari updateModules: toast jarak tiap 15 detik
-  // bila objektif jauh, dan auto-advance bila pemain sampai.
-  function updateObjective(dt) {
-    if (!objective || paused) return;
-    if (objectiveReached()) {
-      var label = objective.label;
-      clearObjective();
-      toast('Objective reached: ' + label, 'green');
-      sfx('objective');
-      if (window.SB.Jobs && window.SB.Jobs.advanceStage) {
-        try { window.SB.Jobs.advanceStage(); } catch (e) { logModErr('Jobs', e); }
-      }
-      return;
-    }
-    if (state.time - lastObjectiveToast > 20) {
-      lastObjectiveToast = state.time;
-      var d = Math.round(objectiveDistance());
-      if (d > 60) toast(objective.label + ' — ' + d + 'm away', '');
-    }
-  }
-
-  // ------------------------------------------------------------------
-  // BUSTED — ditangkap polisi (wanted tinggi + HP rendah + polisi dekat)
-  // ------------------------------------------------------------------
-  var bustedCooldown = 0;
-  function updateBusted(dt) {
-    if (bustedCooldown > 0) { bustedCooldown -= dt; return; }
-    if (state.wanted < 2 || state.player.hp > 25) return;
-    var Pol = window.SB.Police;
-    if (!Pol || !Array.isArray(Pol.cops) || !Pol.cops.length) return;
-    var near = false;
-    for (var i = 0; i < Pol.cops.length; i++) {
-      var c = Pol.cops[i];
-      if (c && M3.dist2D(state.player.x, state.player.z, c.x || 0, c.z || 0) < 4) {
-        near = true; break;
-      }
-    }
-    if (!near) return;
-    bustedCooldown = 8;
-    onBusted();
-  }
-
-  function onBusted() {
-    var fine = Math.min(300, 50 + state.wanted * 50);
-    state.money = Math.max(0, state.money - fine);
-    state.wanted = 0;
-    state.heat = 0;
-    state.player.hp = 100;
-    state.player.x = 0; state.player.z = 24;
-    state.player.onFoot = true; state.player.vehicle = null;
-    if (window.SB.Police && window.SB.Police.setWanted) {
-      try { window.SB.Police.setWanted(0); } catch (e) { /* abaikan */ }
-    }
-    toast('BUSTED — bail $' + fine + '. The cops dropped you at Ocean Drive.', 'red');
-    sfx('busted');
-    save(true);
-  }
-
-  // ------------------------------------------------------------------
-  // Event siklus hari — hook jam tertentu (neon malam, rush hour, dll)
-  // ------------------------------------------------------------------
-  var lastHourMark = -1;
-  var neonOn = false;
-  var rushHour = false;
-
-  // Dipanggil tiap frame: deteksi pergantian jam bulat.
-  function updateDayEvents(dt) {
-    var hour = Math.floor(state.timeOfDay);
-    if (hour === lastHourMark) return;
-    lastHourMark = hour;
-    var night = hour >= 19 || hour < 6;
-    if (night !== neonOn) {
-      neonOn = night;
-      state.flags.neon = night;
-      if (night) toast('Night falls — the neon comes alive.', '');
-    }
-    // Rush hour: 07.00-09.00 & 17.00-19.00 -> traffic lebih padat.
-    rushHour = (hour >= 7 && hour < 9) || (hour >= 17 && hour < 19);
-    state.flags.rushHour = rushHour;
-    // Pagi hari: toko buka, misi harian segar (Jobs yang urus isinya).
-    if (hour === 6) toast('Morning in Sunset Bay — new day, new jobs.', '');
-    // Golden hour: 18.00-19.00 — momen ikonik, beri tahu pemain.
-    if (hour === 18) toast('Golden hour — the city glows orange.', 'gold');
-  }
-
-  function isNight() {
-    return state.timeOfDay >= 19 || state.timeOfDay < 6;
-  }
-
-  function isGoldenHour() {
-    return state.timeOfDay >= 17.5 && state.timeOfDay < 19.5;
-  }
-
-  // Faktor kepadatan traffic saat ini (1.0 normal, 1.5 rush hour,
-  // 0.6 larut malam). Dipakai modul Vehicles untuk spawn/despawn.
-  function trafficDensity() {
-    if (isNight() && state.timeOfDay >= 1 && state.timeOfDay < 5) return 0.55;
-    if (rushHour) return 1.5;
-    return 1.0;
-  }
-
-  // ------------------------------------------------------------------
-  // Monitor performa + kualitas adaptif
-  // Kurangi beban bila fps jatuh: matikan post dulu, lalu shadow.
-  // ------------------------------------------------------------------
-  var perfSamples = [];
-  var perfLevel = 2; // 2=penuh, 1=tanpa post, 0=tanpa post+shadow
-  var perfCheckTimer = 0;
-
-  function updatePerformance(dt) {
-    perfSamples.push(dt);
-    if (perfSamples.length > 90) perfSamples.shift();
-    perfCheckTimer += dt;
-    if (perfCheckTimer < 3) return;
-    perfCheckTimer = 0;
-    if (perfSamples.length < 30) return;
-    var sum = 0;
-    for (var i = 0; i < perfSamples.length; i++) sum += perfSamples[i];
-    var avgFps = perfSamples.length / Math.max(sum, 0.001);
-    if (avgFps < 24 && perfLevel > 0) {
-      perfLevel--;
-      applyPerfLevel();
-    } else if (avgFps > 55 && perfLevel < 2) {
-      perfLevel++;
-      applyPerfLevel();
-    }
-  }
-
-  function applyPerfLevel() {
-    if (!GL) return;
-    if (GL.setPostEnabled) GL.setPostEnabled(perfLevel >= 2);
-    if (GL.setShadowEnabled) GL.setShadowEnabled(perfLevel >= 1);
-    if (typeof console !== 'undefined' && console.info) {
-      console.info('[SB.Game] kualitas adaptif -> level ' + perfLevel);
-    }
-  }
-
-  function getPerfLevel() { return perfLevel; }
-
-  // ------------------------------------------------------------------
-  // Kamera sinematik kejar-kejaran — aktif saat wanted >= 3
-  // Kamera mundur & naik sedikit agar heli + jalan terlihat.
-  // ------------------------------------------------------------------
-  function chaseCamBoost() {
-    if (state.wanted >= 3 && !state.player.onFoot) return 1;
-    if (state.wanted >= 3) return 0.6;
-    return 0;
-  }
-
-  // Jarak kamera efektif (dipakai updateCamera lewat camDist).
-  function effectiveCamDist() {
-    var base = [9, 12.5, 16][camMode] || 9;
-    return base + chaseCamBoost() * 4;
-  }
-
-  // ------------------------------------------------------------------
-  // Statistik sesi — ringkasan untuk layar pause / akhir sesi
-  // ------------------------------------------------------------------
-  function sessionSummary() {
-    return {
-      day: state.day,
-      timeOfDay: state.timeOfDay,
-      money: state.money,
-      rep: state.rep,
-      respectRank: state.respectRank,
-      wanted: state.wanted,
-      kills: state.stats.kills,
-      carsStolen: state.stats.carsStolen,
-      drifts: state.stats.drifts,
-      racesWon: state.stats.racesWon,
-      missionsDone: state.stats.missionsDone,
-      businesses: state.businesses.length,
-      crew: state.crew.length,
-      playSeconds: Math.round(state.time)
-    };
-  }
-
-  // ------------------------------------------------------------------
-  // Ekspor namespace — API spec SB.Game
-  // ------------------------------------------------------------------
-  window.SB.Game = {
-    init: init,
-    frame: frame,
-    save: save,
-    load: load,
-    pause: pause,
-    resume: resume,
-    togglePause: togglePause,
-    isPaused: isPaused,
-    onResize: onResize,
-    queueAction: queueAction,
-    // Helper lintas modul (dipakai Jobs / Economy / Police):
-    addWanted: addWanted,
-    addRep: addRep,
-    addMoney: addMoney,
-    addDistrictRep: addDistrictRep,
-    districtAt: districtAt,
-    completeMissionReward: completeMissionReward,
-    respectRankFor: respectRankFor,
-    resetSave: resetSave,
-    showToast: toast,
-    // Objektif misi & info dunia:
-    setObjective: setObjective,
-    clearObjective: clearObjective,
-    getObjective: getObjective,
-    objectiveDistance: objectiveDistance,
-    objectiveBearing: objectiveBearing,
-    objectiveReached: objectiveReached,
-    isNight: isNight,
-    isGoldenHour: isGoldenHour,
-    trafficDensity: trafficDensity,
-    getPerfLevel: getPerfLevel,
-    sessionSummary: sessionSummary,
-    chaseCamBoost: chaseCamBoost,
-    get state() { return state; },
-    set state(s) { state = s; window.SB.state = s; },
-    get started() { return started; },
-    get saveKey() { return SAVE_KEY; }
+(function(){ 'use strict';
+// ============================================================================
+// SB.Game — ORCHESTRATOR Sunset Bay
+// Satu-satunya modul yang memanggil init/update/draw modul lain, sesuai
+// urutan load spec. SB.state dibuat di sini (struktur PERSIS spec) dan
+// dibaca/ditulis semua modul. File ini tidak menggambar gedung/mobil/NPC
+// sendiri — ia memanggil SB.City.draw, SB.Vehicles.draw, dst.
+// Urutan update per frame: Weather (waktu) -> Jobs -> Races -> Economy ->
+// Crew -> Player -> Vehicles -> Water -> NPC -> Police -> FX -> Audio -> HUD.
+// Urutan draw: langit -> bayangan (pass depth) -> kota -> air -> kendaraan
+// -> pemain -> NPC -> polisi -> FX.
+// Save/load: localStorage key 'sunset-bay-save-v1' (versi 1).
+// ============================================================================
+
+var SAVE_KEY = 'sunset-bay-save-v1';
+var SAVE_VERSION = 1;
+
+var initialized = false;
+var paused = false;
+var started = false;
+var canvas = null;
+var skyMesh = null;
+var frameCount = 0;
+var lastFpsLog = 0;
+var cameraMode = 0;        // 0 = kejar (chase), 1 = jauh, 2 = atas (top-down)
+var cameraYaw = 0;
+var cameraPitch = 0.32;
+var cameraDistance = 11;
+var cameraTarget = { x: 0, y: 1, z: 0 };
+var cameraEye = { x: 0, y: 8, z: 12 };
+var attractAngle = 0;
+var dayRolloverDone = false;
+var lastRadioKey = false;
+var lastCameraKey = false;
+var lastWeaponKey = -1;
+var heatDecayTimer = 0;
+var autosaveTimer = 0;
+
+// ---------------------------------------------------------------------------
+// SB.state — struktur PERSIS spec (jangan ubah nama / bentuk field)
+// ---------------------------------------------------------------------------
+
+function createState() {
+  return {
+    time: 0,               // detik sejak game mulai
+    timeOfDay: 18.33,      // jam (18:20 = golden hour default)
+    day: 1,
+    money: 500, rep: 0, respect: 0, respectRank: 'Rookie',
+    wanted: 0,             // 0-5 bintang
+    heat: 0,               // 0-100 indikator Heat
+    player: { x: 0, y: 0, z: 0, angle: 0, onFoot: true, vehicle: null, hp: 100, armor: 0 },
+    camera: { eye: { x: 0, y: 8, z: 12 }, look: { x: 0, y: 1, z: 0 } },
+    weather: { rain: 0, rainArea: null, clouds: 0.3, wind: 0.2, puddles: 0 },
+    mission: { id: null, stage: 0, text: '', reward: 0 },
+    crew: [],              // anggota crew aktif
+    districtRep: {},       // reputasi per distrik (nama distrik -> 0-100)
+    businesses: [],        // bisnis yang dimiliki
+    race: null,            // balapan aktif
+    radio: 0,              // stasiun radio aktif 0-5
+    ammo: 24, weapon: 0,   // 0=pistol 1=smg 2=shotgun 3=rifle
+    stats: { kills: 0, carsStolen: 0, drifts: 0, racesWon: 0, missionsDone: 0 },
+    flags: {}              // flag boolean bebas
   };
+}
 
-  // SB.state dibuat sejak file dimuat agar modul lain yang di-load
-  // setelah game.js tetap bisa membaca state awal.
-  window.SB.state = state;
+// State pertama dibuat saat file dimuat agar modul lain bisa membacanya
+// sebelum init() (mis. SB.Audio.init(state) dari main.js).
+window.SB.state = createState();
+
+function has(mod) {
+  return !!(window.SB && window.SB[mod]);
+}
+
+function safeCall(mod, fn) {
+  try {
+    if (has(mod) && typeof window.SB[mod][fn] === 'function') {
+      var args = Array.prototype.slice.call(arguments, 2);
+      return window.SB[mod][fn].apply(window.SB[mod], args);
+    }
+  } catch (err) {
+    if (typeof console !== 'undefined' && console.warn) {
+      console.warn('[SB.Game] ' + mod + '.' + fn + ' gagal: ' + (err && err.message ? err.message : err));
+    }
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// init()
+// ---------------------------------------------------------------------------
+
+function init() {
+  if (initialized) { return true; }
+  canvas = document.getElementById('game-canvas');
+  if (!canvas) { return false; }
+  // State segar (tahan terhadap init ganda dari main.js).
+  window.SB.state = createState();
+  if (window.SB.Game) { window.SB.Game.state = window.SB.state; }
+  var st = window.SB.state;
+  // Renderer.
+  if (!has('GL') || !window.SB.GL.init(canvas)) {
+    if (typeof console !== 'undefined' && console.error) {
+      console.error('[SB.Game] WebGL tidak tersedia');
+    }
+    return false;
+  }
+  window.SB.GL.setPerspective(62, 0.1, 900);
+  window.SB.GL.applyGoldenHour(st.timeOfDay);
+  window.SB.GL.setCamera(st.camera.eye, st.camera.look);
+  // Langit: kubus besar dari helper GL (bukan mesh modul lain).
+  if (window.SB.GL.skyCube) { skyMesh = window.SB.GL.skyCube(420); }
+  // Reputasi awal tiap distrik (0 = netral, naik lewat misi/balapan).
+  var districts = [];
+  if (has('City') && Array.isArray(window.SB.City.districts)) {
+    districts = window.SB.City.districts;
+  } else {
+    districts = ['Sunset Beach', 'Marina Bay', 'Old Town', 'Downtown',
+      'Harbour', 'North Hills', 'Palm Avenue', 'Fisherman Wharf',
+      'Neon Strip', 'University', 'Airport Road', 'South Docks'];
+  }
+  for (var i = 0; i < districts.length; i++) {
+    st.districtRep[districts[i]] = 0;
+  }
+  // Init modul — URUTAN LOAD spec (bukan urutan alfabet).
+  safeCall('Rng', 'make', 1337);
+  safeCall('City', 'init', st);
+  safeCall('Water', 'init', st);
+  safeCall('Vehicles', 'init', st);
+  safeCall('Player', 'init', st);
+  safeCall('NPC', 'init', st);
+  safeCall('Police', 'init', st);
+  safeCall('Crew', 'init', st);
+  safeCall('Economy', 'init', st);
+  safeCall('Races', 'init', st);
+  safeCall('Weather', 'init', st);
+  safeCall('FX', 'init', st);
+  safeCall('Audio', 'init', st);
+  safeCall('HUD', 'init', st);
+  safeCall('Shots', 'init', st);
+  safeCall('Jobs', 'init', st);
+  // Misi pertama aktif sejak awal (hadiah +$200 & REP+100 bila selesai).
+  // ID harus 'm01' — id misi di Jobs (bukan 'mission-01').
+  safeCall('Jobs', 'startMission', 'm01');
+  initialized = true;
+  started = false;
+  frameCount = 0;
+  return true;
+}
+
+// Reset ke state baru (tombol MAIN LAGI / mulai baru setelah pernah main).
+function reset() {
+  window.SB.state = createState();
+  if (window.SB.Game) { window.SB.Game.state = window.SB.state; }
+  var st = window.SB.state;
+  paused = false;
+  started = false;
+  frameCount = 0;
+  cameraMode = 0;
+  cameraYaw = 0;
+  if (window.SB.GL) { window.SB.GL.applyGoldenHour(st.timeOfDay); }
+  safeCall('City', 'init', st);
+  safeCall('Water', 'init', st);
+  safeCall('Vehicles', 'init', st);
+  safeCall('Player', 'init', st);
+  safeCall('NPC', 'init', st);
+  safeCall('Police', 'init', st);
+  safeCall('Crew', 'init', st);
+  safeCall('Economy', 'init', st);
+  safeCall('Races', 'init', st);
+  safeCall('Weather', 'init', st);
+  safeCall('FX', 'init', st);
+  safeCall('HUD', 'init', st);
+  safeCall('Shots', 'init', st);
+  safeCall('Jobs', 'init', st);
+  safeCall('Jobs', 'startMission', 'm01');
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// frame(dt) — satu frame penuh: update lalu draw
+// ---------------------------------------------------------------------------
+
+function frame(dt) {
+  if (!initialized) { return; }
+  if (paused) { return; }
+  var st = window.SB.state;
+  if (!st) { return; }
+  var d = (typeof dt === 'number' && dt > 0) ? dt : 0.016;
+  if (d > 0.05) { d = 0.05; }
+  frameCount++;
+  st.time += d;
+  update(d, st);
+  draw(st);
+  if (window.SB.GL && window.SB.GL.nextFrame) { window.SB.GL.nextFrame(); }
+}
+
+// ---------------------------------------------------------------------------
+// update(dt, state)
+// ---------------------------------------------------------------------------
+
+function update(dt, st) {
+  // Waktu dunia: 1 detik nyata = 1 menit game (siang-malam terasa berjalan).
+  // advanceTime milik Weather; fallback bila modul belum ada: hitung sendiri.
+  if (has('Weather') && typeof window.SB.Weather.advanceTime === 'function') {
+    window.SB.Weather.advanceTime(dt);
+  } else {
+    st.timeOfDay += dt / 60;
+    if (st.timeOfDay >= 24) { st.timeOfDay -= 24; st.day++; }
+  }
+  // Pergantian hari: 00:00 -> hari baru, pemasukan bisnis masuk.
+  if (st.timeOfDay < 0.05 && !dayRolloverDone) {
+    dayRolloverDone = true;
+    st.day++;
+    onNewDay(st);
+  }
+  if (st.timeOfDay > 0.2) { dayRolloverDone = false; }
+  // Golden hour mengikuti jam (matahari, kabut, neon).
+  if (window.SB.GL && window.SB.GL.applyGoldenHour) {
+    window.SB.GL.applyGoldenHour(st.timeOfDay);
+  }
+  // Input global (radio, kamera, senjata, isi ulang) — dibaca sekali di sini.
+  handleGlobalInput(st);
+  // Heat mereda perlahan bila tidak ada wanted.
+  heatDecayTimer += dt;
+  if (heatDecayTimer > 1) {
+    heatDecayTimer = 0;
+    if (st.wanted === 0 && st.heat > 0) { st.heat = Math.max(0, st.heat - 1); }
+    if (st.wanted > 0 && st.heat < 100) { st.heat = Math.min(100, st.heat + 0.5); }
+  }
+  // Sinkron wanted -> Police + HUD (satu sumber kebenaran: SB.state).
+  syncWanted(st);
+  // Update modul — urutan logika (bukan urutan gambar).
+  safeCall('Weather', 'update', dt, st);
+  safeCall('Jobs', 'update', dt, st);
+  safeCall('Races', 'update', dt, st);
+  safeCall('Economy', 'update', dt, st);
+  safeCall('Crew', 'update', dt, st);
+  safeCall('Player', 'update', dt, st, readInput());
+  safeCall('Vehicles', 'update', dt, st);
+  // Speedometer HUD dinamis: tidak ada modul yang memanggil HUD.setSpeed,
+  // sehingga .hud-speed selalu 0 km/h saat mengemudi. Isi dari kendaraan
+  // pemain (satuan sama dengan #hud-speed statis: |speed| * 3.6).
+  if (window.SB.HUD && window.SB.HUD.setSpeed) {
+    var _v = st.player && st.player.vehicle;
+    window.SB.HUD.setSpeed((_v && typeof _v.speed === 'number') ? Math.abs(_v.speed) * 3.6 : 0);
+  }
+  safeCall('Water', 'update', dt, st);
+  safeCall('NPC', 'update', dt, st);
+  safeCall('Police', 'update', dt, st);
+  safeCall('FX', 'update', dt, st);
+  safeCall('Audio', 'update', dt, st);
+  // Kamera mengikuti pemain / kendaraan.
+  updateCamera(dt, st);
+  // HUD + minimap (setelah semua modul update agar angka terbaru).
+  syncHud(st);
+  // Rank respect dihitung ulang dari respect total.
+  updateRespectRank(st);
+  // Misi selesai -> hadiah (Jobs yang memutuskan; di sini hanya sinkron).
+  if (st.mission && st.mission.id && st.flags && st.flags['mission-complete']) {
+    st.flags['mission-complete'] = false;
+    completeMissionReward(st);
+  }
+  // Pemain mati -> respawn di rumah sakit (bukan game over total).
+  if (st.player.hp <= 0) {
+    respawnPlayer(st);
+  }
+  // Autosave internal tiap 60 detik (main.js juga memanggil save()).
+  autosaveTimer += dt;
+  if (autosaveTimer > 60) { autosaveTimer = 0; save(); }
+}
+
+function onNewDay(st) {
+  var income = 0;
+  if (has('Economy') && typeof window.SB.Economy.collectIncome === 'function') {
+    try { income = window.SB.Economy.collectIncome() || 0; } catch (e) { income = 0; }
+  }
+  var msg = 'Hari ' + st.day + ' — matahari terbit di Sunset Bay.';
+  if (income > 0) { msg += ' Pemasukan bisnis: +$' + income + '.'; }
+  if (window.SB.HUD && window.SB.HUD.showToast) { window.SB.HUD.showToast(msg); }
+}
+
+function syncWanted(st) {
+  var w = Math.max(0, Math.min(5, st.wanted | 0));
+  st.wanted = w;
+  if (has('Police') && typeof window.SB.Police.setWanted === 'function') {
+    try { window.SB.Police.setWanted(w); } catch (e) { /* abaikan */ }
+  }
+  if (window.SB.HUD && window.SB.HUD.setWanted) {
+    try { window.SB.HUD.setWanted(w); } catch (e) { /* abaikan */ }
+  }
+}
+
+function updateRespectRank(st) {
+  var r = st.respect || 0;
+  var rank = 'Rookie';
+  // Ambang HARUS sama dengan Economy.RANKS (Street 300, Boss 800, Kingpin 1800).
+  if (r >= 1800) { rank = 'Kingpin'; }
+  else if (r >= 800) { rank = 'Boss'; }
+  else if (r >= 300) { rank = 'Street'; }
+  if (rank !== st.respectRank) {
+    st.respectRank = rank;
+    // JANGAN panggil Economy.rankUp() di sini: rankUp() menaikkan respect
+    // ke ambang rank BERIKUTNYA sehingga rank melonjak ke Kingpin sendiri.
+    if (window.SB.HUD && window.SB.HUD.showToast) {
+      window.SB.HUD.showToast('Respect naik: kamu sekarang ' + rank + '!');
+    }
+  }
+}
+
+function completeMissionReward(st) {
+  var reward = (st.mission && st.mission.reward) || 200;
+  st.money += reward;
+  st.rep += 100;
+  st.respect += 50;
+  st.stats.missionsDone++;
+  if (window.SB.HUD && window.SB.HUD.showToast) {
+    window.SB.HUD.showToast('Misi selesai! +$' + reward + ' & REP+100');
+  }
+  if (window.SB.HUD && window.SB.HUD.setMoney) {
+    try { window.SB.HUD.setMoney(st.money); } catch (e) { /* abaikan */ }
+  }
+}
+
+function respawnPlayer(st) {
+  st.player.hp = 100;
+  st.player.armor = 0;
+  st.player.x = 0; st.player.y = 0; st.player.z = 0;
+  st.player.angle = 0;
+  st.player.onFoot = true;
+  st.player.vehicle = null;
+  st.money = Math.max(0, st.money - 100);
+  st.wanted = 0;
+  st.heat = Math.max(0, st.heat - 20);
+  if (window.SB.HUD && window.SB.HUD.showToast) {
+    window.SB.HUD.showToast('Kamu tumbang. Bangun di rumah sakit — -$100.');
+  }
+  if (has('Player') && typeof window.SB.Player.init === 'function') {
+    try { window.SB.Player.init(st); } catch (e) { /* abaikan */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Input global: dibaca main.js lewat SB.Input; fallback keyboard mentah
+// ---------------------------------------------------------------------------
+
+function readInput() {
+  // Bentuk input yang dibaca SB.Player.update: moveX/moveZ (sumbu gerak),
+  // action (E, edge), sprint, shoot, lookDX/lookDY (mouse). Field legacy
+  // (forward/back/...) dipertahankan untuk kompatibilitas.
+  var input = { moveX: 0, moveZ: 0, action: false, sprint: false,
+    shoot: false, lookDX: 0, lookDY: 0,
+    forward: false, back: false, left: false, right: false,
+    run: false, jump: false, interact: false,
+    mouseDX: 0, mouseDY: 0, wheel: 0 };
+  if (window.SB.Input) {
+    try {
+      var fwd = !!window.SB.Input.actionDown('forward');
+      var back = !!window.SB.Input.actionDown('back');
+      var left = !!window.SB.Input.actionDown('left');
+      var right = !!window.SB.Input.actionDown('right');
+      input.moveZ = (fwd ? 1 : 0) - (back ? 1 : 0);
+      input.moveX = (right ? 1 : 0) - (left ? 1 : 0);
+      input.forward = fwd; input.back = back;
+      input.left = left; input.right = right;
+      input.sprint = !!window.SB.Input.actionDown('run');
+      input.run = input.sprint;
+      input.jump = !!window.SB.Input.actionPressed('jump');
+      input.action = !!window.SB.Input.actionPressed('interact');
+      input.interact = input.action;
+      input.shoot = !!window.SB.Input.actionDown('shoot');
+      var md = window.SB.Input.getMouseDelta();
+      input.lookDX = md.x || 0;
+      input.lookDY = md.y || 0;
+      input.mouseDX = input.lookDX;
+      input.mouseDY = input.lookDY;
+      input.wheel = window.SB.Input.getWheelDelta ? window.SB.Input.getWheelDelta() : 0;
+    } catch (e) { /* input gagal: pakai default (diam) */ }
+  }
+  return input;
+}
+
+function handleGlobalInput(st) {
+  if (!window.SB.Input) { return; }
+  var inp = window.SB.Input;
+  // M: ganti stasiun radio (0-5, ORIGINAL, diegetik).
+  var radioDown = false;
+  try { radioDown = inp.actionPressed('radio'); } catch (e) { radioDown = false; }
+  if (radioDown && !lastRadioKey) {
+    st.radio = (st.radio + 1) % 6;
+    if (has('Audio') && typeof window.SB.Audio.setStation === 'function') {
+      try { window.SB.Audio.setStation(st.radio); } catch (e) { /* abaikan */ }
+    }
+    var names = ['Sunset FM', 'Neon Nights', 'Bay Talk', 'Palm Radio', 'Harbour Beats', 'Midnight Drive'];
+    if (has('Audio') && Array.isArray(window.SB.Audio.stations) && window.SB.Audio.stations[st.radio]) {
+      names[st.radio] = window.SB.Audio.stations[st.radio];
+    }
+    if (window.SB.HUD && window.SB.HUD.showToast) {
+      window.SB.HUD.showToast('Radio: ' + names[st.radio]);
+    }
+  }
+  lastRadioKey = radioDown;
+  // C: ganti mode kamera.
+  var camDown = false;
+  try { camDown = inp.actionPressed('camera'); } catch (e) { camDown = false; }
+  if (camDown && !lastCameraKey) {
+    cameraMode = (cameraMode + 1) % 3;
+  }
+  lastCameraKey = camDown;
+  // 1-4: ganti senjata (0=pistol 1=smg 2=shotgun 3=rifle).
+  var weaponNames = ['PISTOL', 'SMG', 'SHOTGUN', 'RIFLE'];
+  for (var w = 0; w < 4; w++) {
+    var pressed = false;
+    try { pressed = inp.isPressed('Digit' + (w + 1)); } catch (e) { pressed = false; }
+    if (pressed && st.weapon !== w) {
+      st.weapon = w;
+      if (window.SB.HUD && window.SB.HUD.showToast) {
+        window.SB.HUD.showToast('Senjata: ' + weaponNames[w]);
+      }
+    }
+  }
+  // R: isi ulang amunisi — $50 / +24 (SB.Shots.buyAmmo).
+  var reloadDown = false;
+  try { reloadDown = inp.actionPressed('reload'); } catch (e) { reloadDown = false; }
+  if (reloadDown) {
+    if (has('Shots') && typeof window.SB.Shots.buyAmmo === 'function') {
+      try { window.SB.Shots.buyAmmo(); } catch (e) { /* abaikan */ }
+    } else if (st.money >= 50) {
+      st.money -= 50;
+      st.ammo += 24;
+    }
+  }
+  // N: mute/unmute audio.
+  var muteDown = false;
+  try { muteDown = inp.isPressed('KeyN'); } catch (e) { muteDown = false; }
+  if (muteDown && has('Audio') && typeof window.SB.Audio.toggleMute === 'function') {
+    try { window.SB.Audio.toggleMute(); } catch (e) { /* abaikan */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Kamera: mengikuti pemain / kendaraan; attract mode saat belum mulai
+// ---------------------------------------------------------------------------
+
+function updateCamera(dt, st) {
+  var M = window.SB.Math3;
+  var p = st.player;
+  if (!started) {
+    // Attract mode (layar start): kamera mengorbit kota perlahan.
+    attractAngle += dt * 0.05;
+    var ax = Math.sin(attractAngle) * 90;
+    var az = Math.cos(attractAngle) * 90;
+    cameraEye = { x: ax, y: 26, z: az };
+    cameraTarget = { x: 0, y: 4, z: 0 };
+  } else if (cameraMode === 2) {
+    // Top-down: dari atas pemain, untuk melihat rute / minimap besar.
+    cameraEye = { x: p.x, y: 60, z: p.z + 0.01 };
+    cameraTarget = { x: p.x, y: 0, z: p.z };
+  } else {
+    var dist = (cameraMode === 1) ? 18 : 11;
+    var height = (cameraMode === 1) ? 7 : 4.5;
+    // Saat di kendaraan, kamera lebih jauh & lebih tinggi: +1,5 HARUS masuk
+    // ke target (cy) SEBELUM lerp. Versi lama menambahkannya ke cameraEye.y
+    // SETELAH lerp tiap frame, sehingga titik tetapnya jadi 4,5+1,5/0,3=9,5
+    // (kamera terlalu tinggi, menunduk ~35 derajat, langit/heli tak terlihat).
+    if (!p.onFoot && p.vehicle) { height += 1.5; }
+    // Yaw kamera mengikuti arah pemain + drag mouse.
+    var input = readInput();
+    if (input.mouseDX) { cameraYaw -= input.mouseDX * 0.003; }
+    var targetYaw = p.angle + Math.PI + cameraYaw;
+    var cx = p.x + Math.sin(targetYaw) * dist;
+    var cz = p.z + Math.cos(targetYaw) * dist;
+    var cy = p.y + height;
+    // Haluskan (lerp) agar kamera tidak patah-patah.
+    var k = Math.min(1, dt * 6);
+    cameraEye.x += (cx - cameraEye.x) * k;
+    cameraEye.y += (cy - cameraEye.y) * k;
+    cameraEye.z += (cz - cameraEye.z) * k;
+    if (cameraEye.y < 1.2) { cameraEye.y = 1.2; }
+    cameraTarget = { x: p.x, y: p.y + 1.5, z: p.z };
+  }
+  st.camera.eye = { x: cameraEye.x, y: cameraEye.y, z: cameraEye.z };
+  st.camera.look = { x: cameraTarget.x, y: cameraTarget.y, z: cameraTarget.z };
+  if (window.SB.GL && window.SB.GL.setCamera) {
+    window.SB.GL.setCamera(st.camera.eye, st.camera.look);
+  }
+  if (window.SB.GL && window.SB.GL.setPerspective) {
+    // FOV melebar sedikit saat ngebut (rasa kecepatan).
+    var speed = 0;
+    if (!p.onFoot && p.vehicle && typeof p.vehicle.speed === 'number') {
+      speed = Math.abs(p.vehicle.speed);
+    }
+    var fov = 62 + Math.min(10, speed * 0.12);
+    window.SB.GL.setPerspective(fov, 0.1, 900);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// draw(state)
+// ---------------------------------------------------------------------------
+
+function draw(st) {
+  var GL = window.SB.GL;
+  if (!GL) { return; }
+  // Resize bila ukuran kanvas berubah (jendela / rotasi HP).
+  if (GL.resize) { GL.resize(); }
+  // Pass bayangan dulu (depth ke shadow map), lalu gambar utama.
+  if (GL.beginShadow && GL.beginShadow()) {
+    drawWorld(st, true);
+    GL.endShadow();
+  }
+  // Langit gradien golden hour + matahari (sebelum objek lain).
+  var sky = [0.98, 0.62, 0.38];
+  if (GL.clear) { GL.clear(sky[0], sky[1], sky[2]); }
+  if (skyMesh && GL.drawSky) {
+    try { GL.drawSky(skyMesh, st.time); } catch (e) { /* abaikan */ }
+  }
+  drawWorld(st, false);
+  // Vignette ringan (post-processing sederhana).
+  if (GL.drawVignette && GL.fullscreenQuad) {
+    try { GL.drawVignette(GL.fullscreenQuad(), 0.18); } catch (e) { /* abaikan */ }
+  }
+}
+
+// Gambar seluruh dunia. shadowOnly=true -> hanya mesh padat (tanpa air/FX).
+function drawWorld(st, shadowOnly) {
+  var GL = window.SB.GL;
+  // Kota: >250 gedung, 12+ distrik, jalan, palma, neon malam.
+  safeCall('City', 'draw', GL, st);
+  if (shadowOnly) { return; }
+  // Air: laut reflektif + perahu (5+) + wake.
+  safeCall('Water', 'draw', GL, st);
+  // Kendaraan: 36+ traffic + mobil pemain.
+  safeCall('Vehicles', 'draw', GL, st);
+  // Pemain (jalan kaki / mengemudi).
+  safeCall('Player', 'draw', GL, st);
+  // NPC: 24+ pejalan kaki, turis pantai, hewan peliharaan.
+  safeCall('NPC', 'draw', GL, st);
+  // Polisi: patroli, roadblock, heli AIR-1 (wanted >= 3).
+  safeCall('Police', 'draw', GL, st);
+  // FX: ledakan, asap, api, partikel, percikan.
+  safeCall('FX', 'draw', GL, st);
+  // Jobs / Races tidak menggambar mesh sendiri lewat drawWorld — mereka
+  // memakai marker lewat HUD/minimap; bila suatu saat punya draw, panggil:
+  safeCall('Jobs', 'draw', GL, st);
+  safeCall('Races', 'draw', GL, st);
+  safeCall('Crew', 'draw', GL, st);
+}
+
+// ---------------------------------------------------------------------------
+// HUD sync: angka di index.html + modul SB.HUD + minimap
+// ---------------------------------------------------------------------------
+
+function syncHud(st) {
+  // Modul HUD (bila ada): update(state) + minimap(state).
+  if (has('HUD')) {
+    if (typeof window.SB.HUD.update === 'function') {
+      try { window.SB.HUD.update(st); } catch (e) { /* abaikan */ }
+    }
+    if (typeof window.SB.HUD.minimap === 'function') {
+      try { window.SB.HUD.minimap(st); } catch (e) { /* abaikan */ }
+    }
+    if (typeof window.SB.HUD.setMoney === 'function') {
+      try { window.SB.HUD.setMoney(st.money); } catch (e) { /* abaikan */ }
+    }
+  }
+  // Fallback DOM langsung (agar HUD tetap hidup walau SB.HUD belum siap).
+  var el;
+  el = document.getElementById('hud-money');
+  if (el) { el.innerHTML = '$' + st.money + ' <small>REP ' + st.rep + ' &middot; ' + st.respectRank + '</small>'; }
+  el = document.getElementById('hud-hp-num');
+  if (el) { el.textContent = String(Math.max(0, Math.round(st.player.hp))); }
+  el = document.getElementById('hud-armor-num');
+  if (el) { el.textContent = String(Math.max(0, Math.round(st.player.armor))); }
+  el = document.getElementById('hud-health-fill');
+  if (el) { el.style.width = Math.max(0, Math.min(100, st.player.hp)) + '%'; }
+  el = document.getElementById('hud-armor-fill');
+  if (el) { el.style.width = Math.max(0, Math.min(100, st.player.armor)) + '%'; }
+  el = document.getElementById('hud-heat-num');
+  if (el) { el.textContent = String(Math.round(st.heat)); }
+  el = document.getElementById('hud-heat-fill');
+  if (el) { el.style.width = Math.max(0, Math.min(100, st.heat)) + '%'; }
+  el = document.getElementById('hud-time');
+  if (el) { el.textContent = formatClock(st.timeOfDay); }
+  el = document.getElementById('hud-day');
+  if (el) {
+    var label = 'Hari ' + st.day;
+    if (st.timeOfDay >= 17.5 && st.timeOfDay <= 19.5) { label += ' &middot; Golden Hour'; }
+    else if (st.timeOfDay >= 19.5 || st.timeOfDay < 5.5) { label += ' &middot; Malam'; }
+    else if (st.timeOfDay >= 5.5 && st.timeOfDay < 11) { label += ' &middot; Pagi'; }
+    else { label += ' &middot; Siang'; }
+    el.innerHTML = label;
+  }
+  el = document.getElementById('hud-weather');
+  if (el) {
+    var w = st.weather;
+    var wt = (w.rain > 0.3) ? 'Hujan lokal' : (w.clouds > 0.6 ? 'Berawan' : 'Cerah');
+    wt += ' &middot; Angin ' + (w.wind > 0.5 ? 'kencang' : 'sepoi');
+    if (w.puddles > 0.1) { wt += ' &middot; Genangan'; }
+    el.textContent = wt;
+  }
+  el = document.getElementById('hud-weapon');
+  if (el) {
+    var wn = ['PISTOL', 'SMG', 'SHOTGUN', 'RIFLE'][st.weapon] || 'PISTOL';
+    el.textContent = wn + ' &middot; Ammo ' + st.ammo + ' &middot; [1-4] ganti senjata &middot; [R] isi ulang';
+  }
+  el = document.getElementById('hud-wanted');
+  if (el) {
+    var stars = '';
+    for (var i = 0; i < 5; i++) {
+      stars += (i < st.wanted) ? '&#9733;' : '<span class="star-off">&#9733;</span>';
+    }
+    el.innerHTML = stars;
+  }
+  el = document.getElementById('hud-mission-text');
+  if (el) {
+    if (st.mission && st.mission.text) { el.textContent = st.mission.text; }
+    else { el.textContent = 'Jelajahi Sunset Bay. Cari ikon misi di peta.'; }
+  }
+  el = document.getElementById('hud-zone');
+  if (el) {
+    var zone = 'Sunset Beach';
+    if (has('City') && typeof window.SB.City.districtAt === 'function') {
+      try { zone = window.SB.City.districtAt(st.player.x, st.player.z) || zone; } catch (e) { /* abaikan */ }
+    }
+    el.textContent = zone;
+  }
+  el = document.getElementById('hud-radio');
+  if (el) {
+    var stations = ['Sunset FM', 'Neon Nights', 'Bay Talk', 'Palm Radio', 'Harbour Beats', 'Midnight Drive'];
+    if (has('Audio') && Array.isArray(window.SB.Audio.stations) && window.SB.Audio.stations[st.radio]) {
+      stations[st.radio] = window.SB.Audio.stations[st.radio];
+    }
+    el.innerHTML = '&#9834; ' + stations[st.radio];
+  }
+  el = document.getElementById('hud-speed');
+  if (el) {
+    var kmh = 0;
+    if (!st.player.onFoot && st.player.vehicle && typeof st.player.vehicle.speed === 'number') {
+      kmh = Math.round(Math.abs(st.player.vehicle.speed) * 3.6);
+    } else if (st.player.onFoot) {
+      kmh = 0;
+    }
+    el.innerHTML = kmh + ' <small>km/j</small>';
+  }
+  el = document.getElementById('hud-wanted-flash');
+  if (el) { el.style.display = (st.wanted >= 3) ? 'block' : 'none'; }
+  el = document.getElementById('hud-objective');
+  if (el) {
+    if (st.mission && st.mission.text) {
+      el.textContent = 'Misi ' + (st.mission.id || '') + ': ' + st.mission.text;
+    } else {
+      // Misi selesai / belum ada: jangan biarkan teks stage lama menempel.
+      el.textContent = 'Tidak ada misi aktif — cari pekerjaan di marina.';
+    }
+  }
+}
+
+function formatClock(hour) {
+  var h = Math.floor(hour) % 24;
+  var m = Math.floor((hour - Math.floor(hour)) * 60);
+  var hh = (h < 10 ? '0' : '') + h;
+  var mm = (m < 10 ? '0' : '') + m;
+  return hh + ':' + mm;
+}
+
+// ---------------------------------------------------------------------------
+// save() / load() — localStorage (Continue)
+// ---------------------------------------------------------------------------
+
+function save() {
+  if (!initialized) { return false; }
+  var st = window.SB.state;
+  if (!st) { return false; }
+  var data = {
+    version: SAVE_VERSION,
+    savedAt: Date.now(),
+    time: st.time, timeOfDay: st.timeOfDay, day: st.day,
+    money: st.money, rep: st.rep, respect: st.respect, respectRank: st.respectRank,
+    wanted: st.wanted, heat: st.heat,
+    player: { x: st.player.x, y: st.player.y, z: st.player.z,
+      angle: st.player.angle, onFoot: st.player.onFoot,
+      hp: st.player.hp, armor: st.player.armor },
+    weather: { rain: st.weather.rain, clouds: st.weather.clouds,
+      wind: st.weather.wind, puddles: st.weather.puddles },
+    mission: { id: st.mission.id, stage: st.mission.stage,
+      text: st.mission.text, reward: st.mission.reward },
+    crew: st.crew.slice(),
+    districtRep: st.districtRep,
+    businesses: st.businesses.slice(),
+    radio: st.radio, ammo: st.ammo, weapon: st.weapon,
+    stats: { kills: st.stats.kills, carsStolen: st.stats.carsStolen,
+      drifts: st.stats.drifts, racesWon: st.stats.racesWon,
+      missionsDone: st.stats.missionsDone },
+    flags: st.flags
+  };
+  try {
+    window.localStorage.setItem(SAVE_KEY, JSON.stringify(data));
+    // Segarkan tombol Continue (di layar start) agar langsung bisa dipakai.
+    var cbtn = document.getElementById('btn-continue');
+    if (cbtn) { cbtn.style.display = ''; cbtn.disabled = false; cbtn.style.opacity = '1'; }
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function load() {
+  if (!initialized) { return false; }
+  var raw = null;
+  try { raw = window.localStorage.getItem(SAVE_KEY); } catch (err) { return false; }
+  if (!raw) { return false; }
+  var data = null;
+  try { data = JSON.parse(raw); } catch (err) { return false; }
+  if (!data || data.version !== SAVE_VERSION) { return false; }
+  var st = window.SB.state;
+  // Hanya field yang dikenal yang dipulihkan; sisanya tetap default aman.
+  if (typeof data.time === 'number') { st.time = data.time; }
+  if (typeof data.timeOfDay === 'number') { st.timeOfDay = data.timeOfDay; }
+  if (typeof data.day === 'number') { st.day = data.day; }
+  if (typeof data.money === 'number') { st.money = data.money; }
+  if (typeof data.rep === 'number') { st.rep = data.rep; }
+  if (typeof data.respect === 'number') { st.respect = data.respect; }
+  if (typeof data.respectRank === 'string') { st.respectRank = data.respectRank; }
+  if (typeof data.wanted === 'number') { st.wanted = Math.max(0, Math.min(5, data.wanted)); }
+  if (typeof data.heat === 'number') { st.heat = Math.max(0, Math.min(100, data.heat)); }
+  if (data.player) {
+    if (typeof data.player.x === 'number') { st.player.x = data.player.x; }
+    if (typeof data.player.y === 'number') { st.player.y = data.player.y; }
+    if (typeof data.player.z === 'number') { st.player.z = data.player.z; }
+    if (typeof data.player.angle === 'number') { st.player.angle = data.player.angle; }
+    if (typeof data.player.onFoot === 'boolean') { st.player.onFoot = data.player.onFoot; }
+    if (typeof data.player.hp === 'number') { st.player.hp = data.player.hp; }
+    if (typeof data.player.armor === 'number') { st.player.armor = data.player.armor; }
+    st.player.vehicle = null;
+  }
+  if (data.weather) {
+    if (typeof data.weather.rain === 'number') { st.weather.rain = data.weather.rain; }
+    if (typeof data.weather.clouds === 'number') { st.weather.clouds = data.weather.clouds; }
+    if (typeof data.weather.wind === 'number') { st.weather.wind = data.weather.wind; }
+    if (typeof data.weather.puddles === 'number') { st.weather.puddles = data.weather.puddles; }
+  }
+  if (data.mission) {
+    st.mission = {
+      id: data.mission.id || null,
+      stage: data.mission.stage || 0,
+      text: data.mission.text || '',
+      reward: data.mission.reward || 0
+    };
+  }
+  if (Array.isArray(data.crew)) { st.crew = data.crew.slice(); }
+  if (data.districtRep) { st.districtRep = data.districtRep; }
+  if (Array.isArray(data.businesses)) { st.businesses = data.businesses.slice(); }
+  if (typeof data.radio === 'number') { st.radio = data.radio % 6; }
+  if (typeof data.ammo === 'number') { st.ammo = data.ammo; }
+  if (typeof data.weapon === 'number') { st.weapon = data.weapon % 4; }
+  if (data.stats) {
+    if (typeof data.stats.kills === 'number') { st.stats.kills = data.stats.kills; }
+    if (typeof data.stats.carsStolen === 'number') { st.stats.carsStolen = data.stats.carsStolen; }
+    if (typeof data.stats.drifts === 'number') { st.stats.drifts = data.stats.drifts; }
+    if (typeof data.stats.racesWon === 'number') { st.stats.racesWon = data.stats.racesWon; }
+    if (typeof data.stats.missionsDone === 'number') { st.stats.missionsDone = data.stats.missionsDone; }
+  }
+  if (data.flags) { st.flags = data.flags; }
+  // Sinkronkan dunia dengan state yang dipulihkan.
+  if (window.SB.GL) { window.SB.GL.applyGoldenHour(st.timeOfDay); }
+  safeCall('Player', 'init', st);
+  safeCall('Police', 'setWanted', st.wanted);
+  syncWanted(st);
+  syncHud(st);
+  if (window.SB.HUD && window.SB.HUD.showToast) {
+    window.SB.HUD.showToast('Save dimuat — selamat datang kembali di Sunset Bay.');
+  }
+  return true;
+}
+
+function hasSave() {
+  try { return !!window.localStorage.getItem(SAVE_KEY); } catch (err) { return false; }
+}
+
+function clearSave() {
+  try { window.localStorage.removeItem(SAVE_KEY); return true; } catch (err) { return false; }
+}
+
+// ---------------------------------------------------------------------------
+// pause() / resume()
+// ---------------------------------------------------------------------------
+
+function pause() {
+  paused = true;
+  if (window.SB.Audio && typeof window.SB.Audio.toggleMute === 'function') {
+    // Jangan mute permanen saat pause — hanya catat; audio modul yang atur.
+  }
+  return true;
+}
+
+function resume() {
+  paused = false;
+  started = true;
+  return true;
+}
+
+function isPaused() { return paused; }
+function isStarted() { return started; }
+function isInitialized() { return initialized; }
+function getFrameCount() { return frameCount; }
+
+// API bantuan untuk modul lain / debug (tidak mengubah state diam-diam).
+function setWanted(n) {
+  var st = window.SB.state;
+  if (!st) { return; }
+  st.wanted = Math.max(0, Math.min(5, n | 0));
+  syncWanted(st);
+}
+
+function addMoney(n) {
+  var st = window.SB.state;
+  if (!st) { return 0; }
+  st.money = Math.max(0, st.money + (n | 0));
+  return st.money;
+}
+
+function addRep(n) {
+  var st = window.SB.state;
+  if (!st) { return 0; }
+  st.rep += (n | 0);
+  st.respect += (n | 0);
+  updateRespectRank(st);
+  return st.rep;
+}
+
+function setMission(id, stage, text, reward) {
+  var st = window.SB.state;
+  if (!st) { return; }
+  st.mission = { id: id || null, stage: stage || 0, text: text || '', reward: reward || 0 };
+  if (window.SB.HUD && window.SB.HUD.showMission) {
+    try { window.SB.HUD.showMission(text); } catch (e) { /* abaikan */ }
+  }
+  syncHud(st);
+}
+
+function getCameraMode() { return cameraMode; }
+function setCameraMode(m) { cameraMode = Math.max(0, Math.min(2, m | 0)); }
+
+// ---------------------------------------------------------------------------
+// Reputasi distrik (12+ distrik): pengaruhi harga & reaksi NPC
+// ---------------------------------------------------------------------------
+
+function getDistrictRep(name) {
+  var st = window.SB.state;
+  if (!st || !st.districtRep) { return 0; }
+  var v = st.districtRep[name];
+  return (typeof v === 'number') ? v : 0;
+}
+
+function addDistrictRep(name, delta) {
+  var st = window.SB.state;
+  if (!st) { return 0; }
+  if (!st.districtRep) { st.districtRep = {}; }
+  var cur = getDistrictRep(name);
+  var next = Math.max(0, Math.min(100, cur + (delta | 0)));
+  st.districtRep[name] = next;
+  return next;
+}
+
+function setDistrictRep(name, value) {
+  var st = window.SB.state;
+  if (!st) { return 0; }
+  if (!st.districtRep) { st.districtRep = {}; }
+  var next = Math.max(0, Math.min(100, value | 0));
+  st.districtRep[name] = next;
+  return next;
+}
+
+// Pengali harga di distrik: rep tinggi -> diskon (0.85), rep 0 -> harga penuh.
+function districtPriceModifier(name) {
+  var rep = getDistrictRep(name);
+  if (rep >= 80) { return 0.85; }
+  if (rep >= 50) { return 0.92; }
+  if (rep >= 25) { return 0.97; }
+  return 1.0;
+}
+
+// Distrik dengan reputasi tertinggi (markas / wilayah kekuasaan pemain).
+function topDistrict() {
+  var st = window.SB.state;
+  if (!st || !st.districtRep) { return 'Sunset Beach'; }
+  var best = 'Sunset Beach', bestVal = -1;
+  var keys = Object.keys(st.districtRep);
+  for (var i = 0; i < keys.length; i++) {
+    var v = st.districtRep[keys[i]] || 0;
+    if (v > bestVal) { bestVal = v; best = keys[i]; }
+  }
+  return best;
+}
+
+// Rata-rata reputasi semua distrik (0..100).
+function averageDistrictRep() {
+  var st = window.SB.state;
+  if (!st || !st.districtRep) { return 0; }
+  var keys = Object.keys(st.districtRep);
+  if (!keys.length) { return 0; }
+  var sum = 0;
+  for (var i = 0; i < keys.length; i++) { sum += st.districtRep[keys[i]] || 0; }
+  return Math.round(sum / keys.length);
+}
+
+// ---------------------------------------------------------------------------
+// Wanted & Heat
+// ---------------------------------------------------------------------------
+
+function addHeat(n) {
+  var st = window.SB.state;
+  if (!st) { return 0; }
+  st.heat = Math.max(0, Math.min(100, st.heat + (n | 0)));
+  if (st.heat >= 80 && st.wanted < 2) { setWanted(2); }
+  else if (st.heat >= 50 && st.wanted < 1) { setWanted(1); }
+  return st.heat;
+}
+
+function clearWanted() {
+  var st = window.SB.state;
+  if (!st) { return; }
+  st.wanted = 0;
+  st.heat = 0;
+  syncWanted(st);
+  if (window.SB.HUD && window.SB.HUD.showToast) {
+    window.SB.HUD.showToast('Polisi kehilangan jejakmu. Wanted bersih.');
+  }
+}
+
+// Naik wanted satu tingkat (maks 5). Dipakai saat kejahatan terlihat NPC/polisi.
+function raiseWanted() {
+  var st = window.SB.state;
+  if (!st) { return 0; }
+  if (st.wanted < 5) { setWanted(st.wanted + 1); }
+  addHeat(15);
+  return st.wanted;
+}
+
+// ---------------------------------------------------------------------------
+// Misi: stage, gagal, dan heist showcase
+// ---------------------------------------------------------------------------
+
+function advanceMissionStage() {
+  var st = window.SB.state;
+  if (!st || !st.mission || !st.mission.id) { return false; }
+  if (has('Jobs') && typeof window.SB.Jobs.advanceStage === 'function') {
+    try { window.SB.Jobs.advanceStage(); } catch (e) { /* abaikan */ }
+  }
+  st.mission.stage++;
+  syncHud(st);
+  return true;
+}
+
+function failMission(reason) {
+  var st = window.SB.state;
+  if (!st) { return false; }
+  var msg = 'Misi gagal' + (reason ? ': ' + reason : '.') + ' Coba lagi.';
+  if (window.SB.HUD && window.SB.HUD.showToast) {
+    window.SB.HUD.showToast(msg);
+  }
+  // Misi diulang dari stage 0 (bukan game over).
+  if (st.mission) { st.mission.stage = 0; }
+  if (has('Jobs') && typeof window.SB.Jobs.startMission === 'function' && st.mission && st.mission.id) {
+    try { window.SB.Jobs.startMission(st.mission.id); } catch (e) { /* abaikan */ }
+  }
+  return true;
+}
+
+function startMission(id) {
+  var st = window.SB.state;
+  if (!st) { return false; }
+  var ok = false;
+  if (has('Jobs') && typeof window.SB.Jobs.startMission === 'function') {
+    try { ok = !!window.SB.Jobs.startMission(id); } catch (e) { ok = false; }
+  }
+  if (ok) {
+    st.mission = { id: id, stage: 0, text: 'Misi ' + id + ' dimulai.', reward: 200 };
+    syncHud(st);
+  }
+  return ok;
+}
+
+// Misi heist showcase 3 fase: recon -> eksekusi -> kabur ("The Harbour Lights Job").
+function startHeist() {
+  return startMission('harbour-lights-job');
+}
+
+// ---------------------------------------------------------------------------
+// Waktu dunia
+// ---------------------------------------------------------------------------
+
+function setTimeOfDay(hour) {
+  var st = window.SB.state;
+  if (!st) { return; }
+  st.timeOfDay = ((hour % 24) + 24) % 24;
+  if (window.SB.GL) { window.SB.GL.applyGoldenHour(st.timeOfDay); }
+}
+
+function skipToGoldenHour() {
+  setTimeOfDay(18.33);
+  if (window.SB.HUD && window.SB.HUD.showToast) {
+    window.SB.HUD.showToast('Golden hour — 18:20. Matahari terbenam di Sunset Bay.');
+  }
+}
+
+function skipToNight() {
+  setTimeOfDay(21.0);
+}
+
+function isNight() {
+  var st = window.SB.state;
+  if (!st) { return false; }
+  if (has('Weather') && typeof window.SB.Weather.isNight === 'function') {
+    try { return !!window.SB.Weather.isNight(); } catch (e) { return false; }
+  }
+  return (st.timeOfDay >= 19.5 || st.timeOfDay < 5.5);
+}
+
+function isGoldenHour() {
+  var st = window.SB.state;
+  if (!st) { return false; }
+  return st.timeOfDay >= 17.5 && st.timeOfDay <= 19.5;
+}
+
+// ---------------------------------------------------------------------------
+// Statistik dunia & validasi state (dipakai QA / layar debug)
+// ---------------------------------------------------------------------------
+
+function getWorldStats() {
+  var st = window.SB.state;
+  var stats = {
+    day: st ? st.day : 0, timeOfDay: st ? st.timeOfDay : 0,
+    money: st ? st.money : 0, wanted: st ? st.wanted : 0,
+    buildings: 0, cars: 0, pedestrians: 0, boats: 0,
+    missions: 0, races: 0, crew: st ? st.crew.length : 0,
+    businesses: st ? st.businesses.length : 0,
+    drawCalls: 0, triangles: 0, frame: frameCount
+  };
+  if (has('City') && Array.isArray(window.SB.City.buildings)) {
+    stats.buildings = window.SB.City.buildings.length;
+  }
+  if (has('Vehicles') && Array.isArray(window.SB.Vehicles.cars)) {
+    stats.cars = window.SB.Vehicles.cars.length;
+  }
+  if (has('NPC') && Array.isArray(window.SB.NPC.pedestrians)) {
+    stats.pedestrians = window.SB.NPC.pedestrians.length;
+  }
+  if (has('Water') && Array.isArray(window.SB.Water.boats)) {
+    stats.boats = window.SB.Water.boats.length;
+  }
+  if (has('Jobs') && Array.isArray(window.SB.Jobs.missions)) {
+    stats.missions = window.SB.Jobs.missions.length;
+  }
+  if (has('Races') && Array.isArray(window.SB.Races.races)) {
+    stats.races = window.SB.Races.races.length;
+  }
+  if (window.SB.GL && window.SB.GL.getStats) {
+    try {
+      var s = window.SB.GL.getStats();
+      stats.drawCalls = s.drawCalls;
+      stats.triangles = s.triangles;
+    } catch (e) { /* abaikan */ }
+  }
+  return stats;
+}
+
+// Periksa state sesuai spec: semua field wajib ada dengan tipe benar.
+// Mengembalikan array string masalah (kosong = valid).
+function validateState() {
+  var st = window.SB.state;
+  var problems = [];
+  if (!st) { problems.push('state hilang'); return problems; }
+  var required = ['time', 'timeOfDay', 'day', 'money', 'rep', 'respect',
+    'respectRank', 'wanted', 'heat', 'player', 'camera', 'weather',
+    'mission', 'crew', 'districtRep', 'businesses', 'race', 'radio',
+    'ammo', 'weapon', 'stats', 'flags'];
+  for (var i = 0; i < required.length; i++) {
+    if (st[required[i]] === undefined) { problems.push('field hilang: ' + required[i]); }
+  }
+  if (st.player) {
+    var pf = ['x', 'y', 'z', 'angle', 'onFoot', 'vehicle', 'hp', 'armor'];
+    for (var j = 0; j < pf.length; j++) {
+      if (st.player[pf[j]] === undefined) { problems.push('player field hilang: ' + pf[j]); }
+    }
+  }
+  if (st.camera) {
+    if (!st.camera.eye || st.camera.eye.x === undefined) { problems.push('camera.eye hilang'); }
+    if (!st.camera.look || st.camera.look.x === undefined) { problems.push('camera.look hilang'); }
+  }
+  if (st.weather) {
+    var wf = ['rain', 'rainArea', 'clouds', 'wind', 'puddles'];
+    for (var k = 0; k < wf.length; k++) {
+      if (st.weather[wf[k]] === undefined) { problems.push('weather field hilang: ' + wf[k]); }
+    }
+  }
+  if (st.stats) {
+    var sf = ['kills', 'carsStolen', 'drifts', 'racesWon', 'missionsDone'];
+    for (var m = 0; m < sf.length; m++) {
+      if (st.stats[sf[m]] === undefined) { problems.push('stats field hilang: ' + sf[m]); }
+    }
+  }
+  if (typeof st.wanted !== 'number' || st.wanted < 0 || st.wanted > 5) {
+    problems.push('wanted di luar 0-5: ' + st.wanted);
+  }
+  if (typeof st.heat !== 'number' || st.heat < 0 || st.heat > 100) {
+    problems.push('heat di luar 0-100: ' + st.heat);
+  }
+  if (typeof st.radio !== 'number' || st.radio < 0 || st.radio > 5) {
+    problems.push('radio di luar 0-5: ' + st.radio);
+  }
+  if (typeof st.weapon !== 'number' || st.weapon < 0 || st.weapon > 3) {
+    problems.push('weapon di luar 0-3: ' + st.weapon);
+  }
+  return problems;
+}
+
+// Ringkasan satu baris untuk log QA.
+function stateSummary() {
+  var st = window.SB.state;
+  if (!st) { return 'no-state'; }
+  return 'hari ' + st.day + ' ' + formatClock(st.timeOfDay) +
+    ' $' + st.money + ' rep ' + st.rep + ' ' + st.respectRank +
+    ' wanted ' + st.wanted + ' heat ' + Math.round(st.heat) +
+    ' misi ' + (st.mission && st.mission.id ? st.mission.id : '-') +
+    ' stage ' + (st.mission ? st.mission.stage : 0);
+}
+
+// ---------------------------------------------------------------------------
+// Screenshot & event kecil
+// ---------------------------------------------------------------------------
+
+function takeShot(name) {
+  if (has('Shots') && typeof window.SB.Shots.take === 'function') {
+    try { return window.SB.Shots.take(name || 'shot'); } catch (e) { return null; }
+  }
+  return null;
+}
+
+// Teleport pemain (dipakai misi / debug / respawn aman).
+function teleportPlayer(x, z) {
+  var st = window.SB.state;
+  if (!st) { return false; }
+  st.player.x = x || 0;
+  st.player.z = z || 0;
+  st.player.y = 0;
+  cameraEye = { x: st.player.x, y: 8, z: st.player.z + 12 };
+  cameraTarget = { x: st.player.x, y: 1, z: st.player.z };
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Ekspor API (wajib spec: init, frame, save, load, pause, resume, state)
+// ---------------------------------------------------------------------------
+window.SB.Game = {
+  init: init, frame: frame, save: save, load: load,
+  pause: pause, resume: resume, reset: reset,
+  state: window.SB.state,
+  hasSave: hasSave, clearSave: clearSave,
+  isPaused: isPaused, isStarted: isStarted, isInitialized: isInitialized,
+  getFrameCount: getFrameCount, setWanted: setWanted,
+  addMoney: addMoney, addRep: addRep, setMission: setMission,
+  getCameraMode: getCameraMode, setCameraMode: setCameraMode,
+  updateCamera: updateCamera, syncHud: syncHud,
+  formatClock: formatClock,
+  getDistrictRep: getDistrictRep, addDistrictRep: addDistrictRep,
+  setDistrictRep: setDistrictRep, districtPriceModifier: districtPriceModifier,
+  topDistrict: topDistrict, averageDistrictRep: averageDistrictRep,
+  addHeat: addHeat, clearWanted: clearWanted, raiseWanted: raiseWanted,
+  advanceMissionStage: advanceMissionStage, failMission: failMission,
+  startMission: startMission, startHeist: startHeist,
+  setTimeOfDay: setTimeOfDay, skipToGoldenHour: skipToGoldenHour,
+  skipToNight: skipToNight, isNight: isNight, isGoldenHour: isGoldenHour,
+  getWorldStats: getWorldStats, validateState: validateState,
+  stateSummary: stateSummary, takeShot: takeShot,
+  teleportPlayer: teleportPlayer
+};
 })();

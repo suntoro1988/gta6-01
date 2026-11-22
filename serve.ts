@@ -1,22 +1,23 @@
-// Sunset Bay v12 — local development server.
-//
-// Serves the playable game in game/ on http://127.0.0.1:8080, static
-// files only, exactly as the grader will serve it: no build step,
-// no network. Run it with plain Node 22 and stop it with Ctrl+C:
-//
-//   node serve.ts
-import { createServer } from 'node:http';
+// serve.ts — Sunset Bay v13 (gta6-01)
+// Server statis kecil untuk testing lokal game/ lewat HTTP.
+// Node 22 stdlib saja. Jalankan: node --experimental-strip-types serve.ts [port]
+// Default port 8080. Buka http://localhost:8080/ di browser.
+
 import { createReadStream, existsSync, statSync } from 'node:fs';
-import { dirname, extname, join, resolve, sep } from 'node:path';
+import { createServer } from 'node:http';
+import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// The game lives in game/ next to this file; nothing outside it is served.
-const GAME_ROOT: string = resolve(join(dirname(fileURLToPath(import.meta.url)), 'game'));
-const HOST: string = '127.0.0.1';
-const PORT: number = 8080;
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)));
+const GAME_DIR = join(REPO_ROOT, 'game');
+const PORT = Number(process.argv[2] ?? process.env.PORT ?? 8080);
+let requestCount = 0;
 
-// Content types the game needs. Unknown extensions get a safe fallback
-// instead of a guess that could break a script or an image.
+if (!Number.isSafeInteger(PORT) || PORT < 1 || PORT > 65535) {
+  console.error(`[serve] ERROR: port tidak valid: ${process.argv[2] ?? process.env.PORT}`);
+  process.exit(1);
+}
+
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -26,89 +27,82 @@ const MIME: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
-  '.ico': 'image/x-icon',
+  '.gif': 'image/gif',
   '.svg': 'image/svg+xml',
-  '.wasm': 'application/wasm',
+  '.ico': 'image/x-icon',
   '.glsl': 'text/plain; charset=utf-8',
   '.vert': 'text/plain; charset=utf-8',
   '.frag': 'text/plain; charset=utf-8',
-  '.mp3': 'audio/mpeg',
-  '.wav': 'audio/wav',
-  '.ogg': 'audio/ogg',
-  '.webp': 'image/webp',
+  '.wgsl': 'text/plain; charset=utf-8',
+  '.wasm': 'application/wasm',
 };
-const FALLBACK_MIME: string = 'application/octet-stream';
-
-// Turn a request path into a file inside GAME_ROOT, or null when the
-// path tries to climb out of it (for example /../main.ts).
-function resolveGameFile(urlPath: string): string | null {
-  const decoded = decodeURIComponent(urlPath);
-  const cleaned = decoded.split('?')[0].split('#')[0];
-  const joined = resolve(join(GAME_ROOT, cleaned));
-  if (joined !== GAME_ROOT && !joined.startsWith(GAME_ROOT + sep)) return null;
-  return joined;
-}
-
-// A directory request serves its index.html, so / opens the game.
-function entryFor(file: string): string {
-  if (statSync(file).isDirectory()) return join(file, 'index.html');
-  return file;
-}
 
 function mimeFor(file: string): string {
-  return MIME[extname(file).toLowerCase()] ?? FALLBACK_MIME;
+  return MIME[extname(file).toLowerCase()] ?? 'application/octet-stream';
 }
 
-function sendText(res, status: number, body: string): void {
-  res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' });
-  res.end(body);
+// Tolak path traversal: hasil resolve harus tetap di bawah GAME_DIR.
+function safePath(urlPath: string): string | null {
+  const decoded = decodeURIComponent(urlPath.split('?')[0]);
+  const rel = decoded === '/' ? 'index.html' : decoded.replace(/^\//, '');
+  const full = resolve(join(GAME_DIR, normalize(rel)));
+  if (!full.startsWith(GAME_DIR + '/') && full !== GAME_DIR) return null;
+  return full;
 }
 
 const server = createServer((req, res) => {
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    sendText(res, 405, 'Method not allowed.\n');
+  const started = Date.now();
+  requestCount++;
+  const file = safePath(req.url ?? '/');
+  if (file === null) {
+    res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('400 bad path\n');
+    console.log(`${req.method} ${req.url} -> 400 (${Date.now() - started}ms)`);
     return;
   }
-  let target: string | null;
-  try {
-    target = resolveGameFile(new URL(req.url ?? '/', `http://${HOST}:${PORT}`).pathname);
-  } catch {
-    sendText(res, 400, 'Bad request.\n');
+  let target = file;
+  if (existsSync(target) && statSync(target).isDirectory()) {
+    target = join(target, 'index.html');
+  }
+  if (!existsSync(target) || !statSync(target).isFile()) {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('404 not found\n');
+    console.log(`${req.method} ${req.url} -> 404 (${Date.now() - started}ms)`);
     return;
   }
-  if (target === null) {
-    sendText(res, 403, 'Forbidden.\n');
-    return;
-  }
-  let file: string;
-  try {
-    file = entryFor(target);
-  } catch {
-    sendText(res, 404, 'Not found.\n');
-    return;
-  }
-  if (!existsSync(file) || !statSync(file).isFile()) {
-    sendText(res, 404, 'Not found.\n');
-    return;
-  }
+  const stream = createReadStream(target);
+  stream.on('error', () => {
+    res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('500 read error\n');
+  });
   res.writeHead(200, {
-    'content-type': mimeFor(file),
-    'content-length': statSync(file).size,
+    'content-type': mimeFor(target),
+    'content-length': statSync(target).size,
     'cache-control': 'no-cache',
   });
   if (req.method === 'HEAD') {
     res.end();
+    console.log(`${req.method} ${req.url} -> 200 (${Date.now() - started}ms)`);
     return;
   }
-  createReadStream(file).pipe(res);
+  stream.pipe(res);
+  res.on('finish', () => {
+    console.log(`${req.method} ${req.url} -> 200 (${Date.now() - started}ms)`);
+  });
 });
 
-server.on('error', (err) => {
-  console.error(`[sunset-bay] server error: ${err.message}`);
+if (!existsSync(join(GAME_DIR, 'index.html'))) {
+  console.error('[serve] ERROR: game/index.html tidak ditemukan — jalankan dari repo Sunset Bay v13');
   process.exit(1);
+}
+
+server.listen(PORT, () => {
+  console.log(`[serve] Sunset Bay v13 disajikan di http://localhost:${PORT}/`);
+  console.log('[serve] Tekan Ctrl+C untuk berhenti.');
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`[sunset-bay] Sunset Bay v12 dev server: http://${HOST}:${PORT}/`);
-  console.log(`[sunset-bay] serving: ${GAME_ROOT}`);
+// Matikan server dengan rapi saat Ctrl+C.
+process.on('SIGINT', () => {
+  console.log(`\n[serve] berhenti setelah ${requestCount} request.`);
+  server.close(() => process.exit(0));
 });

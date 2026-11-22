@@ -1,354 +1,218 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="id">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Sunset Bay v12 — Vice City of the Golden Hour</title>
-<link rel="icon" type="image/x-icon" href="favicon.ico">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="description" content="Sunset Bay — game open-world GTA-like di browser. Golden hour, kejar-kejaran helikopter, 20+ misi, 5+ balapan jalanan.">
+<meta name="theme-color" content="#1a0f2e">
+<title>Sunset Bay — GTA-like Open World</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23ff9a3c'/%3E%3Ccircle cx='32' cy='36' r='14' fill='%23fff3d6'/%3E%3Crect y='44' width='64' height='20' rx='6' fill='%232e6f8e'/%3E%3C/svg%3E">
 <style>
-  /* ============ Sunset Bay v12 — HUD + canvas shell ============ */
-  :root {
-    --hud-bg: rgba(8, 10, 24, 0.62);
-    --hud-bg-soft: rgba(8, 10, 24, 0.42);
-    --hud-line: rgba(255, 255, 255, 0.14);
-    --hud-text: #f4f1e8;
-    --hud-dim: #b8b4a8;
-    --gold: #ffb347;
-    --orange: #ff7a2f;
-    --pink: #ff4d8d;
-    --cyan: #39d5ff;
-    --green: #58e39a;
-    --red: #ff3b4e;
-    --font: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-    --font-cond: "Arial Narrow", "Segoe UI", Arial, sans-serif;
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body {
-    width: 100%; height: 100%;
-    overflow: hidden;
-    background: #120a1e;
-    font-family: var(--font);
-    color: var(--hud-text);
-    -webkit-user-select: none; user-select: none;
-    touch-action: none;
-  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #1a0f2e; }
+  body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; color: #fff; }
   #game-canvas {
-    position: fixed; inset: 0;
-    width: 100vw; height: 100vh;
-    display: block;
-    background: linear-gradient(180deg, #ff9a3c 0%, #e85d75 38%, #7b3fa0 68%, #1c1440 100%);
-    cursor: crosshair;
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    display: block; touch-action: none; cursor: crosshair;
+    background: linear-gradient(180deg, #5b2a6e 0%, #ff9a3c 55%, #2e6f8e 100%);
   }
-  #vignette {
-    position: fixed; inset: 0; pointer-events: none; z-index: 3;
-    background: radial-gradient(ellipse at center, transparent 58%, rgba(10, 4, 24, 0.38) 100%);
+  .hud { position: fixed; z-index: 10; pointer-events: none; user-select: none; }
+  /* HUD statis diduplikasi HUD dinamis (#sb-hud): sembunyikan yang rangkap
+     supaya tidak ada teks ganda di layar. Kanvas minimap (#hud-minimap),
+     zona (#hud-zone) dan objective (#hud-objective) tetap tampil. */
+  .hud-top-left, .hud-bottom-left { display: none; }
+  .hud-top-right > .pill { display: none; }
+  /* Minimap turun di bawah panel jam dinamis (#sb-hud) yang juga di kanan atas. */
+  .hud-top-right { top: 132px; }
+  #hud-speed { display: none; }
+  .hud-top-left { top: 14px; left: 14px; }
+  .hud-top-right { top: 14px; right: 14px; text-align: right; }
+  .hud-bottom-left { bottom: 14px; left: 14px; }
+  .hud-bottom-right { bottom: 14px; right: 14px; text-align: right; }
+  .pill {
+    display: inline-block; background: rgba(10, 8, 24, 0.62);
+    border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 10px;
+    padding: 8px 12px; margin-bottom: 8px; backdrop-filter: blur(4px);
   }
-  /* ---------- HUD root ---------- */
-  #hud { position: fixed; inset: 0; pointer-events: none; z-index: 5; }
-  .hud-panel {
-    background: var(--hud-bg);
-    border: 1px solid var(--hud-line);
-    border-radius: 10px;
-    backdrop-filter: blur(6px);
-    -webkit-backdrop-filter: blur(6px);
-    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+  #hud-money { font-size: 26px; font-weight: 800; color: #7dff9a; letter-spacing: 0.5px; }
+  #hud-money small { font-size: 13px; color: #cfe8d4; font-weight: 600; }
+  #hud-wanted { font-size: 22px; letter-spacing: 3px; color: #ffd23f; }
+  #hud-wanted .star-off { color: rgba(255, 255, 255, 0.28); }
+  #hud-heat { font-size: 12px; color: #ffb3a0; }
+  #hud-heat-bar { width: 150px; height: 7px; background: rgba(255,255,255,0.18); border-radius: 4px; overflow: hidden; margin-top: 4px; }
+  #hud-heat-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #ffd23f, #ff5a3c); }
+  #hud-time { font-size: 15px; font-weight: 700; }
+  #hud-day { font-size: 12px; color: #ffd9a8; }
+  #hud-weather { font-size: 12px; color: #bfe3ff; }
+  #hud-radio { font-size: 12px; color: #e8c8ff; }
+  #hud-mission { max-width: 340px; font-size: 15px; line-height: 1.45; }
+  #hud-mission b { color: #ffd23f; }
+  #hud-toast {
+    position: fixed; top: 78px; left: 50%; transform: translateX(-50%);
+    z-index: 11; pointer-events: none; text-align: center;
+    background: rgba(10, 8, 24, 0.72); border: 1px solid rgba(255, 210, 63, 0.5);
+    border-radius: 10px; padding: 10px 18px; font-size: 15px; font-weight: 600;
+    display: none; max-width: 86vw;
   }
-  .hud-label {
-    font-size: 10px; letter-spacing: 0.22em;
-    text-transform: uppercase; color: var(--hud-dim);
-    font-weight: 600;
+  #hud-health { font-size: 14px; font-weight: 700; }
+  #hud-health .bar { width: 170px; height: 9px; background: rgba(255,255,255,0.18); border-radius: 5px; overflow: hidden; margin-top: 4px; }
+  #hud-health-fill { height: 100%; width: 100%; background: linear-gradient(90deg, #37e07a, #a5ff6e); }
+  #hud-armor-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #4aa8ff, #9fd8ff); }
+  #hud-weapon { font-size: 13px; color: #ffe9b0; margin-top: 6px; }
+  #hud-speed { font-size: 30px; font-weight: 800; }
+  #hud-speed small { font-size: 13px; color: #ffd9a8; }
+  #hud-minimap {
+    width: 168px; height: 168px; border-radius: 50%;
+    border: 3px solid rgba(255, 255, 255, 0.35);
+    background: rgba(12, 20, 40, 0.72); overflow: hidden;
   }
-  /* ---------- Top-left: mission + money ---------- */
-  #hud-tl {
-    position: absolute; top: 14px; left: 14px;
-    display: flex; flex-direction: column; gap: 8px;
-    width: 300px; max-width: 42vw;
+  #hud-minimap canvas { width: 100%; height: 100%; display: block; }
+  #hud-controls { font-size: 11px; color: rgba(255,255,255,0.65); line-height: 1.6; }
+  #screen-start, #screen-pause, #screen-end {
+    position: fixed; inset: 0; z-index: 20; display: flex;
+    flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; padding: 24px;
+    background: linear-gradient(180deg, rgba(26,15,46,0.55) 0%, rgba(26,15,46,0.82) 100%);
   }
-  #mission-box { padding: 10px 12px; }
-  #mission-title {
-    font-size: 15px; font-weight: 700; color: var(--gold);
-    letter-spacing: 0.02em; line-height: 1.25;
-  }
-  #mission-text {
-    margin-top: 3px; font-size: 12.5px; line-height: 1.45;
-    color: var(--hud-text);
-  }
-  #mission-reward {
-    margin-top: 6px; font-size: 11.5px; color: var(--green);
-    font-weight: 700; letter-spacing: 0.04em;
-  }
-  #money-row {
-    display: flex; align-items: center; gap: 10px;
-    padding: 8px 12px;
-  }
-  #money {
-    font-family: var(--font-cond);
-    font-size: 26px; font-weight: 700; color: var(--green);
-    letter-spacing: 0.03em; line-height: 1;
-    text-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
-  }
-  #money-sub { font-size: 11px; color: var(--hud-dim); line-height: 1.35; }
-  #money-sub b { color: var(--hud-text); }
-  #rep-bar-wrap { padding: 8px 12px 10px; }
-  #rep-row { display: flex; justify-content: space-between; align-items: baseline; }
-  #rep-rank { font-size: 13px; font-weight: 800; color: var(--cyan); letter-spacing: 0.08em; }
-  #rep-val { font-size: 11px; color: var(--hud-dim); }
-  #rep-bar {
-    margin-top: 5px; height: 7px; border-radius: 4px;
-    background: rgba(255, 255, 255, 0.12); overflow: hidden;
-  }
-  #rep-fill {
-    height: 100%; width: 0%;
-    background: linear-gradient(90deg, var(--cyan), var(--pink));
-    border-radius: 4px; transition: width 0.4s ease;
-  }
-  #heat-row { display: flex; align-items: center; gap: 8px; margin-top: 7px; }
-  #heat-label { font-size: 10px; letter-spacing: 0.18em; color: var(--hud-dim); }
-  #heat-bar { flex: 1; height: 6px; border-radius: 3px; background: rgba(255,255,255,0.1); overflow: hidden; }
-  #heat-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--gold), var(--red)); transition: width 0.3s; }
-  #heat-val { font-size: 11px; font-weight: 700; color: var(--orange); }
-  /* ---------- Top-right: wanted + radio + clock ---------- */
-  #hud-tr {
-    position: absolute; top: 14px; right: 14px;
-    display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
-    width: 260px; max-width: 40vw;
-  }
-  #wanted-box { padding: 9px 12px; text-align: right; }
-  #wanted-stars {
-    font-size: 24px; letter-spacing: 4px; line-height: 1;
-    color: var(--red); text-shadow: 0 0 12px rgba(255, 59, 78, 0.8);
-  }
-  #wanted-stars .off { color: rgba(255, 255, 255, 0.22); text-shadow: none; }
-  #wanted-text { margin-top: 4px; font-size: 11px; color: var(--hud-dim); letter-spacing: 0.08em; }
-  #clock-box { padding: 8px 12px; text-align: right; }
-  #clock { font-family: var(--font-cond); font-size: 24px; font-weight: 700; line-height: 1; }
-  #clock-sub { font-size: 11px; color: var(--hud-dim); margin-top: 2px; }
-  #radio-box { padding: 8px 12px; text-align: right; min-width: 180px; }
-  #radio-name { font-size: 14px; font-weight: 800; color: var(--pink); letter-spacing: 0.04em; }
-  #radio-track { font-size: 11px; color: var(--hud-dim); margin-top: 2px; }
-  #radio-hint { font-size: 10px; color: rgba(255,255,255,0.35); margin-top: 4px; letter-spacing: 0.1em; }
-  /* ---------- Bottom-left: minimap ---------- */
-  #hud-bl {
-    position: absolute; left: 14px; bottom: 14px;
-    display: flex; flex-direction: column; gap: 8px;
-  }
-  #minimap-wrap { padding: 8px; }
-  #minimap {
-    display: block; width: 190px; height: 190px;
-    border-radius: 8px; background: #0a0f1e;
-    border: 1px solid var(--hud-line);
-  }
-  #minimap-caption {
-    margin-top: 6px; display: flex; justify-content: space-between;
-    font-size: 11px; color: var(--hud-dim);
-  }
-  #minimap-caption b { color: var(--gold); }
-  /* ---------- Bottom-right: weapon + controls ---------- */
-  #hud-br {
-    position: absolute; right: 14px; bottom: 14px;
-    display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
-  }
-  #weapon-box { padding: 9px 12px; text-align: right; min-width: 170px; }
-  #weapon-name { font-size: 15px; font-weight: 800; letter-spacing: 0.06em; color: var(--hud-text); }
-  #weapon-ammo { font-family: var(--font-cond); font-size: 22px; font-weight: 700; color: var(--gold); margin-top: 2px; }
-  #weapon-ammo small { font-size: 12px; color: var(--hud-dim); }
-  #controls-hint {
-    padding: 7px 10px; font-size: 10.5px; line-height: 1.6;
-    color: var(--hud-dim); text-align: right;
-  }
-  #controls-hint b { color: var(--hud-text); font-weight: 700; }
-  /* ---------- Toasts / center messages ---------- */
-  #toasts {
-    position: absolute; top: 84px; left: 50%; transform: translateX(-50%);
-    display: flex; flex-direction: column; align-items: center; gap: 6px;
-    width: min(560px, 86vw);
-  }
-  .toast {
-    padding: 8px 16px; border-radius: 999px;
-    background: var(--hud-bg); border: 1px solid var(--hud-line);
-    font-size: 13.5px; font-weight: 600; text-align: center;
-    animation: toast-in 0.25s ease-out;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
-  }
-  .toast.gold { color: var(--gold); border-color: rgba(255, 179, 71, 0.5); }
-  .toast.green { color: var(--green); border-color: rgba(88, 227, 154, 0.5); }
-  .toast.red { color: #ff8a96; border-color: rgba(255, 59, 78, 0.5); }
-  @keyframes toast-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
-  /* ---------- Start / pause overlays ---------- */
-  .overlay {
-    position: fixed; inset: 0; z-index: 10;
-    display: flex; align-items: center; justify-content: center;
-    background: linear-gradient(180deg, rgba(18, 8, 32, 0.55), rgba(8, 4, 20, 0.82));
-    backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
-  }
-  .overlay.hidden { display: none; }
-  .overlay-card {
-    width: min(620px, 92vw); text-align: center;
-    padding: 34px 30px 28px;
-    background: rgba(12, 8, 28, 0.72);
-    border: 1px solid rgba(255, 179, 71, 0.35);
-    border-radius: 18px;
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
-  }
-  .overlay-kicker { font-size: 12px; letter-spacing: 0.42em; color: var(--pink); font-weight: 700; }
-  .overlay-title {
-    margin-top: 8px; font-family: var(--font-cond);
-    font-size: 64px; line-height: 0.95; font-weight: 900;
-    letter-spacing: 0.02em;
-    background: linear-gradient(180deg, #ffe9a8, #ff9a3c 55%, #ff4d8d);
+  #screen-pause, #screen-end { display: none; }
+  .game-title {
+    font-size: clamp(44px, 9vw, 96px); font-weight: 900; letter-spacing: 2px;
+    background: linear-gradient(180deg, #fff3d6 20%, #ff9a3c 60%, #ff5a8a 100%);
     -webkit-background-clip: text; background-clip: text; color: transparent;
-    text-shadow: 0 6px 30px rgba(255, 122, 47, 0.25);
+    text-shadow: 0 6px 30px rgba(255, 154, 60, 0.35);
   }
-  .overlay-sub { margin-top: 10px; font-size: 14px; color: var(--hud-dim); line-height: 1.55; }
-  .overlay-stats {
-    margin: 18px auto 4px; display: flex; justify-content: center; gap: 26px;
-    font-size: 12px; color: var(--hud-dim);
-  }
-  .overlay-stats b { display: block; font-size: 20px; color: var(--hud-text); font-family: var(--font-cond); }
+  .game-sub { font-size: clamp(15px, 2.4vw, 21px); color: #ffe9c8; margin-top: 6px; }
+  .game-tag { font-size: 13px; color: #c9b8ff; margin-top: 10px; letter-spacing: 1px; }
   .btn {
-    pointer-events: auto; cursor: pointer;
-    margin-top: 22px; padding: 13px 34px;
-    font-family: var(--font); font-size: 15px; font-weight: 800; letter-spacing: 0.12em;
-    color: #1c0d00; background: linear-gradient(180deg, #ffd166, #ff7a2f);
-    border: none; border-radius: 999px;
-    box-shadow: 0 8px 24px rgba(255, 122, 47, 0.45);
-    transition: transform 0.12s ease, box-shadow 0.12s ease;
+    pointer-events: auto; cursor: pointer; margin-top: 26px;
+    font-size: 19px; font-weight: 800; letter-spacing: 1px; color: #231303;
+    background: linear-gradient(180deg, #ffd23f, #ff9a3c);
+    border: none; border-radius: 14px; padding: 15px 42px;
+    box-shadow: 0 8px 24px rgba(255, 154, 60, 0.45);
   }
-  .btn:hover { transform: translateY(-2px); box-shadow: 0 12px 30px rgba(255, 122, 47, 0.6); }
-  .btn.secondary {
-    background: transparent; color: var(--hud-text);
-    border: 1px solid var(--hud-line); box-shadow: none;
-    margin-left: 10px;
+  .btn:hover { filter: brightness(1.08); }
+  .btn-secondary { background: rgba(255,255,255,0.14); color: #fff; border: 1px solid rgba(255,255,255,0.35); box-shadow: none; font-size: 15px; padding: 11px 26px; }
+  .keys { margin-top: 22px; font-size: 13px; color: rgba(255,255,255,0.78); line-height: 1.9; }
+  .keys b { color: #ffd23f; }
+  #hud-loading {
+    position: fixed; inset: 0; z-index: 30; display: flex;
+    align-items: center; justify-content: center; flex-direction: column;
+    background: #1a0f2e; font-size: 15px; color: #ffd9a8;
   }
-  .overlay-keys { margin-top: 18px; font-size: 11.5px; color: rgba(255,255,255,0.45); line-height: 1.8; }
-  .overlay-keys b { color: var(--hud-text); }
-  #loading-note { margin-top: 14px; font-size: 11px; color: rgba(255,255,255,0.4); letter-spacing: 0.14em; }
-  #fps-badge {
-    position: fixed; right: 8px; bottom: 4px; z-index: 6;
-    font-size: 10px; color: rgba(255,255,255,0.35);
-    pointer-events: none; font-family: monospace;
+  #hud-loading .spin { font-size: 40px; margin-bottom: 12px; }
+  #hud-fps { position: fixed; left: 14px; bottom: 150px; z-index: 10; font-size: 11px; color: rgba(255,255,255,0.5); pointer-events: none; }
+  #hud-crosshair {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    z-index: 9; font-size: 20px; color: rgba(255,255,255,0.85);
+    text-shadow: 0 0 6px rgba(0,0,0,0.8); pointer-events: none; display: none;
   }
-  @media (max-width: 760px) {
-    #hud-tl { width: 230px; }
-    #minimap { width: 130px; height: 130px; }
-    #controls-hint { display: none; }
-    .overlay-title { font-size: 44px; }
-    #wanted-stars { font-size: 19px; }
+  #hud-objective {
+    position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+    z-index: 10; pointer-events: none; text-align: center;
+    font-size: 13px; color: #ffe9c8; background: rgba(10, 8, 24, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 999px;
+    padding: 6px 16px; max-width: 90vw; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  #hud-wanted-flash {
+    position: fixed; inset: 0; z-index: 8; pointer-events: none; display: none;
+    box-shadow: inset 0 0 120px rgba(255, 40, 40, 0.55);
+  }
+  #touch-controls { position: fixed; inset: 0; z-index: 12; pointer-events: none; display: none; }
+  #touch-controls .tbtn {
+    position: absolute; pointer-events: auto; width: 58px; height: 58px;
+    border-radius: 50%; border: 1px solid rgba(255,255,255,0.4);
+    background: rgba(10, 8, 24, 0.5); color: #fff; font-size: 20px;
+    display: flex; align-items: center; justify-content: center; font-weight: 800;
+  }
+  #touch-controls .tbtn:active { background: rgba(255, 154, 60, 0.65); }
+  #tbtn-up { left: 26px; bottom: 150px; }
+  #tbtn-down { left: 26px; bottom: 78px; }
+  #tbtn-left { left: 90px; bottom: 114px; }
+  #tbtn-right { left: 154px; bottom: 114px; }
+  #tbtn-action { right: 26px; bottom: 96px; background: rgba(255, 154, 60, 0.6); }
+  #tbtn-fire { right: 96px; bottom: 150px; background: rgba(255, 60, 60, 0.55); }
+  #tbtn-jump { right: 26px; bottom: 168px; }
+  @media (pointer: coarse) { #touch-controls { display: block; } }
+  @media (max-width: 640px) {
+    #hud-minimap { width: 110px; height: 110px; }
+    #hud-money { font-size: 20px; }
+    #hud-mission { max-width: 230px; font-size: 13px; }
+    #hud-controls { display: none; }
   }
 </style>
 </head>
 <body>
-<canvas id="game-canvas" width="1280" height="720"></canvas>
-<div id="vignette"></div>
+<canvas id="game-canvas" width="1280" height="719"></canvas>
+<div id="hud-crosshair">+</div>
+<div id="hud-wanted-flash"></div>
+<div id="hud-objective">Misi 1: First Light — temui Rico di kantor marina.</div>
+<div id="touch-controls">
+  <div class="tbtn" id="tbtn-up" data-key="KeyW">&#8593;</div>
+  <div class="tbtn" id="tbtn-down" data-key="KeyS">&#8595;</div>
+  <div class="tbtn" id="tbtn-left" data-key="KeyA">&#8592;</div>
+  <div class="tbtn" id="tbtn-right" data-key="KeyD">&#8594;</div>
+  <div class="tbtn" id="tbtn-action" data-key="KeyE">E</div>
+  <div class="tbtn" id="tbtn-fire" data-key="KeyF">F</div>
+  <div class="tbtn" id="tbtn-jump" data-key="Space">&#8593;&#8593;</div>
+</div>
+<div id="hud-toast" role="status"></div>
 
-<!-- ======================= HUD ======================= -->
-<div id="hud">
-  <!-- Top-left: mission + money + rep -->
-  <div id="hud-tl">
-    <div id="mission-box" class="hud-panel">
-      <div class="hud-label">Mission</div>
-      <div id="mission-title">Welcome to Sunset Bay</div>
-      <div id="mission-text">First Light Courier — pick up the package at the diner. Press M for missions.</div>
-      <div id="mission-reward">REWARD $200 &middot; REP +100</div>
-    </div>
-    <div id="money-row" class="hud-panel">
-      <div id="money">$500</div>
-      <div id="money-sub">CASH<br><b id="money-sub2">Day 1 &middot; 18:20</b></div>
-    </div>
-    <div id="rep-bar-wrap" class="hud-panel">
-      <div id="rep-row">
-        <span id="rep-rank">ROOKIE</span>
-        <span id="rep-val">REP 0</span>
-      </div>
-      <div id="rep-bar"><div id="rep-fill"></div></div>
-      <div id="heat-row">
-        <span id="heat-label">HEAT</span>
-        <div id="heat-bar"><div id="heat-fill"></div></div>
-        <span id="heat-val">0</span>
-      </div>
-    </div>
-  </div>
-
-  <!-- Top-right: wanted + clock + radio -->
-  <div id="hud-tr">
-    <div id="wanted-box" class="hud-panel">
-      <div id="wanted-stars"><span class="off">&#9733;</span><span class="off">&#9733;</span><span class="off">&#9733;</span><span class="off">&#9733;</span><span class="off">&#9733;</span></div>
-      <div id="wanted-text">CLEAN &middot; NO HEAT</div>
-    </div>
-    <div id="clock-box" class="hud-panel">
-      <div id="clock">18:20</div>
-      <div id="clock-sub">GOLDEN HOUR &middot; DAY 1</div>
-    </div>
-    <div id="radio-box" class="hud-panel">
-      <div class="hud-label">Radio</div>
-      <div id="radio-name">SUNSET 98.5</div>
-      <div id="radio-track">Golden Hour Drive &mdash; The Palms</div>
-      <div id="radio-hint">R &mdash; CHANGE STATION</div>
-    </div>
-  </div>
-
-  <!-- Bottom-left: minimap -->
-  <div id="hud-bl">
-    <div id="minimap-wrap" class="hud-panel">
-      <canvas id="minimap" width="190" height="190"></canvas>
-      <div id="minimap-caption"><span id="minimap-district">Ocean Drive</span><b id="minimap-coords">0, 0</b></div>
-    </div>
-  </div>
-
-  <!-- Bottom-right: weapon + controls -->
-  <div id="hud-br">
-    <div id="weapon-box" class="hud-panel">
-      <div class="hud-label">Weapon</div>
-      <div id="weapon-name">PISTOL</div>
-      <div id="weapon-ammo">24 <small>/ ∞</small></div>
-    </div>
-    <div id="controls-hint" class="hud-panel">
-      <b>WASD</b> move / drive &nbsp; <b>E</b> steal car &nbsp; <b>Space</b> brake<br>
-      <b>Shift</b> sprint &nbsp; <b>R</b> radio &nbsp; <b>M</b> missions &nbsp; <b>Tab</b> map &nbsp; <b>Esc</b> pause
-    </div>
-  </div>
-
-  <div id="toasts"></div>
+<div class="hud hud-top-left">
+  <div class="pill"><div id="hud-money">$500 <small>REP 0 &middot; Rookie</small></div>
+  <div id="hud-wanted"><span class="star-off">&#9733;&#9733;&#9733;&#9733;&#9733;</span></div>
+  <div id="hud-heat">HEAT <span id="hud-heat-num">0</span></div>
+  <div id="hud-heat-bar"><div id="hud-heat-fill"></div></div></div>
+  <div class="pill" id="hud-mission"><b>MISI</b><br><span id="hud-mission-text">Jelajahi Sunset Bay. Cari ikon misi di peta.</span></div>
 </div>
 
-<!-- ======================= START OVERLAY ======================= -->
-<div id="start-overlay" class="overlay">
-  <div class="overlay-card">
-    <div class="overlay-kicker">MAKE.FUN &middot; GTA 6 BOUNTY</div>
-    <div class="overlay-title">SUNSET<br>BAY</div>
-    <div class="overlay-sub">A golden-hour open world. Steal cars, outrun AIR-1,<br>
-    build your crew, and take the Harbour Lights Job.</div>
-    <div class="overlay-stats">
-      <span><b>20+</b>missions</span>
-      <span><b>12</b>districts</span>
-      <span><b>6</b>radio stations</span>
-      <span><b>250+</b>buildings</span>
-    </div>
-    <button id="start-btn" class="btn">START ENGINE</button>
-    <button id="continue-btn" class="btn secondary">CONTINUE</button>
-    <div class="overlay-keys">
-      <b>WASD</b> move &nbsp;&middot;&nbsp; <b>E</b> steal car &nbsp;&middot;&nbsp; <b>Space</b> brake &nbsp;&middot;&nbsp; <b>Shift</b> sprint<br>
-      <b>R</b> radio &nbsp;&middot;&nbsp; <b>M</b> missions &nbsp;&middot;&nbsp; <b>Tab</b> map &nbsp;&middot;&nbsp; <b>Esc</b> pause
-    </div>
-    <div id="loading-note">WEBGL &middot; GOLDEN HOUR &middot; v12</div>
+<div class="hud hud-top-right">
+  <div class="pill"><div id="hud-time">18:20</div><div id="hud-day">Hari 1 &middot; Golden Hour</div><div id="hud-weather">Cerah &middot; Angin sepoi</div><div id="hud-radio">&#9834; Sunset FM</div></div>
+  <div id="hud-minimap"><canvas id="minimap-canvas" width="168" height="168"></canvas></div>
+</div>
+
+<div class="hud hud-bottom-left">
+  <div class="pill"><div id="hud-health">HP <span id="hud-hp-num">100</span> &middot; ARMOR <span id="hud-armor-num">0</span></div>
+  <div class="bar"><div id="hud-health-fill"></div></div>
+  <div class="bar" style="margin-top:3px"><div id="hud-armor-fill"></div></div>
+  <div id="hud-weapon">PISTOL &middot; Ammo 24 &middot; [1-4] ganti senjata &middot; [R] isi ulang</div></div>
+  <div id="hud-controls">WASD gerak &middot; Shift lari &middot; Spasi lompat &middot; E masuk/keluar mobil &middot; F tembak &middot; C kamera &middot; M radio &middot; P pause &middot; H klakson</div>
+</div>
+
+<div class="hud hud-bottom-right">
+  <div class="pill"><div id="hud-speed">0 <small>km/j</small></div><div id="hud-zone" style="font-size:12px;color:#ffd9a8">Sunset Beach</div></div>
+</div>
+<div id="hud-fps"></div>
+
+<div id="screen-start">
+  <div class="game-title">SUNSET BAY</div>
+  <div class="game-sub">Kota pantai, matahari terbenam, dan satu malam yang mengubah segalanya.</div>
+  <div class="game-tag">OPEN WORLD &middot; 20+ MISI &middot; 5 BALAPAN &middot; 6 RADIO &middot; CREW &middot; HEIST</div>
+  <button class="btn" id="btn-start" type="button">MULAI PETUALANGAN</button>
+  <button class="btn btn-secondary" id="btn-continue" type="button">LANJUTKAN (SAVE)</button>
+  <div class="keys">
+    <b>WASD</b> gerak / mengemudi &nbsp;&middot;&nbsp; <b>E</b> masuk mobil / perahu &nbsp;&middot;&nbsp; <b>F</b> tembak<br>
+    <b>Shift</b> lari &nbsp;&middot;&nbsp; <b>Spasi</b> lompat &nbsp;&middot;&nbsp; <b>1-4</b> senjata &nbsp;&middot;&nbsp; <b>M</b> radio &nbsp;&middot;&nbsp; <b>P</b> pause
   </div>
 </div>
 
-<!-- ======================= PAUSE OVERLAY ======================= -->
-<div id="pause-overlay" class="overlay hidden">
-  <div class="overlay-card">
-    <div class="overlay-kicker">PAUSED</div>
-    <div class="overlay-title" style="font-size:44px">SUNSET BAY</div>
-    <div class="overlay-sub">The city waits. Your heat cools while you rest.</div>
-    <button id="resume-btn" class="btn">RESUME</button>
-    <button id="save-btn" class="btn secondary">SAVE GAME</button>
-    <div class="overlay-keys">Progress saves to this browser automatically.</div>
-  </div>
+<div id="screen-pause">
+  <div class="game-title" style="font-size:52px">JEDA</div>
+  <div class="game-sub">Sunset Bay menunggumu. Matahari belum tenggelam.</div>
+  <button class="btn" id="btn-resume" type="button">LANJUTKAN</button>
+  <button class="btn btn-secondary" id="btn-save-quit" type="button">SIMPAN &amp; KE MENU</button>
 </div>
 
-<div id="fps-badge"></div>
+<div id="screen-end">
+  <div class="game-title" style="font-size:52px">MALAM TIBA</div>
+  <div class="game-sub" id="screen-end-text">Hari pertama selesai. Kota ini milikmu besok.</div>
+  <button class="btn" id="btn-again" type="button">MAIN LAGI</button>
+</div>
 
-<!-- ======================= GAME SCRIPTS — load order is the spec ======================= -->
+<div id="hud-loading"><div class="spin">&#9728;</div><div>Memuat Sunset Bay&hellip;</div></div>
+<noscript><p style="position:fixed;inset:0;background:#1a0f2e;color:#fff;display:flex;align-items:center;justify-content:center;z-index:99">Sunset Bay butuh JavaScript aktif.</p></noscript>
+
+<!-- URUTAN LOAD WAJIB (spec v12/v13): 21 script, lokal semua, tanpa request jaringan. -->
 <script src="src/math3.js"></script>
 <script src="src/rng.js"></script>
 <script src="src/gl.js"></script>

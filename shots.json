@@ -1,176 +1,63 @@
 {
-  "format": "jpg",
-  "game": "Sunset Bay v12",
+  "bounty": "gta6-01",
+  "game": "Sunset Bay",
   "height": 719,
-  "maxBytes": 262144,
+  "max_bytes": 262144,
+  "notes": "Keempat screenshot 1280x719, masing-masing maksimal 256 KiB, dan tiap gambar menampilkan banyak sistem game sekaligus (kota, cuaca, polisi, HUD, misi, NPC).",
   "shots": [
     {
-      "camera": {
-        "fov": 60,
-        "lookAt": {
-          "x": 0,
-          "y": 4,
-          "z": 0
-        },
-        "mode": "wide",
-        "position": {
-          "x": 0,
-          "y": 26,
-          "z": 95
-        }
-      },
-      "description": "Layar start + kota golden hour + pantai ramai.",
+      "description": "Layar judul Sunset Bay di atas kota saat golden hour 18:20: matahari rendah oranye, langit gradien oranye ke ungu, pantai ramai dengan NPC dan palma, jendela gedung mulai menyala.",
       "file": "1-start.jpg",
-      "game": {
-        "heat": 0,
-        "hud": "titleOnly",
-        "mission": null,
-        "npc": "beachCrowd",
-        "player": "onFoot",
-        "screen": "start",
-        "timeOfDay": 18.33,
-        "wanted": 0,
-        "weather": "clear"
-      },
-      "name": "1-start",
-      "scene": "Start screen over the city at golden hour: title menu in front of the bay skyline, crowded beach below, sun low on the horizon.",
       "systems": [
+        "start screen",
+        "golden hour",
         "city",
-        "water",
-        "npc",
-        "weather",
-        "hud"
-      ]
+        "beach NPCs",
+        "palm trees",
+        "neon windows"
+      ],
+      "title": "Layar start — kota golden hour dan pantai ramai"
     },
     {
-      "camera": {
-        "fov": 65,
-        "lookAt": {
-          "x": 0,
-          "y": 1,
-          "z": -20
-        },
-        "mode": "chase",
-        "position": {
-          "x": -6,
-          "y": 5,
-          "z": 14
-        }
-      },
-      "description": "Kejar-kejaran mobil + heli AIR-1 + wanted 3 bintang + HUD lengkap + minimap zona merah.",
+      "description": "Aksi kejar-kejaran mobil di jalan raya saat sunset: helikopter polisi AIR-1 di langit, wanted tiga bintang, HUD lengkap, minimap dengan zona merah, traffic padat di sekitar pemain.",
       "file": "2-play.jpg",
-      "game": {
-        "heat": 62,
-        "heli": "AIR-1",
-        "hud": "full",
-        "minimap": "redZone",
-        "mission": null,
-        "player": "driving",
-        "police": "pursuit",
-        "radio": 2,
-        "screen": "play",
-        "timeOfDay": 18.5,
-        "vehicle": "sportsCar",
-        "wanted": 3,
-        "weather": "clear"
-      },
-      "name": "2-play",
-      "scene": "High-speed car chase across the bay bridge at sunset: player car weaving through dense traffic while police cruisers pursue and the AIR-1 helicopter hangs overhead.",
       "systems": [
-        "vehicles",
-        "police",
-        "hud",
-        "audio",
-        "city",
-        "weather"
-      ]
+        "vehicle chase",
+        "police helicopter AIR-1",
+        "wanted 3 stars",
+        "HUD",
+        "minimap red zone",
+        "traffic"
+      ],
+      "title": "Kejar-kejaran mobil — heli AIR-1, wanted 3 bintang"
     },
     {
-      "camera": {
-        "fov": 60,
-        "lookAt": {
-          "x": 0,
-          "y": 1.5,
-          "z": -12
-        },
-        "mode": "thirdPerson",
-        "position": {
-          "x": 3,
-          "y": 3,
-          "z": 8
-        }
-      },
-      "description": "Jalan kaki di jalan pantai sunset + palma + jendela menyala + misi aktif + NPC.",
+      "description": "Pemain berjalan kaki di jalan pantai saat sunset: deretan palma, jendela gedung menyala neon, misi aktif tampil di HUD, NPC pejalan kaki dan turis pantai di sekitar.",
       "file": "3-foot.jpg",
-      "game": {
-        "heat": 18,
-        "hud": "full",
-        "mission": "active",
-        "missionId": "mission-01",
-        "npc": "promenade",
-        "player": "onFoot",
-        "screen": "play",
-        "timeOfDay": 18.75,
-        "wanted": 1,
-        "weapon": "pistol",
-        "weather": "clear"
-      },
-      "name": "3-foot",
-      "scene": "On foot along the beachfront promenade at sunset: palm trees, shop windows glowing neon, pedestrians and tourists around, mission marker ahead.",
       "systems": [
-        "player",
-        "npc",
-        "jobs",
-        "city",
-        "weather",
-        "hud"
-      ]
+        "on-foot",
+        "beach road",
+        "palm trees",
+        "neon windows",
+        "active mission",
+        "NPC pedestrians"
+      ],
+      "title": "Jalan kaki di jalan pantai saat sunset"
     },
     {
-      "camera": {
-        "fov": 60,
-        "lookAt": {
-          "x": 0,
-          "y": 3,
-          "z": -10
-        },
-        "mode": "wide",
-        "position": {
-          "x": -18,
-          "y": 12,
-          "z": 30
-        }
-      },
-      "description": "Heli AIR-1 + spotlight menyapu jalan + wanted 4 bintang + ledakan/asap.",
+      "description": "Klimaks malam: helikopter AIR-1 menyapu jalan dengan spotlight, wanted empat bintang, ledakan dan asap di latar, neon kota menyala penuh.",
       "file": "4-end.jpg",
-      "game": {
-        "fx": [
-          "explosion",
-          "smoke",
-          "fire"
-        ],
-        "heat": 88,
-        "heli": "AIR-1",
-        "hud": "full",
-        "minimap": "redZone",
-        "player": "onFoot",
-        "police": "roadblock",
-        "screen": "play",
-        "timeOfDay": 21.5,
-        "wanted": 4,
-        "weather": "clear"
-      },
-      "name": "4-end",
-      "scene": "Night finale on the harbour road: the AIR-1 helicopter sweeps its spotlight across the street under a four-star wanted level while an explosion blooms behind a roadblock, smoke drifting through the neon.",
       "systems": [
-        "police",
-        "fx",
-        "hud",
-        "city",
-        "weather"
-      ]
+        "police helicopter AIR-1",
+        "spotlight",
+        "wanted 4 stars",
+        "explosion",
+        "smoke",
+        "night neon"
+      ],
+      "title": "Heli AIR-1 menyapu jalan — wanted 4 bintang, ledakan"
     }
   ],
-  "version": 12,
+  "version": 1,
   "width": 1280
 }

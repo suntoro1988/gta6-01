@@ -1,324 +1,296 @@
 window.SB = window.SB || {};
-(function () {
-  'use strict';
+(function(){ 'use strict';
+// ---------------------------------------------------------------------------
+// SB.Shots — the screenshot helper of Sunset Bay, plus the ammo shop.
+// take(name) captures the game canvas (1280x719) and downloads it as a
+// PNG, keeping a small in-memory gallery and a localStorage index so the
+// pause screen can show the player's album. The four official captures
+// (1-start, 2-play, 3-foot, 4-end) are scripted presets so every build
+// produces comparable hero shots.
+// buyAmmo(): $50 for +24 ammo (spec), deducted from shared state.
+// NOTE (spec): `ammo` is lowercase everywhere in this module.
+// API (spec): take(name), buyAmmo(), ammo (lowercase).
+// ---------------------------------------------------------------------------
 
-  // ---------------------------------------------------------------------------
-  // SB.Shots — screenshot helper + weapon ammo economy for Sunset Bay v12.
-  // take(name): captures the game canvas to a dataURL and triggers a
-  // download (name.jpg). Used for the 4 submission screenshots, and for
-  // the in-game photo missions (SB.Jobs "Golden Hour Shots").
-  // Ammo: the module owns the lowercase `ammo` counter and buyAmmo()
-  // ($50 for +24 ammo), matching the weapon slots in the design spec
-  // (0 pistol, 1 smg, 2 shotgun, 3 rifle). SB.Game / SB.Player read
-  // SB.Shots.ammo and call SB.Shots.spendAmmo() on every shot.
-  // scorePhoto(state): rates a shot 0-100 from how many systems are
-  // visible at once (HUD, wanted, heli, explosion, sunset, NPCs) — the
-  // same ingredients the 4 submission shots are built from.
-  // ---------------------------------------------------------------------------
+var AMMO_PRICE = 50;      // $ per box
+var AMMO_PER_BOX = 24;    // rounds per box
+var MAX_AMMO = 999;
+var MAX_CARRY = 4;        // max ammo boxes carried at once (soft cap via price)
+var ammo = 24;            // current reserve, lowercase, mirrors SB.state.ammo
+var gallery = [];         // {name, dataUrl, at} newest first, max 12
+var lastShot = null;
+var stateRef = null;
+var canvasRef = null;
+var autoCounter = 0;
 
-  var AMMO_PRICE = 50;
-  var AMMO_PACK = 24;
-  var MAX_AMMO = 240;
-  var MAX_CARRY = 999;
+// The four official captures (spec): name, scene description, and the
+// game moment each one is meant to show. The capture script (Builder B's
+// shots.json) calls take() with these names in order.
+var PRESETS = [
+  {
+    name: '1-start',
+    title: 'Start screen',
+    brief: 'Title screen over the city at golden hour, crowded beach below.'
+  },
+  {
+    name: '2-play',
+    title: 'Car chase',
+    brief: 'Vehicle chase with heli AIR-1, wanted three stars, full HUD and minimap with a red zone.'
+  },
+  {
+    name: '3-foot',
+    title: 'On foot at sunset',
+    brief: 'Walking the beachfront road at sunset, palms, lit windows, active mission, NPCs nearby.'
+  },
+  {
+    name: '4-end',
+    title: 'Helicopter spotlight',
+    brief: 'Heli AIR-1 spotlight sweeping the street, wanted four stars, explosion and smoke.'
+  }
+];
 
-  var ammoCount = 24;      // lowercase `ammo` — see getter below
-  var weapon = 0;          // 0 pistol, 1 smg, 2 shotgun, 3 rifle
-  var stateRef = null;
-  var shotsTaken = [];
-  var lastDataUrl = null;
-  var canvasRef = null;
-  var flashEl = null;
+function findCanvas() {
+  if (typeof document === 'undefined') { return null; }
+  if (canvasRef && canvasRef.parentNode) { return canvasRef; }
+  canvasRef = document.getElementById('game-canvas')
+    || document.querySelector('#game-container canvas')
+    || document.querySelector('canvas');
+  return canvasRef;
+}
 
-  var WEAPONS = [
-    { name: 'Pistol', damage: 25, rate: 0.35, spread: 0.02, cost: 1 },
-    { name: 'SMG', damage: 14, rate: 0.09, spread: 0.07, cost: 1 },
-    { name: 'Shotgun', damage: 18, rate: 0.8, spread: 0.16, cost: 3 },
-    { name: 'Rifle', damage: 45, rate: 0.5, spread: 0.01, cost: 1 }
-  ];
+// init(state): remember shared state and the canvas. Optional — take()
+// also works standalone (it re-finds the canvas each time).
+function init(state) {
+  stateRef = state || null;
+  if (stateRef && typeof stateRef.ammo === 'number') {
+    ammo = stateRef.ammo;
+  }
+  findCanvas();
+  loadIndex();
+  return true;
+}
 
-  var WEAPON_NAMES = ['Pistol', 'SMG', 'Shotgun', 'Rifle'];
+// ---------------------------------------------------------------------------
+// take(name): capture the current frame.
+// - name omitted -> auto name "shot-NNN" with a running counter.
+// - Renders the WebGL canvas to a PNG data URL (preserveDrawingBuffer
+//   is off, so we force a fresh frame first when the Game module offers
+//   a render hook, then read the canvas synchronously).
+// - Downloads the file (a.click) and records it in the gallery + index.
+// Returns the data URL, or null when no canvas is available.
+// ---------------------------------------------------------------------------
+function take(name) {
+  var canvas = findCanvas();
+  if (!canvas) { return null; }
+  var shotName = String(name || ('shot-' + (++autoCounter))).replace(/[^a-z0-9\-_]/gi, '-');
+  // Ask the Game module for one fresh frame so the capture is current.
+  if (window.SB && window.SB.Game && window.SB.Game.render) {
+    try { window.SB.Game.render(); } catch (e) { /* keep the last frame */ }
+  }
+  var dataUrl;
+  try {
+    dataUrl = canvas.toDataURL('image/png');
+  } catch (e) {
+    return null;
+  }
+  var entry = { name: shotName, dataUrl: dataUrl, at: Date.now() };
+  lastShot = entry;
+  gallery.unshift(entry);
+  if (gallery.length > 12) { gallery.pop(); }
+  saveIndex();
+  download(dataUrl, shotName + '.png');
+  if (window.SB && window.SB.HUD) {
+    window.SB.HUD.showToast('Screenshot saved: ' + shotName + '.png', 'good');
+  }
+  if (window.SB && window.SB.Audio) { window.SB.Audio.sfx('click'); }
+  return dataUrl;
+}
 
-  // The 4 submission shots from the design spec, with the systems each
-  // one must show. take() can be called with any name; these four are
-  // the ones the dossier build records.
-  var SUBMISSION_SHOTS = [
-    {
-      name: '1-start',
-      file: '1-start.jpg',
-      desc: 'Start screen + golden-hour city + crowded beach',
-      systems: ['start screen', 'golden hour', 'city skyline', 'beach NPCs']
-    },
-    {
-      name: '2-play',
-      file: '2-play.jpg',
-      desc: 'Car chase + heli AIR-1 + wanted 3 stars + full HUD + minimap red zone',
-      systems: ['car chase', 'heli AIR-1', 'wanted 3', 'HUD', 'minimap']
-    },
-    {
-      name: '3-foot',
-      file: '3-foot.jpg',
-      desc: 'On foot on the beach road at sunset + palms + lit windows + active mission + NPCs',
-      systems: ['on foot', 'sunset', 'palms', 'lit windows', 'mission', 'NPCs']
-    },
-    {
-      name: '4-end',
-      file: '4-end.jpg',
-      desc: 'Heli AIR-1 + spotlight sweeping the road + wanted 4 stars + explosion/smoke',
-      systems: ['heli AIR-1', 'spotlight', 'wanted 4', 'explosion', 'smoke']
+// Trigger a browser download for a data URL.
+function download(dataUrl, filename) {
+  var a = document.createElement('a');
+  a.href = dataUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+// Capture the four official presets in order, with a short pause between
+// them so each scene can settle. `step` is called with (preset, index)
+// before each capture so the driver can stage the scene.
+function takeAll(step, gapMs) {
+  var i = 0;
+  var gap = gapMs || 1200;
+  function next() {
+    if (i >= PRESETS.length) { return; }
+    var preset = PRESETS[i];
+    if (typeof step === 'function') {
+      try { step(preset, i); } catch (e) { /* driver error: still shoot */ }
     }
-  ];
-
-  // --- Canvas capture ---------------------------------------------------------
-
-  function findCanvas() {
-    if (canvasRef) return canvasRef;
-    var c = document.getElementById('game-canvas') ||
-      document.getElementById('game') ||
-      document.querySelector('canvas');
-    canvasRef = c || null;
-    return canvasRef;
+    window.setTimeout(function () {
+      take(preset.name);
+      i++;
+      next();
+    }, gap);
   }
+  next();
+  return PRESETS.length;
+}
 
-  function setCanvas(canvas) {
-    canvasRef = canvas || null;
-    return canvasRef;
+// Take one named preset (used by the capture script for a single scene).
+function takePreset(name) {
+  var i;
+  for (i = 0; i < PRESETS.length; i++) {
+    if (PRESETS[i].name === name) { return take(name); }
   }
+  return null;
+}
 
-  function captureDataUrl(quality) {
-    var canvas = findCanvas();
-    if (!canvas) return null;
-    try {
-      // preserveDrawingBuffer may be off; toDataURL still works if called
-      // in the same frame as a draw. Game calls take() right after frame().
-      return canvas.toDataURL('image/jpeg', quality || 0.85);
-    } catch (e) {
-      return null;
-    }
-  }
-
-  function download(dataUrl, filename) {
-    var a = document.createElement('a');
-    a.href = dataUrl;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(function () {
-      if (a.parentNode) a.parentNode.removeChild(a);
-    }, 200);
-  }
-
-  function flash() {
-    if (typeof document === 'undefined') return;
-    if (!flashEl) {
-      flashEl = document.createElement('div');
-      flashEl.style.cssText = 'position:fixed;inset:0;background:#fff;opacity:0;' +
-        'pointer-events:none;z-index:60;transition:opacity .12s;';
-      document.body.appendChild(flashEl);
-    }
-    flashEl.style.opacity = '0.7';
-    setTimeout(function () { flashEl.style.opacity = '0'; }, 120);
-  }
-
-  function take(name) {
-    var clean = String(name || 'shot').replace(/[^a-z0-9\-_]/gi, '').toLowerCase() || 'shot';
-    var dataUrl = captureDataUrl(0.85);
-    var record = {
-      name: clean,
-      file: clean + '.jpg',
-      time: stateRef ? stateRef.time : 0,
-      timeOfDay: stateRef ? stateRef.timeOfDay : 0,
-      wanted: stateRef ? stateRef.wanted : 0,
-      score: stateRef ? scorePhoto(stateRef) : 0,
-      dataUrl: dataUrl,
-      at: new Date().toISOString()
-    };
-    lastDataUrl = dataUrl;
-    shotsTaken.push(record);
-    flash();
-    if (dataUrl) download(dataUrl, record.file);
+// ---------------------------------------------------------------------------
+// Ammo shop. buyAmmo(): $50 for +24 rounds (spec). Fails (returns false)
+// when the player cannot afford it; otherwise deducts, adds, syncs
+// shared state, and toasts the result. `ammo` stays lowercase.
+// ---------------------------------------------------------------------------
+function buyAmmo() {
+  var cash = stateRef ? (stateRef.money || 0) : 0;
+  if (cash < AMMO_PRICE) {
     if (window.SB && window.SB.HUD) {
-      window.SB.HUD.showToast('Photo saved: ' + record.file +
-        '  ·  score ' + record.score + '/100');
+      window.SB.HUD.showToast('Not enough cash — ammo costs $' + AMMO_PRICE + '.', 'bad');
     }
-    if (window.SB && window.SB.Audio) window.SB.Audio.sfx('click');
-    return record;
+    return false;
   }
-
-  // Take one of the four named submission shots, pre-checking its setup.
-  function takeSubmission(slot) {
-    var idx = Math.max(0, Math.min(3, Math.floor(slot || 0)));
-    var spec = SUBMISSION_SHOTS[idx];
-    var rec = take(spec.name);
-    rec.submission = true;
-    rec.spec = spec.desc;
-    return rec;
-  }
-
-  // --- Photo scoring ----------------------------------------------------------
-
-  function scorePhoto(state) {
-    if (!state) return 0;
-    var score = 20; // base: a clean frame of the bay is worth something
-    // Golden hour / sunset light is the hero look.
-    var tod = state.timeOfDay || 0;
-    if (tod >= 17.5 && tod <= 19.5) score += 18;
-    else if (tod >= 19.5 || tod < 6) score += 10; // neon night
-    // Wanted heat makes a shot dramatic.
-    if (state.wanted >= 4) score += 16;
-    else if (state.wanted >= 3) score += 12;
-    else if (state.wanted >= 1) score += 5;
-    // Active mission + HUD richness.
-    if (state.mission && state.mission.id) score += 10;
-    if (state.heat >= 50) score += 6;
-    // Heli in the air (wanted >= 3 spawns AIR-1).
-    if (window.SB && window.SB.Police && window.SB.Police.heli) score += 12;
-    // FX on screen: explosion / smoke / fire particles.
-    if (window.SB && window.SB.FX && window.SB.FX.particles &&
-      window.SB.FX.particles.length > 0) score += 10;
-    // Living world: NPCs + traffic visible.
-    if (window.SB && window.SB.NPC && window.SB.NPC.pedestrians &&
-      window.SB.NPC.pedestrians.length >= 10) score += 6;
-    if (window.SB && window.SB.Vehicles && window.SB.Vehicles.cars &&
-      window.SB.Vehicles.cars.length >= 10) score += 4;
-    // On foot vs in a vehicle — foot shots show the street life.
-    if (state.player && state.player.onFoot) score += 4;
-    if (state.weather && state.weather.rain > 0) score += 4; // rain + puddles
-    if (score > 100) score = 100;
-    return score;
-  }
-
-  function bestShot() {
-    var best = null, i;
-    for (i = 0; i < shotsTaken.length; i++) {
-      if (!best || shotsTaken[i].score > best.score) best = shotsTaken[i];
-    }
-    return best;
-  }
-
-  // --- Ammo economy -----------------------------------------------------------
-
-  function syncFromState() {
-    // Shots tidak di-init oleh game.js (di luar urutan init spec), dan
-    // game.js load() mengganti objek state — jadi selalu baca state live
-    // dari window.SB.state, bukan hanya stateRef sekali init.
-    if (window.SB && window.SB.state) stateRef = window.SB.state;
-    if (!stateRef) return;
-    if (typeof stateRef.ammo === 'number') ammoCount = stateRef.ammo;
-    if (typeof stateRef.weapon === 'number') weapon = stateRef.weapon;
-  }
-
-  function syncToState() {
-    if (window.SB && window.SB.state) stateRef = window.SB.state;
-    if (!stateRef) return;
-    stateRef.ammo = ammoCount;
-    stateRef.weapon = weapon;
-  }
-
-  function buyAmmo() {
-    syncFromState();
-    if (!stateRef) return false;
-    if ((stateRef.money || 0) < AMMO_PRICE) {
-      if (window.SB && window.SB.HUD) {
-        window.SB.HUD.showToast('Not enough cash — ammo costs $' + AMMO_PRICE + '.');
-      }
-      return false;
-    }
-    if (ammoCount >= MAX_AMMO) {
-      if (window.SB && window.SB.HUD) {
-        window.SB.HUD.showToast('Ammo full (' + MAX_AMMO + ').');
-      }
-      return false;
-    }
-    stateRef.money -= AMMO_PRICE;
-    ammoCount = Math.min(MAX_AMMO, ammoCount + AMMO_PACK);
-    syncToState();
+  if (ammo >= MAX_AMMO) {
     if (window.SB && window.SB.HUD) {
-      window.SB.HUD.showToast('Ammo +24  ·  -$50  ·  total ' + ammoCount);
-      window.SB.HUD.setMoney(stateRef.money);
+      window.SB.HUD.showToast('Ammo full (' + MAX_AMMO + ').', 'info');
     }
-    if (window.SB && window.SB.Audio) window.SB.Audio.sfx('money');
-    return true;
+    return false;
   }
-
-  function spendAmmo(n) {
-    syncFromState();
-    var cost = n || WEAPONS[weapon].cost;
-    if (ammoCount < cost) return false;
-    ammoCount -= cost;
-    syncToState();
-    return true;
+  if (stateRef) {
+    stateRef.money = cash - AMMO_PRICE;
+    ammo = Math.min(MAX_AMMO, ammo + AMMO_PER_BOX);
+    stateRef.ammo = ammo;
+  } else {
+    ammo = Math.min(MAX_AMMO, ammo + AMMO_PER_BOX);
   }
-
-  function addAmmo(n) {
-    syncFromState();
-    ammoCount = Math.min(MAX_AMMO, Math.max(0, ammoCount + (n || 0)));
-    syncToState();
-    return ammoCount;
+  if (window.SB && window.SB.HUD) {
+    window.SB.HUD.setMoney(stateRef ? stateRef.money : 0);
+    window.SB.HUD.setAmmo(ammo);
+    window.SB.HUD.showToast('Ammo +24  (-$' + AMMO_PRICE + ')', 'good');
   }
-
-  function switchWeapon(dir) {
-    syncFromState();
-    weapon = ((weapon + (dir || 1)) % 4 + 4) % 4;
-    syncToState();
-    if (window.SB && window.SB.HUD) {
-      window.SB.HUD.showToast('Weapon: ' + WEAPONS[weapon].name +
-        '  ·  ammo ' + ammoCount);
-    }
-    if (window.SB && window.SB.Audio) window.SB.Audio.sfx('click');
-    return weapon;
+  if (window.SB && window.SB.Audio) {
+    window.SB.Audio.sfx('reload');
+    window.SB.Audio.sfx('cash');
   }
+  return true;
+}
 
-  function setWeapon(i) {
-    syncFromState();
-    weapon = ((Math.floor(i) % 4) + 4) % 4;
-    syncToState();
-    return weapon;
+// Price / size of one box, for shop UI text.
+function ammoPrice() { return AMMO_PRICE; }
+function ammoPerBox() { return AMMO_PER_BOX; }
+
+// How many boxes the player can afford right now.
+function affordableBoxes() {
+  var cash = stateRef ? (stateRef.money || 0) : 0;
+  return Math.floor(cash / AMMO_PRICE);
+}
+
+// Spend rounds (called by Player.shoot). Returns false when empty.
+function spendAmmo(n) {
+  var need = n || 1;
+  if (ammo < need) { return false; }
+  ammo -= need;
+  if (stateRef) { stateRef.ammo = ammo; }
+  if (window.SB && window.SB.HUD) { window.SB.HUD.setAmmo(ammo); }
+  return true;
+}
+
+// Add rounds without charging (pickups, mission rewards).
+function addAmmo(n) {
+  ammo = Math.min(MAX_AMMO, ammo + (n || 0));
+  if (stateRef) { stateRef.ammo = ammo; }
+  if (window.SB && window.SB.HUD) { window.SB.HUD.setAmmo(ammo); }
+  return ammo;
+}
+
+// Current reserve (lowercase accessor; the property `ammo` is the source).
+function getAmmo() { return ammo; }
+
+// Sync from shared state (called when loading a save).
+function syncFromState() {
+  if (stateRef && typeof stateRef.ammo === 'number') {
+    ammo = stateRef.ammo;
   }
+  return ammo;
+}
 
-  function weaponInfo() {
-    return {
-      index: weapon,
-      name: WEAPONS[weapon].name,
-      damage: WEAPONS[weapon].damage,
-      rate: WEAPONS[weapon].rate,
-      ammo: ammoCount
-    };
-  }
+// ---------------------------------------------------------------------------
+// Gallery index: localStorage keeps only names + timestamps (never the
+// PNG bytes — those would blow the 5 MB quota). The pause screen reads
+// this list to show the album.
+// ---------------------------------------------------------------------------
+var INDEX_KEY = 'sunset-bay-shots-index';
 
-  // --- Lifecycle --------------------------------------------------------------
+function saveIndex() {
+  try {
+    var slim = gallery.map(function (g) {
+      return { name: g.name, at: g.at };
+    });
+    window.localStorage.setItem(INDEX_KEY, JSON.stringify(slim));
+  } catch (e) { /* storage full or blocked: gallery still works in memory */ }
+}
 
-  function init(state) {
-    stateRef = state || null;
-    if (stateRef) {
-      if (typeof stateRef.ammo !== 'number') stateRef.ammo = ammoCount;
-      if (typeof stateRef.weapon !== 'number') stateRef.weapon = weapon;
-      syncFromState();
-    }
-    findCanvas();
-  }
+function loadIndex() {
+  try {
+    var raw = window.localStorage.getItem(INDEX_KEY);
+    if (!raw) { return []; }
+    return JSON.parse(raw) || [];
+  } catch (e) { return []; }
+}
 
-  window.SB.Shots = {
-    init: init,
-    take: take,
-    takeSubmission: takeSubmission,
-    scorePhoto: scorePhoto,
-    bestShot: bestShot,
-    buyAmmo: buyAmmo,
-    spendAmmo: spendAmmo,
-    addAmmo: addAmmo,
-    switchWeapon: switchWeapon,
-    setWeapon: setWeapon,
-    weaponInfo: weaponInfo,
-    setCanvas: setCanvas,
-    findCanvas: findCanvas,
-    submissionShots: SUBMISSION_SHOTS,
-    weapons: WEAPON_NAMES,
-    get ammo() { syncFromState(); return ammoCount; },
-    set ammo(v) { ammoCount = Math.max(0, Math.min(MAX_AMMO, Math.floor(v || 0))); syncToState(); },
-    get weapon() { return weapon; },
-    get shots() { return shotsTaken; },
-    get lastDataUrl() { return lastDataUrl; },
-    get price() { return AMMO_PRICE; },
-    get pack() { return AMMO_PACK; }
-  };
+function clearGallery() {
+  gallery = [];
+  lastShot = null;
+  try { window.localStorage.removeItem(INDEX_KEY); } catch (e) {}
+  return true;
+}
+
+// Gallery entries (newest first), without the heavy data URLs.
+function listShots() {
+  return gallery.map(function (g) {
+    return { name: g.name, at: g.at };
+  });
+}
+
+function lastShotName() {
+  return lastShot ? lastShot.name : null;
+}
+
+window.SB.Shots = {
+  init: init,
+  take: take,
+  takeAll: takeAll,
+  takePreset: takePreset,
+  buyAmmo: buyAmmo,
+  ammoPrice: ammoPrice,
+  ammoPerBox: ammoPerBox,
+  affordableBoxes: affordableBoxes,
+  spendAmmo: spendAmmo,
+  addAmmo: addAmmo,
+  getAmmo: getAmmo,
+  syncFromState: syncFromState,
+  listShots: listShots,
+  clearGallery: clearGallery,
+  lastShotName: lastShotName,
+  presets: PRESETS
+};
+// `ammo` is a live lowercase property: reading SB.Shots.ammo always
+// returns the current reserve (a plain value copy would go stale after
+// the first buyAmmo/spendAmmo call).
+Object.defineProperty(window.SB.Shots, 'ammo', {
+  get: function () { return ammo; },
+  set: function (v) { ammo = Math.max(0, Math.min(MAX_AMMO, v | 0)); },
+  enumerable: true,
+  configurable: true
+});
 })();
