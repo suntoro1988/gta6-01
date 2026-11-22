@@ -1,272 +1,324 @@
-// shots.js — Sunset Bay (v11)
-// Shooting system for Sunset Bay, written from scratch.
-//  * Ammunition is spelled lowercase "ammo" everywhere (HUD, shop,
-//    code) — the v10 convention, kept on purpose.
-//  * buyAmmo: $50 for +24 ammo.
-//  * Shooting a police officer: HP 100 -> 66 per hit (34 damage —
-//    the v10 value, kept). Three hits take an officer down.
-//  * Reload, crosshair (DOM + canvas-drawn), spread, range, cooldown.
-//  * No dependencies except an optional audio hook: pass an object
-//    with sfxGunshot() / sfxReload() (the audio.js engine) and the
-//    system will call it; without one it runs silently.
-//  * Hit detection is a plain ray-vs-target test over caller-supplied
-//    targets, so it works with any world representation.
+window.SB = window.SB || {};
+(function () {
+  'use strict';
 
-'use strict';
+  // ---------------------------------------------------------------------------
+  // SB.Shots — screenshot helper + weapon ammo economy for Sunset Bay v12.
+  // take(name): captures the game canvas to a dataURL and triggers a
+  // download (name.jpg). Used for the 4 submission screenshots, and for
+  // the in-game photo missions (SB.Jobs "Golden Hour Shots").
+  // Ammo: the module owns the lowercase `ammo` counter and buyAmmo()
+  // ($50 for +24 ammo), matching the weapon slots in the design spec
+  // (0 pistol, 1 smg, 2 shotgun, 3 rifle). SB.Game / SB.Player read
+  // SB.Shots.ammo and call SB.Shots.spendAmmo() on every shot.
+  // scorePhoto(state): rates a shot 0-100 from how many systems are
+  // visible at once (HUD, wanted, heli, explosion, sunset, NPCs) — the
+  // same ingredients the 4 submission shots are built from.
+  // ---------------------------------------------------------------------------
 
-export const AMMO_PRICE = 50;
-export const AMMO_PACK = 24;
-export const MAG_SIZE = 12;
-export const POLICE_HP = 100;
-export const DAMAGE_PER_HIT = 34; // 100 -> 66 on the first hit (v10 value)
-export const RELOAD_TIME_MS = 1100;
-export const FIRE_COOLDOWN_MS = 180;
-export const MAX_RANGE = 120;
-export const BASE_SPREAD_DEG = 1.2;
+  var AMMO_PRICE = 50;
+  var AMMO_PACK = 24;
+  var MAX_AMMO = 240;
+  var MAX_CARRY = 999;
 
-function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  var ammoCount = 24;      // lowercase `ammo` — see getter below
+  var weapon = 0;          // 0 pistol, 1 smg, 2 shotgun, 3 rifle
+  var stateRef = null;
+  var shotsTaken = [];
+  var lastDataUrl = null;
+  var canvasRef = null;
+  var flashEl = null;
 
-export class ShootingSystem {
-  constructor(options) {
-    const o = options || {};
-    this.audio = o.audio || null;      // optional audio.js engine
-    this.onEvent = typeof o.onEvent === 'function' ? o.onEvent : null;
-    this.money = o.money != null ? o.money : 0;
-    this.ammo = o.ammo != null ? o.ammo : 48;          // reserve ammo
-    this.mag = o.mag != null ? o.mag : MAG_SIZE;        // ammo in the magazine
-    this.magSize = MAG_SIZE;
-    this.reloading = false;
-    this._reloadTimer = null;
-    this._lastShotAt = 0;
-    this._shotsFired = 0;
-    this._shotsHit = 0;
-    this.crosshair = { visible: false, spread: 8, hitMarkerAt: 0 };
-    this._crossEl = null;
-  }
+  var WEAPONS = [
+    { name: 'Pistol', damage: 25, rate: 0.35, spread: 0.02, cost: 1 },
+    { name: 'SMG', damage: 14, rate: 0.09, spread: 0.07, cost: 1 },
+    { name: 'Shotgun', damage: 18, rate: 0.8, spread: 0.16, cost: 3 },
+    { name: 'Rifle', damage: 45, rate: 0.5, spread: 0.01, cost: 1 }
+  ];
 
-  emit(event, data) {
-    if (this.onEvent) this.onEvent(event, data);
-  }
+  var WEAPON_NAMES = ['Pistol', 'SMG', 'Shotgun', 'Rifle'];
 
-  // --- Ammunition shop ----------------------------------------------
-  // $50 buys +24 ammo (reserve). Returns { ok, ammo, money }.
-  buyAmmo() {
-    if (this.money < AMMO_PRICE) {
-      return { ok: false, error: 'need $' + AMMO_PRICE, money: this.money, ammo: this.ammo };
+  // The 4 submission shots from the design spec, with the systems each
+  // one must show. take() can be called with any name; these four are
+  // the ones the dossier build records.
+  var SUBMISSION_SHOTS = [
+    {
+      name: '1-start',
+      file: '1-start.jpg',
+      desc: 'Start screen + golden-hour city + crowded beach',
+      systems: ['start screen', 'golden hour', 'city skyline', 'beach NPCs']
+    },
+    {
+      name: '2-play',
+      file: '2-play.jpg',
+      desc: 'Car chase + heli AIR-1 + wanted 3 stars + full HUD + minimap red zone',
+      systems: ['car chase', 'heli AIR-1', 'wanted 3', 'HUD', 'minimap']
+    },
+    {
+      name: '3-foot',
+      file: '3-foot.jpg',
+      desc: 'On foot on the beach road at sunset + palms + lit windows + active mission + NPCs',
+      systems: ['on foot', 'sunset', 'palms', 'lit windows', 'mission', 'NPCs']
+    },
+    {
+      name: '4-end',
+      file: '4-end.jpg',
+      desc: 'Heli AIR-1 + spotlight sweeping the road + wanted 4 stars + explosion/smoke',
+      systems: ['heli AIR-1', 'spotlight', 'wanted 4', 'explosion', 'smoke']
     }
-    this.money -= AMMO_PRICE;
-    this.ammo += AMMO_PACK;
-    this.emit('ammo-bought', { price: AMMO_PRICE, gained: AMMO_PACK, ammo: this.ammo, money: this.money });
-    return { ok: true, price: AMMO_PRICE, gained: AMMO_PACK, ammo: this.ammo, money: this.money };
+  ];
+
+  // --- Canvas capture ---------------------------------------------------------
+
+  function findCanvas() {
+    if (canvasRef) return canvasRef;
+    var c = document.getElementById('game-canvas') ||
+      document.getElementById('game') ||
+      document.querySelector('canvas');
+    canvasRef = c || null;
+    return canvasRef;
   }
 
-  // How many $50 packs the player can currently afford.
-  affordablePacks() { return Math.floor(this.money / AMMO_PRICE); }
-
-  // --- Firing ---------------------------------------------------------
-  canFire(now) {
-    if (this.reloading) return { ok: false, reason: 'reloading' };
-    if (this.mag <= 0) return { ok: false, reason: 'empty' };
-    const t = now || Date.now();
-    if (t - this._lastShotAt < FIRE_COOLDOWN_MS) return { ok: false, reason: 'cooldown' };
-    return { ok: true };
+  function setCanvas(canvas) {
+    canvasRef = canvas || null;
+    return canvasRef;
   }
 
-  // Fire one shot along a ray. `aim` = { ox, oy, oz, dx, dy, dz }
-  // (origin + normalised direction). `targets` = array of
-  // { id, kind, x, y, z, radius, hp } — kind 'police' | 'npc' | 'prop'.
-  // Returns { ok, hit, target, damage, remaining }.
-  fire(aim, targets) {
-    const check = this.canFire();
-    if (!check.ok) {
-      if (check.reason === 'empty') this.emit('dry-fire', {});
-      return { ok: false, reason: check.reason };
+  function captureDataUrl(quality) {
+    var canvas = findCanvas();
+    if (!canvas) return null;
+    try {
+      // preserveDrawingBuffer may be off; toDataURL still works if called
+      // in the same frame as a draw. Game calls take() right after frame().
+      return canvas.toDataURL('image/jpeg', quality || 0.85);
+    } catch (e) {
+      return null;
     }
-    this._lastShotAt = Date.now();
-    this.mag -= 1;
-    this._shotsFired += 1;
-    this.crosshair.spread = 14;
-    if (this.audio && typeof this.audio.sfxGunshot === 'function') this.audio.sfxGunshot();
-
-    const hit = this._raycast(aim, targets || []);
-    if (hit) {
-      this._shotsHit += 1;
-      this.crosshair.hitMarkerAt = Date.now();
-      const result = this._applyHit(hit.target);
-      this.emit('shot-hit', { target: hit.target, damage: result.damage, hp: result.hp, distance: hit.distance });
-      if (result.down) this.emit('target-down', { target: hit.target });
-      return { ok: true, hit: true, target: hit.target, damage: result.damage, hp: result.hp, down: result.down, mag: this.mag, ammo: this.ammo };
-    }
-    this.emit('shot-miss', {});
-    return { ok: true, hit: false, mag: this.mag, ammo: this.ammo };
   }
 
-  // Nearest target whose sphere the ray passes within `radius`.
-  _raycast(aim, targets) {
-    if (!aim) return null;
-    const spreadRad = (BASE_SPREAD_DEG * Math.PI) / 180;
-    // Deterministic-ish spread: rotate the direction slightly by a
-    // pseudo-random amount scaled by the crosshair spread.
-    const jx = (Math.random() - 0.5) * spreadRad * 2;
-    const jz = (Math.random() - 0.5) * spreadRad * 2;
-    const dx = aim.dx + jx, dy = aim.dy, dz = aim.dz + jz;
-    const len = Math.hypot(dx, dy, dz) || 1;
-    const ndx = dx / len, ndy = dy / len, ndz = dz / len;
-    let best = null;
-    for (const t of targets) {
-      if (t.hp != null && t.hp <= 0) continue;
-      const rx = t.x - aim.ox, ry = t.y - aim.oy, rz = t.z - aim.oz;
-      const along = rx * ndx + ry * ndy + rz * ndz;
-      if (along < 0 || along > MAX_RANGE) continue;
-      const px = aim.ox + ndx * along, py = aim.oy + ndy * along, pz = aim.oz + ndz * along;
-      const miss = Math.hypot(t.x - px, t.y - py, t.z - pz);
-      const radius = t.radius || 1;
-      if (miss <= radius && (!best || along < best.distance)) best = { target: t, distance: along };
+  function download(dataUrl, filename) {
+    var a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () {
+      if (a.parentNode) a.parentNode.removeChild(a);
+    }, 200);
+  }
+
+  function flash() {
+    if (typeof document === 'undefined') return;
+    if (!flashEl) {
+      flashEl = document.createElement('div');
+      flashEl.style.cssText = 'position:fixed;inset:0;background:#fff;opacity:0;' +
+        'pointer-events:none;z-index:60;transition:opacity .12s;';
+      document.body.appendChild(flashEl);
+    }
+    flashEl.style.opacity = '0.7';
+    setTimeout(function () { flashEl.style.opacity = '0'; }, 120);
+  }
+
+  function take(name) {
+    var clean = String(name || 'shot').replace(/[^a-z0-9\-_]/gi, '').toLowerCase() || 'shot';
+    var dataUrl = captureDataUrl(0.85);
+    var record = {
+      name: clean,
+      file: clean + '.jpg',
+      time: stateRef ? stateRef.time : 0,
+      timeOfDay: stateRef ? stateRef.timeOfDay : 0,
+      wanted: stateRef ? stateRef.wanted : 0,
+      score: stateRef ? scorePhoto(stateRef) : 0,
+      dataUrl: dataUrl,
+      at: new Date().toISOString()
+    };
+    lastDataUrl = dataUrl;
+    shotsTaken.push(record);
+    flash();
+    if (dataUrl) download(dataUrl, record.file);
+    if (window.SB && window.SB.HUD) {
+      window.SB.HUD.showToast('Photo saved: ' + record.file +
+        '  ·  score ' + record.score + '/100');
+    }
+    if (window.SB && window.SB.Audio) window.SB.Audio.sfx('click');
+    return record;
+  }
+
+  // Take one of the four named submission shots, pre-checking its setup.
+  function takeSubmission(slot) {
+    var idx = Math.max(0, Math.min(3, Math.floor(slot || 0)));
+    var spec = SUBMISSION_SHOTS[idx];
+    var rec = take(spec.name);
+    rec.submission = true;
+    rec.spec = spec.desc;
+    return rec;
+  }
+
+  // --- Photo scoring ----------------------------------------------------------
+
+  function scorePhoto(state) {
+    if (!state) return 0;
+    var score = 20; // base: a clean frame of the bay is worth something
+    // Golden hour / sunset light is the hero look.
+    var tod = state.timeOfDay || 0;
+    if (tod >= 17.5 && tod <= 19.5) score += 18;
+    else if (tod >= 19.5 || tod < 6) score += 10; // neon night
+    // Wanted heat makes a shot dramatic.
+    if (state.wanted >= 4) score += 16;
+    else if (state.wanted >= 3) score += 12;
+    else if (state.wanted >= 1) score += 5;
+    // Active mission + HUD richness.
+    if (state.mission && state.mission.id) score += 10;
+    if (state.heat >= 50) score += 6;
+    // Heli in the air (wanted >= 3 spawns AIR-1).
+    if (window.SB && window.SB.Police && window.SB.Police.heli) score += 12;
+    // FX on screen: explosion / smoke / fire particles.
+    if (window.SB && window.SB.FX && window.SB.FX.particles &&
+      window.SB.FX.particles.length > 0) score += 10;
+    // Living world: NPCs + traffic visible.
+    if (window.SB && window.SB.NPC && window.SB.NPC.pedestrians &&
+      window.SB.NPC.pedestrians.length >= 10) score += 6;
+    if (window.SB && window.SB.Vehicles && window.SB.Vehicles.cars &&
+      window.SB.Vehicles.cars.length >= 10) score += 4;
+    // On foot vs in a vehicle — foot shots show the street life.
+    if (state.player && state.player.onFoot) score += 4;
+    if (state.weather && state.weather.rain > 0) score += 4; // rain + puddles
+    if (score > 100) score = 100;
+    return score;
+  }
+
+  function bestShot() {
+    var best = null, i;
+    for (i = 0; i < shotsTaken.length; i++) {
+      if (!best || shotsTaken[i].score > best.score) best = shotsTaken[i];
     }
     return best;
   }
 
-  // Damage model. Police: 100 -> 66 -> 32 -> 0 (34 per hit).
-  // Civilians / props take the same base damage; only police have
-  // the exact 100 HP the brief pins down.
-  _applyHit(target) {
-    const damage = DAMAGE_PER_HIT;
-    if (target.hp == null) target.hp = target.kind === 'police' ? POLICE_HP : 50;
-    target.hp = Math.max(0, target.hp - damage);
-    return { damage, hp: target.hp, down: target.hp <= 0 };
+  // --- Ammo economy -----------------------------------------------------------
+
+  function syncFromState() {
+    // Shots tidak di-init oleh game.js (di luar urutan init spec), dan
+    // game.js load() mengganti objek state — jadi selalu baca state live
+    // dari window.SB.state, bukan hanya stateRef sekali init.
+    if (window.SB && window.SB.state) stateRef = window.SB.state;
+    if (!stateRef) return;
+    if (typeof stateRef.ammo === 'number') ammoCount = stateRef.ammo;
+    if (typeof stateRef.weapon === 'number') weapon = stateRef.weapon;
   }
 
-  // Convenience: shoot a police officer object directly (used by
-  // tests and by simple callers that already did their own aiming).
-  // officer = { hp } — starts at 100 if unset. Returns new HP.
-  shootPolice(officer) {
-    if (!officer) return { ok: false, error: 'no officer' };
-    if (this.mag <= 0) return { ok: false, reason: 'empty' };
-    this.mag -= 1;
-    this._shotsFired += 1;
-    if (officer.hp == null) officer.hp = POLICE_HP;
-    officer.hp = Math.max(0, officer.hp - DAMAGE_PER_HIT);
-    this._shotsHit += 1;
-    if (this.audio && typeof this.audio.sfxGunshot === 'function') this.audio.sfxGunshot();
-    this.emit('shot-hit', { target: officer, damage: DAMAGE_PER_HIT, hp: officer.hp });
-    if (officer.hp <= 0) this.emit('target-down', { target: officer });
-    return { ok: true, damage: DAMAGE_PER_HIT, hp: officer.hp, down: officer.hp <= 0, mag: this.mag };
+  function syncToState() {
+    if (window.SB && window.SB.state) stateRef = window.SB.state;
+    if (!stateRef) return;
+    stateRef.ammo = ammoCount;
+    stateRef.weapon = weapon;
   }
 
-  // --- Reload ---------------------------------------------------------
-  reload() {
-    if (this.reloading) return { ok: false, reason: 'already reloading' };
-    if (this.mag >= this.magSize) return { ok: false, reason: 'mag full' };
-    if (this.ammo <= 0) return { ok: false, reason: 'no ammo' };
-    this.reloading = true;
-    if (this.audio && typeof this.audio.sfxReload === 'function') this.audio.sfxReload();
-    this.emit('reload-start', {});
-    this._reloadTimer = setTimeout(() => {
-      const need = this.magSize - this.mag;
-      const take = Math.min(need, this.ammo);
-      this.mag += take;
-      this.ammo -= take;
-      this.reloading = false;
-      this._reloadTimer = null;
-      this.emit('reload-done', { mag: this.mag, ammo: this.ammo });
-    }, RELOAD_TIME_MS);
-    return { ok: true, ms: RELOAD_TIME_MS };
-  }
-
-  // Instant reload used by tests / save loading (no timer).
-  reloadInstant() {
-    if (this._reloadTimer) { clearTimeout(this._reloadTimer); this._reloadTimer = null; }
-    const need = this.magSize - this.mag;
-    const take = Math.min(need, this.ammo);
-    this.mag += take;
-    this.ammo -= take;
-    this.reloading = false;
-    return { mag: this.mag, ammo: this.ammo };
-  }
-
-  cancelReload() {
-    if (this._reloadTimer) { clearTimeout(this._reloadTimer); this._reloadTimer = null; }
-    this.reloading = false;
-  }
-
-  // --- Crosshair ------------------------------------------------------
-  // A DOM crosshair: four ticks + a centre dot that blooms with
-  // spread and flashes a hit marker (X) for 150ms after a hit.
-  // Build once; show()/hide() toggle it; tick() eases the spread.
-  buildCrosshair(container) {
-    if (this._crossEl) return this._crossEl;
-    const parent = container || (typeof document !== 'undefined' ? document.body : null);
-    if (!parent) return null;
-    const c = document.createElement('div');
-    c.className = 'sunset-crosshair';
-    c.style.cssText = 'position:fixed;left:50%;top:50%;width:40px;height:40px;margin:-20px 0 0 -20px;pointer-events:none;z-index:25;display:none;';
-    c.innerHTML =
-      '<div style="position:absolute;left:19px;top:19px;width:2px;height:2px;background:#fff;border-radius:50%;box-shadow:0 0 3px #000;"></div>' +
-      '<div class="ch-t" style="position:absolute;left:19px;top:2px;width:2px;height:10px;background:#fff;box-shadow:0 0 3px #000;"></div>' +
-      '<div class="ch-b" style="position:absolute;left:19px;bottom:2px;width:2px;height:10px;background:#fff;box-shadow:0 0 3px #000;"></div>' +
-      '<div class="ch-l" style="position:absolute;top:19px;left:2px;height:2px;width:10px;background:#fff;box-shadow:0 0 3px #000;"></div>' +
-      '<div class="ch-r" style="position:absolute;top:19px;right:2px;height:2px;width:10px;background:#fff;box-shadow:0 0 3px #000;"></div>' +
-      '<div class="ch-x" style="position:absolute;inset:0;display:none;color:#ff4d4d;font-size:22px;line-height:40px;text-align:center;">✕</div>';
-    parent.appendChild(c);
-    this._crossEl = c;
-    return c;
-  }
-
-  showCrosshair(show) {
-    this.crosshair.visible = !!show;
-    if (this._crossEl) this._crossEl.style.display = show ? 'block' : 'none';
-    return this.crosshair.visible;
-  }
-
-  // Call once per frame: eases spread back down and clears the hit marker.
-  tickCrosshair() {
-    this.crosshair.spread += (8 - this.crosshair.spread) * 0.2;
-    if (this._crossEl) {
-      const s = Math.round(this.crosshair.spread);
-      const set = (sel, v) => { const n = this._crossEl.querySelector(sel); if (n) n.style.transform = v; };
-      set('.ch-t', 'translateY(' + (-s + 8) + 'px)');
-      set('.ch-b', 'translateY(' + (s - 8) + 'px)');
-      set('.ch-l', 'translateX(' + (-s + 8) + 'px)');
-      set('.ch-r', 'translateX(' + (s - 8) + 'px)');
-      const x = this._crossEl.querySelector('.ch-x');
-      if (x) x.style.display = (Date.now() - this.crosshair.hitMarkerAt < 150) ? 'block' : 'none';
+  function buyAmmo() {
+    syncFromState();
+    if (!stateRef) return false;
+    if ((stateRef.money || 0) < AMMO_PRICE) {
+      if (window.SB && window.SB.HUD) {
+        window.SB.HUD.showToast('Not enough cash — ammo costs $' + AMMO_PRICE + '.');
+      }
+      return false;
     }
-    return this.crosshair.spread;
+    if (ammoCount >= MAX_AMMO) {
+      if (window.SB && window.SB.HUD) {
+        window.SB.HUD.showToast('Ammo full (' + MAX_AMMO + ').');
+      }
+      return false;
+    }
+    stateRef.money -= AMMO_PRICE;
+    ammoCount = Math.min(MAX_AMMO, ammoCount + AMMO_PACK);
+    syncToState();
+    if (window.SB && window.SB.HUD) {
+      window.SB.HUD.showToast('Ammo +24  ·  -$50  ·  total ' + ammoCount);
+      window.SB.HUD.setMoney(stateRef.money);
+    }
+    if (window.SB && window.SB.Audio) window.SB.Audio.sfx('money');
+    return true;
   }
 
-  // --- Stats / persistence --------------------------------------------
-  accuracy() {
-    if (this._shotsFired === 0) return 0;
-    return Math.round((this._shotsHit / this._shotsFired) * 100);
+  function spendAmmo(n) {
+    syncFromState();
+    var cost = n || WEAPONS[weapon].cost;
+    if (ammoCount < cost) return false;
+    ammoCount -= cost;
+    syncToState();
+    return true;
   }
 
-  status() {
+  function addAmmo(n) {
+    syncFromState();
+    ammoCount = Math.min(MAX_AMMO, Math.max(0, ammoCount + (n || 0)));
+    syncToState();
+    return ammoCount;
+  }
+
+  function switchWeapon(dir) {
+    syncFromState();
+    weapon = ((weapon + (dir || 1)) % 4 + 4) % 4;
+    syncToState();
+    if (window.SB && window.SB.HUD) {
+      window.SB.HUD.showToast('Weapon: ' + WEAPONS[weapon].name +
+        '  ·  ammo ' + ammoCount);
+    }
+    if (window.SB && window.SB.Audio) window.SB.Audio.sfx('click');
+    return weapon;
+  }
+
+  function setWeapon(i) {
+    syncFromState();
+    weapon = ((Math.floor(i) % 4) + 4) % 4;
+    syncToState();
+    return weapon;
+  }
+
+  function weaponInfo() {
     return {
-      mag: this.mag, magSize: this.magSize, ammo: this.ammo,
-      reloading: this.reloading, money: this.money,
-      shotsFired: this._shotsFired, shotsHit: this._shotsHit,
-      accuracy: this.accuracy(),
+      index: weapon,
+      name: WEAPONS[weapon].name,
+      damage: WEAPONS[weapon].damage,
+      rate: WEAPONS[weapon].rate,
+      ammo: ammoCount
     };
   }
 
-  save() { return { mag: this.mag, ammo: this.ammo, money: this.money }; }
+  // --- Lifecycle --------------------------------------------------------------
 
-  load(data) {
-    if (!data) return;
-    if (data.mag != null) this.mag = clamp(data.mag, 0, this.magSize);
-    if (data.ammo != null) this.ammo = Math.max(0, data.ammo);
-    if (data.money != null) this.money = data.money;
+  function init(state) {
+    stateRef = state || null;
+    if (stateRef) {
+      if (typeof stateRef.ammo !== 'number') stateRef.ammo = ammoCount;
+      if (typeof stateRef.weapon !== 'number') stateRef.weapon = weapon;
+      syncFromState();
+    }
+    findCanvas();
   }
-}
 
-export function createShootingSystem(options) { return new ShootingSystem(options); }
-
-if (typeof window !== 'undefined') {
-  window.SunsetShots = window.SunsetShots || {};
-  window.SunsetShots.ShootingSystem = ShootingSystem;
-  window.SunsetShots.AMMO_PRICE = AMMO_PRICE;
-  window.SunsetShots.AMMO_PACK = AMMO_PACK;
-  window.SunsetShots.DAMAGE_PER_HIT = DAMAGE_PER_HIT;
-  window.SunsetShots.POLICE_HP = POLICE_HP;
-  window.SunsetShots.createShootingSystem = createShootingSystem;
-}
+  window.SB.Shots = {
+    init: init,
+    take: take,
+    takeSubmission: takeSubmission,
+    scorePhoto: scorePhoto,
+    bestShot: bestShot,
+    buyAmmo: buyAmmo,
+    spendAmmo: spendAmmo,
+    addAmmo: addAmmo,
+    switchWeapon: switchWeapon,
+    setWeapon: setWeapon,
+    weaponInfo: weaponInfo,
+    setCanvas: setCanvas,
+    findCanvas: findCanvas,
+    submissionShots: SUBMISSION_SHOTS,
+    weapons: WEAPON_NAMES,
+    get ammo() { syncFromState(); return ammoCount; },
+    set ammo(v) { ammoCount = Math.max(0, Math.min(MAX_AMMO, Math.floor(v || 0))); syncToState(); },
+    get weapon() { return weapon; },
+    get shots() { return shotsTaken; },
+    get lastDataUrl() { return lastDataUrl; },
+    get price() { return AMMO_PRICE; },
+    get pack() { return AMMO_PACK; }
+  };
+})();

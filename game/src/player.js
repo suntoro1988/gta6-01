@@ -1,316 +1,333 @@
-// player.js — Pemain "Sunset Bay" v11
-// Jalan kaki (WASD + mouse), lari (Shift), masuk/keluar mobil (E — mencuri),
-// berenang di pantai (pakaian basah setelah berenang), tembak (klik),
-// ganti pakaian di toko (menghilangkan jejak "baju dikenali" dari wanted).
-// Health + stamina. Respons NPC terhadap pemain berdasarkan jarak + senjata.
-// Modul logika murni: tidak bergantung pada renderer; game loop memanggil
-// update(dt, input, world) tiap frame.
+window.SB = window.SB || {};
+(function(){
+'use strict';
 
-(function (global) {
-  'use strict';
+/* =========================================================================
+   SB.Player — Sunset Bay v12 (Builder C, dunia)
+   Pejalan kaki: WASD + lari (Shift), lompat (Spasi), tembak (klik mouse),
+   HP + armor, animasi jalan sederhana (bob + ayun lengan via rotasi),
+   tabrakan gedung (AABB dari SB.City.buildings), batas peta, respawn
+   di safehouse saat HP habis.
+   Input (dari main.js via SB.Game -> update(dt,state,input)):
+     input.keys  : objek {w,a,s,d,shift,space,e,...} (boolean)
+     input.mouse : { dx, dy, clicked } — klik kiri = tembak
+     input.camAngle : sudut yaw kamera (radian) untuk gerak relatif kamera
+   Kontrak dengan Vehicles: modul ini menulis state.input = input agar
+   Vehicles.update(dt,state) bisa membaca tombol mengemudi.
+   ========================================================================= */
 
-  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
-  function dist2(ax, az, bx, bz) { const dx = ax - bx, dz = az - bz; return dx * dx + dz * dz; }
+var WALK_SPEED = 5.0;
+var RUN_SPEED = 9.5;
+var JUMP_VEL = 7.5;
+var GRAVITY = 20.0;
+var MAP_HALF = 178;
 
-  // ---------- pakaian ----------
-  const OUTFITS = [
-    { id: 'kaos-biru', name: 'Kaos Biru + Jeans', shirt: [0.2, 0.45, 0.85], pants: [0.15, 0.2, 0.35], price: 0 },
-    { id: 'kemeja-krem', name: 'Kemeja Krem + Celana Cokelat', shirt: [0.9, 0.85, 0.7], pants: [0.45, 0.32, 0.2], price: 60 },
-    { id: 'hoodie-hijau', name: 'Hoodie Hijau + Jogger', shirt: [0.2, 0.55, 0.3], pants: [0.25, 0.25, 0.25], price: 80 },
-    { id: 'jaket-kulit', name: 'Jaket Kulit + Jeans Hitam', shirt: [0.15, 0.12, 0.12], pants: [0.1, 0.1, 0.14], price: 150 },
-    { id: 'baju-pantai', name: 'Baju Pantai + Celana Pendek', shirt: [0.95, 0.6, 0.25], pants: [0.9, 0.8, 0.6], price: 45 },
-  ];
+var WEAPONS = [
+  { name: 'Pistol',  damage: 25, rate: 0.28, range: 40, spread: 0.02 },
+  { name: 'SMG',     damage: 14, rate: 0.09, range: 34, spread: 0.06 },
+  { name: 'Shotgun', damage: 16, rate: 0.8,  range: 20, spread: 0.14, pellets: 6 },
+  { name: 'Rifle',   damage: 40, rate: 0.16, range: 70, spread: 0.01 }
+];
 
-  // ---------- pemain ----------
-  class Player {
-    constructor(spawn) {
-      const s = spawn || { x: 0, z: 20 };
-      this.x = s.x; this.z = s.z; this.y = 0;
-      this.yaw = 0;            // arah hadap (radian, 0 = -Z)
-      this.pitch = 0;
-      this.vx = 0; this.vz = 0;
-      this.health = 100;
-      this.stamina = 100;
-      this.money = 250;
-      this.wanted = 0;         // level 0-5
-      this.outfitRecognized = false; // true bila saksi melihat baju saat kejahatan
-      this.outfit = OUTFITS[0];
-      this.wet = false;        // pakaian basah setelah berenang
-      this.wetTimer = 0;
-      this.swimming = false;
-      this.inVehicle = null;   // referensi kendaraan (dari vehicles.js) atau null
-      this.inBoat = null;      // referensi perahu (dari water.js) atau null
-      this.inInterior = null;  // id interior yang sedang dimasuki
-      this.weapon = 'none';    // 'none' | 'pistol'
-      this.ammo = 0;
-      this.shootCooldown = 0;
-      this.stealCooldown = 0;
-      this.footstepTimer = 0;
-      this.isRunning = false;
-      this.alive = true;
-      this.lastDamageAt = -999;
-    }
+var state = null;
+var pos = { x: 0, y: 0, z: 6 };
+var velY = 0;
+var onGround = true;
+var angle = 0;            // arah hadap pemain (radian, yaw)
+var walkPhase = 0;        // fase animasi jalan (0..2PI)
+var moving = false;
+var running = false;
+var shootCooldown = 0;
+var hurtTimer = 0;        // jeda singkat antar damage (anti insta-kill)
+var muzzleTimer = 0;
+var meshPerson = null;
+var meshGun = null;
+var initialized = false;
 
-    // input: {forward,back,left,right,run,mouseDX,mouseDY,shoot,interact}
-    // world: {city, vehicles, water, npcs, time, onEvent}
-    update(dt, input, world) {
-      if (!this.alive) return;
-      dt = Math.min(dt, 0.05);
-      this.shootCooldown = Math.max(0, this.shootCooldown - dt);
-      this.stealCooldown = Math.max(0, this.stealCooldown - dt);
+function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
 
-      // Mouse look.
-      if (input) {
-        this.yaw -= (input.mouseDX || 0) * 0.0028;
-        this.pitch = clamp(this.pitch - (input.mouseDY || 0) * 0.0028, -1.2, 1.2);
-      }
-
-      // Pakaian basah mengering perlahan (60 detik).
-      if (this.wet) {
-        this.wetTimer -= dt;
-        if (this.wetTimer <= 0) { this.wet = false; this.wetTimer = 0; }
-      }
-
-      // Di dalam mobil / perahu: kendali diserahkan ke vehicles/water.
-      if (this.inVehicle || this.inBoat) {
-        if (input && input.interact) this.exitCurrentRide(world);
-        return;
-      }
-
-      // --- gerak jalan kaki ---
-      const inWater = world && world.water ? world.water.isInWater(this.x, this.z) : false;
-      this.swimming = inWater && this.y <= 0.2;
-      const wantRun = !!(input && input.run) && this.stamina > 1 && !this.swimming;
-      this.isRunning = wantRun;
-      const speed = this.swimming ? 2.2 : wantRun ? 7.5 : 4.2;
-
-      let mx = 0, mz = 0;
-      if (input) {
-        if (input.forward) mz -= 1;
-        if (input.back) mz += 1;
-        if (input.left) mx -= 1;
-        if (input.right) mx += 1;
-      }
-      const ml = Math.hypot(mx, mz) || 1;
-      mx /= ml; mz /= ml;
-      const sin = Math.sin(this.yaw), cos = Math.cos(this.yaw);
-      const wx = mx * cos - mz * sin;
-      const wz = mx * sin + mz * cos;
-      this.vx = wx * speed;
-      this.vz = wz * speed;
-      this.x += this.vx * dt;
-      this.z += this.vz * dt;
-
-      // Stamina: lari menguras, jalan memulihkan.
-      if (wantRun && (mx !== 0 || mz !== 0)) this.stamina = Math.max(0, this.stamina - 14 * dt);
-      else this.stamina = Math.min(100, this.stamina + 9 * dt);
-
-      // Berenang: masuk air pantai -> basah.
-      if (this.swimming && !this.wet) {
-        this.wet = true; this.wetTimer = 60;
-        if (world && world.onEvent) world.onEvent('swim-start', { x: this.x, z: this.z });
-      }
-
-      // Tembak (klik).
-      if (input && input.shoot) this.shoot(world);
-
-      // Interaksi (E): masuk mobil / perahu / interior terdekat.
-      if (input && input.interact) this.tryInteract(world);
-    }
-
-    // ---- tembak ----
-    shoot(world) {
-      if (this.weapon === 'none' || this.ammo <= 0 || this.shootCooldown > 0) return false;
-      this.shootCooldown = 0.25;
-      this.ammo--;
-      if (world && world.onEvent) {
-        world.onEvent('shoot', { x: this.x, z: this.z, yaw: this.yaw, weapon: this.weapon });
-      }
-      // Menembak di depan saksi menaikkan wanted + menandai baju dikenali.
-      if (world && world.npcs) {
-        for (const npc of world.npcs) {
-          if (npc && dist2(this.x, this.z, npc.x, npc.z) < 25 * 25) {
-            this.raiseWanted(1);
-            this.outfitRecognized = true;
-            break;
-          }
-        }
-      }
+/* Tabrakan AABB sederhana dengan gedung: kembalikan true bila titik
+   (x,z) dengan radius r berada di dalam footprint gedung. */
+function hitsBuilding(x, z, r){
+  if (!window.SB || !SB.City || !SB.City.buildings) return false;
+  var list = SB.City.buildings;
+  for (var i = 0; i < list.length; i++){
+    var b = list[i];
+    if (Math.abs(x - b.x) < b.w/2 + r && Math.abs(z - b.z) < b.d/2 + r){
       return true;
     }
+  }
+  return false;
+}
 
-    giveWeapon(kind, ammo) {
-      this.weapon = kind;
-      this.ammo = ammo;
-    }
+/* Geser posisi dengan tabrakan per-sumbu (bisa meluncur di dinding). */
+function move(dx, dz){
+  if (!state) return;
+  var p = state.player;
+  var r = 0.6;
+  var nx = p.x + dx;
+  if (!hitsBuilding(nx, p.z, r)) p.x = nx;
+  var nz = p.z + dz;
+  if (!hitsBuilding(p.x, nz, r)) p.z = nz;
+  p.x = clamp(p.x, -MAP_HALF, MAP_HALF);
+  p.z = clamp(p.z, -MAP_HALF, MAP_HALF);
+  pos.x = p.x; pos.z = p.z;
+}
 
-    // ---- interaksi (E) ----
-    tryInteract(world) {
-      if (!world) return null;
-      // 1) Perahu terdekat (di dermaga/pantai).
-      if (world.water && world.water.nearestBoat) {
-        const boat = world.water.nearestBoat(this.x, this.z, 4);
-        if (boat) { this.boardBoat(boat, world); return 'boat'; }
-      }
-      // 2) Mobil terdekat -> mencuri (E).
-      if (world.vehicles && world.vehicles.nearestCar) {
-        const car = world.vehicles.nearestCar(this.x, this.z, 4);
-        if (car && this.stealCooldown <= 0) {
-          this.stealCar(car, world);
-          return 'car';
-        }
-      }
-      // 3) Pintu interior terdekat (toko/kafe).
-      if (world.city && world.city.interiorAt) {
-        const it = world.city.interiorAt(this.x, this.z, 3);
-        if (it) {
-          if (it.closedAfterRobbery) {
-            if (world.onEvent) world.onEvent('interior-closed', { id: it.id, name: it.name });
-            return 'closed';
-          }
-          this.inInterior = it.id;
-          if (world.onEvent) world.onEvent('enter-interior', { id: it.id, name: it.name });
-          return 'interior';
-        }
-      }
-      return null;
-    }
+function init(st){
+  state = st || null;
+  if (initialized) return;
+  initialized = true;
+  if (state && state.player){
+    pos.x = state.player.x || 0;
+    pos.y = state.player.y || 0;
+    pos.z = state.player.z || 6;
+    angle = state.player.angle || 0;
+  }
+  if (window.SB && SB.Meshes){
+    meshPerson = SB.Meshes.person([0.2, 0.5, 0.9]);
+    meshGun = SB.Meshes.box(0.12, 0.12, 0.7);
+  }
+}
 
-    stealCar(car, world) {
-      this.inVehicle = car;
-      this.stealCooldown = 1.0;
-      car.driver = this;
-      this.raiseWanted(1);
-      this.outfitRecognized = true; // saksi melihat baju saat mencuri
-      if (world && world.onEvent) world.onEvent('car-stolen', { carId: car.id, x: this.x, z: this.z });
-    }
-
-    boardBoat(boat, world) {
-      this.inBoat = boat;
-      boat.rider = this;
-      if (world && world.onEvent) world.onEvent('board-boat', { boatId: boat.id });
-    }
-
-    // Keluar dari mobil/perahu. Anti-soft-lock: selalu berhasil, posisi
-    // aman dicari di sekitar kendaraan (atau di dermaga/pantai terdekat).
-    exitCurrentRide(world) {
-      if (this.inVehicle) {
-        const car = this.inVehicle;
-        car.driver = null;
-        this.inVehicle = null;
-        this.x = car.x + Math.sin(car.heading + Math.PI / 2) * 2.5;
-        this.z = car.z + Math.cos(car.heading + Math.PI / 2) * 2.5;
-      }
-      if (this.inBoat) {
-        const boat = this.inBoat;
-        boat.rider = null;
-        this.inBoat = null;
-        // Keluar di dermaga/pantai terdekat — tidak pernah di tengah laut.
-        const spot = world && world.water && world.water.nearestShore
-          ? world.water.nearestShore(boat.x, boat.z)
-          : { x: boat.x + 3, z: boat.z };
-        this.x = spot.x; this.z = spot.z; this.y = 0;
-        this.wet = true; this.wetTimer = 60;
-      }
-      this.stealCooldown = 0.5;
-    }
-
-    exitInterior() { this.inInterior = null; }
-
-    // ---- ganti pakaian di toko ----
-    // Menghilangkan jejak "baju dikenali": wanted turun 1 level dan saksi
-    // tidak lagi mengenali pemain dari bajunya.
-    changeOutfit(outfitId, world) {
-      const outfit = OUTFITS.find(o => o.id === outfitId);
-      if (!outfit) return { ok: false, reason: 'outfit-not-found' };
-      if (this.money < outfit.price) return { ok: false, reason: 'not-enough-money' };
-      this.money -= outfit.price;
-      this.outfit = outfit;
-      if (this.outfitRecognized) {
-        this.outfitRecognized = false;
-        this.wanted = Math.max(0, this.wanted - 1);
-      }
-      if (world && world.onEvent) world.onEvent('outfit-changed', { outfit: outfit.id, wanted: this.wanted });
-      return { ok: true, outfit: outfit.name, wanted: this.wanted };
-    }
-
-    // ---- wanted / damage ----
-    raiseWanted(levels) {
-      this.wanted = clamp(this.wanted + (levels || 1), 0, 5);
-    }
-    lowerWanted(levels) {
-      this.wanted = clamp(this.wanted - (levels || 1), 0, 5);
-      if (this.wanted === 0) this.outfitRecognized = false;
-    }
-    takeDamage(amount, from) {
-      if (!this.alive) return;
-      this.health = Math.max(0, this.health - amount);
-      this.lastDamageAt = Date.now() / 1000;
-      if (this.health <= 0) {
-        this.alive = false;
-        if (this.inVehicle) this.inVehicle.driver = null;
-        if (this.inBoat) this.inBoat.rider = null;
-        this.inVehicle = null; this.inBoat = null;
-      }
-    }
-    heal(amount) {
-      this.health = clamp(this.health + amount, 0, 100);
-      if (this.health > 0) this.alive = true;
-    }
-    respawn(spawn) {
-      const s = spawn || { x: 0, z: 20 };
-      this.x = s.x; this.z = s.z; this.y = 0;
-      this.health = 100; this.stamina = 100; this.alive = true;
-      this.wanted = 0; this.outfitRecognized = false;
-      this.inVehicle = null; this.inBoat = null; this.inInterior = null;
-    }
-
-    // ---- respons NPC terhadap pemain ----
-    // Mengembalikan aksi yang sebaiknya dilakukan NPC:
-    // 'ignore' | 'flee' | 'confront' | 'warn'
-    // Berdasarkan jarak + apakah pemain bersenjata / wanted / basah kuyup.
-    static npcReaction(npc, player) {
-      if (!npc || !player) return 'ignore';
-      const d2 = dist2(npc.x, npc.z, player.x, player.z);
-      const armed = player.weapon !== 'none';
-      const threatening = armed || player.wanted >= 2;
-      if (d2 < 3 * 3) {
-        if (threatening) return 'flee';
-        if (npc.blocked) return 'warn'; // pemain menghalangi jalan NPC
-        return 'ignore';
-      }
-      if (d2 < 10 * 10) {
-        if (threatening) return 'flee';
-        if (player.isRunning) return 'ignore';
-        return 'ignore';
-      }
-      if (d2 < 25 * 25 && threatening) return 'flee';
-      return 'ignore';
-    }
-
-    // NPC memaki / menghindar bila dihalangi: dipanggil saat pemain berdiri
-    // di jalur NPC lebih dari 1,5 detik.
-    static npcBlockedResponse(npc, player, blockedSeconds) {
-      if (blockedSeconds > 1.5) return { action: 'warn', line: 'Hei, minggir dong!' };
-      if (blockedSeconds > 0.5) return { action: 'sidestep', line: '' };
-      return { action: 'wait', line: '' };
-    }
-
-    status() {
-      return {
-        x: +this.x.toFixed(2), z: +this.z.toFixed(2),
-        health: this.health, stamina: Math.round(this.stamina),
-        money: this.money, wanted: this.wanted,
-        outfit: this.outfit.id, outfitRecognized: this.outfitRecognized,
-        wet: this.wet, swimming: this.swimming,
-        inVehicle: !!this.inVehicle, inBoat: !!this.inBoat,
-        inInterior: this.inInterior, weapon: this.weapon, ammo: this.ammo,
-        alive: this.alive,
-      };
+/* Cari target tembak terdekat di depan pemain (NPC / polisi).
+   Return objek {x,z,dist} atau null. Hanya baca modul lain via guard. */
+function findTarget(){
+  var range = WEAPONS[state.weapon || 0].range;
+  var best = null, bestD = range;
+  var fx = Math.sin(angle), fz = Math.cos(angle);
+  function consider(list){
+    if (!list) return;
+    for (var i = 0; i < list.length; i++){
+      var e = list[i];
+      if (e.dead || e.hp !== undefined && e.hp <= 0) continue;
+      var dx = e.x - pos.x, dz = e.z - pos.z;
+      var d = Math.sqrt(dx*dx + dz*dz);
+      if (d > range || d < 0.5) continue;
+      var dot = (dx*fx + dz*fz) / d;   // cos sudut ke target
+      if (dot < 0.86) continue;        // di luar kerucut bidik ~30 derajat
+      if (d < bestD){ bestD = d; best = e; }
     }
   }
+  if (window.SB && SB.NPC) consider(SB.NPC.pedestrians);
+  if (window.SB && SB.Police) consider(SB.Police.cops);
+  return best;
+}
 
-  const api = { Player, OUTFITS };
-  if (typeof module !== 'undefined' && module.exports) module.exports = api;
-  global.SunsetPlayer = api;
-})(typeof globalThis !== 'undefined' ? globalThis : this);
+function shoot(){
+  if (!state) return;
+  if (state.player.vehicle || state.player.boat) return; // tidak bisa tembak dari kendaraan
+  if (shootCooldown > 0) return;
+  var w = WEAPONS[state.weapon || 0];
+  if (state.ammo <= 0){
+    if (window.SB && SB.HUD) SB.HUD.showToast('AMMO HABIS — beli di toko ($50 / +24)');
+    if (window.SB && SB.Audio) SB.Audio.sfx('dryfire');
+    shootCooldown = 0.3;
+    return;
+  }
+  state.ammo -= 1;
+  shootCooldown = w.rate;
+  muzzleTimer = 0.07;
+  if (window.SB && SB.Audio) SB.Audio.sfx('shoot');
+  // Muzzle flash + asap kecil
+  if (window.SB && SB.FX){
+    var fx = pos.x + Math.sin(angle) * 1.2;
+    var fz = pos.z + Math.cos(angle) * 1.2;
+    SB.FX.sparks(fx, pos.y + 1.4, fz);
+  }
+  var target = findTarget();
+  if (target){
+    var pellets = w.pellets || 1;
+    var dmg = w.damage * pellets;
+    if (target.hp !== undefined) target.hp -= dmg;
+    else target.hp = 100 - dmg;
+    if (target.hp <= 0){
+      target.dead = true;
+      state.stats.kills = (state.stats.kills || 0) + 1;
+      state.rep = (state.rep || 0) + 5;
+      if (window.SB && SB.HUD) SB.HUD.showToast('Target down! REP +5');
+      if (window.SB && SB.FX) SB.FX.smoke(target.x, 1, target.z);
+    } else if (window.SB && SB.NPC && SB.NPC.flee){
+      SB.NPC.flee(pos.x, pos.z);
+    }
+  }
+}
+
+function takeDamage(n){
+  if (!state) return;
+  if (hurtTimer > 0) return;      // invulnerable singkat 0.4 detik
+  hurtTimer = 0.4;
+  var p = state.player;
+  var remaining = n;
+  if (p.armor > 0){
+    var absorbed = Math.min(p.armor, remaining);
+    p.armor -= absorbed;
+    remaining -= absorbed;
+  }
+  p.hp -= remaining;
+  if (window.SB && SB.HUD) SB.HUD.showToast('HP -' + remaining);
+  if (window.SB && SB.Audio) SB.Audio.sfx('hurt');
+  if (p.hp <= 0) die();
+}
+
+function die(){
+  var p = state.player;
+  p.hp = 100;
+  p.armor = 0;
+  // Respawn di safehouse (interior ke-3) atau titik awal bila belum ada
+  var sx = 0, sz = 6;
+  if (window.SB && SB.City && SB.City.interiors && SB.City.interiors[2]){
+    sx = SB.City.interiors[2].x;
+    sz = SB.City.interiors[2].z;
+  }
+  p.x = sx; p.z = sz; p.y = 0;
+  pos.x = sx; pos.z = sz; pos.y = 0;
+  velY = 0;
+  // Denda rumah sakit + wanted hilang
+  state.money = Math.max(0, (state.money || 0) - 100);
+  state.wanted = 0;
+  state.heat = 0;
+  if (window.SB && SB.HUD){
+    SB.HUD.showToast('Kamu tumbang! -$100 biaya rumah sakit. Respawn di safehouse.');
+  }
+  if (window.SB && SB.Police) SB.Police.setWanted(0);
+}
+
+function update(dt, st, input){
+  if (st) state = st;
+  if (!state) return;
+  // Teruskan input ke state agar Vehicles bisa membaca tombol mengemudi
+  if (input) state.input = input;
+  var p = state.player;
+  if (!p) return;
+
+  // Sinkron posisi lokal dari state (game.js bisa memindahkan pemain)
+  pos.x = p.x; pos.y = p.y || 0; pos.z = p.z;
+  angle = p.angle || angle;
+
+  if (shootCooldown > 0) shootCooldown -= dt;
+  if (hurtTimer > 0) hurtTimer -= dt;
+  if (muzzleTimer > 0) muzzleTimer -= dt;
+
+  // Di kendaraan/perahu: modul Vehicles/Water yang menggerakkan pemain
+  if (p.vehicle || p.boat){
+    walkPhase = 0;
+    moving = false;
+    return;
+  }
+
+  var keys = (input && input.keys) || {};
+  var camAngle = (input && input.camAngle !== undefined) ? input.camAngle : angle;
+
+  // Arah gerak relatif kamera: W = maju menjauhi kamera
+  var fwdX = Math.sin(camAngle), fwdZ = Math.cos(camAngle);
+  var rightX = Math.cos(camAngle), rightZ = -Math.sin(camAngle);
+  var ix = 0, iz = 0;
+  if (keys.w || keys.arrowup){ ix += fwdX; iz += fwdZ; }
+  if (keys.s || keys.arrowdown){ ix -= fwdX; iz -= fwdZ; }
+  if (keys.a || keys.arrowleft){ ix -= rightX; iz -= rightZ; }
+  if (keys.d || keys.arrowright){ ix += rightX; iz += rightZ; }
+
+  moving = (ix !== 0 || iz !== 0);
+  running = !!(keys.shift) && moving;
+  var speed = running ? RUN_SPEED : WALK_SPEED;
+  if (moving){
+    var len = Math.sqrt(ix*ix + iz*iz);
+    ix /= len; iz /= len;
+    move(ix * speed * dt, iz * speed * dt);
+    // Hadap ke arah gerak (lerp sudut terpendek)
+    var targetAngle = Math.atan2(ix, iz);
+    var diff = targetAngle - angle;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    angle += diff * Math.min(1, dt * 12);
+    walkPhase += dt * (running ? 13 : 8);
+  }
+
+  // Lompat (Spasi) — hanya dari tanah
+  if ((keys.space || keys[' ']) && onGround){
+    velY = JUMP_VEL;
+    onGround = false;
+    if (window.SB && SB.Audio) SB.Audio.sfx('jump');
+  }
+  // Gravitasi
+  if (!onGround){
+    velY -= GRAVITY * dt;
+    pos.y += velY * dt;
+    if (pos.y <= 0){ pos.y = 0; velY = 0; onGround = true; }
+  }
+  p.y = pos.y;
+  p.angle = angle;
+
+  // Tembak: klik mouse (sekali per klik) atau tahan tombol mouse
+  if (input && input.mouse && input.mouse.clicked){
+    shoot();
+    input.mouse.clicked = false;
+  }
+  // Ganti senjata (tombol 1-4)
+  if (keys['1']) state.weapon = 0;
+  if (keys['2']) state.weapon = 1;
+  if (keys['3']) state.weapon = 2;
+  if (keys['4']) state.weapon = 3;
+
+  // Jatuh ke laut (x < -172): dorong kembali ke pantai + damage kecil
+  if (p.x < -172 && !p.boat){
+    p.x = -171;
+    pos.x = -171;
+    takeDamage(5);
+    if (window.SB && SB.HUD) SB.HUD.showToast('Air laut! Kembali ke pantai.');
+  }
+}
+
+function draw(gl, st){
+  if (st) state = st;
+  if (!gl || !SB.GL || !SB.Math3 || !state) return;
+  var p = state.player;
+  if (!p) return;
+  // Jangan gambar model pejalan kaki saat di kendaraan/perahu
+  if (p.vehicle || p.boat) return;
+  if (!meshPerson) return;
+  var M = SB.Math3;
+  // Animasi jalan: bob naik-turun + goyang kecil
+  var bob = moving ? Math.abs(Math.sin(walkPhase)) * 0.08 : 0;
+  var sway = moving ? Math.sin(walkPhase) * 0.06 : 0;
+  var m = M.mat4Identity();
+  m = M.mat4Translate(m, p.x, (p.y || 0) + bob, p.z);
+  m = M.mat4RotateY(m, angle + sway);
+  // Warna baju: biru saat sehat, merah berkedip saat baru kena damage
+  var flash = hurtTimer > 0.2;
+  var col = flash ? [0.95, 0.2, 0.2] : [0.2, 0.5, 0.9];
+  SB.GL.drawMesh(meshPerson, m, col);
+  // Senjata di tangan (kotak kecil di depan dada)
+  if (meshGun){
+    var gm = M.mat4Identity();
+    gm = M.mat4Translate(gm,
+      p.x + Math.sin(angle) * 0.35,
+      (p.y || 0) + 1.25 + bob,
+      p.z + Math.cos(angle) * 0.35);
+    gm = M.mat4RotateY(gm, angle);
+    SB.GL.drawMesh(meshGun, gm, [0.12, 0.12, 0.14]);
+  }
+  // Muzzle flash: kotak kuning terang singkat di ujung senjata
+  if (muzzleTimer > 0 && meshGun){
+    var fm = M.mat4Identity();
+    fm = M.mat4Translate(fm,
+      p.x + Math.sin(angle) * 0.9,
+      (p.y || 0) + 1.3,
+      p.z + Math.cos(angle) * 0.9);
+    fm = M.mat4RotateY(fm, angle);
+    SB.GL.drawMesh(meshGun, fm, [1.0, 0.85, 0.3]);
+  }
+}
+
+window.SB.Player = {
+  init: init,
+  update: update,
+  draw: draw,
+  move: move,
+  shoot: shoot,
+  takeDamage: takeDamage,
+  weapons: WEAPONS
+};
+
+})();

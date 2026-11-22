@@ -1,580 +1,601 @@
-// jobs.js — Sunset Bay (v11)
-// Mission system for Sunset Bay, written from scratch.
-// 18 missions, 49 stages total. All mission names, characters,
-// shops and places are original inventions — no borrowed franchise names.
-// Mission 1 pays +$150 on completion, +$50 bonus, +100 REP.
-//
-// Highlights:
-//  * Showcase heist "The Harbour Lights Job" (mission 18): three
-//    phases — (a) Prep: pick 1 of 2 getaway cars and park it yourself
-//    at a spot you choose; (b) Execution: rob a small harbour shop
-//    through the busy front door OR the quiet back alley, NPCs react
-//    differently depending on how loud you are; (c) Escape: systemic
-//    pursuit — police chase your actual position, never a scripted
-//    spline; swapping cars mid-chase drops the vehicle trail.
-//    Set pieces: AIR-1 helicopter with a sweeping spotlight at
-//    wanted >= 3, spike strips / roadblocks at 1-2 points.
-//    The mission passes when you reach the end point by ANY route.
-//  * Cop AI, wanted 0-5 with MEMORY (see hud.js), safehouse,
-//    garage / shop respray -$150, cash pickups.
-//  * One night-only side mission (street race / harbour delivery).
-// No dependencies: the system is driven by plain state objects and
-// optional callbacks, so it can run standalone or wired into game.js.
+window.SB = window.SB || {};
+(function () {
+  'use strict';
 
-'use strict';
+  // ---------------------------------------------------------------------------
+  // SB.Jobs — missions for Sunset Bay v12. 22 missions, 79 stages.
+  // 3 SHOWCASE missions:
+  //  1. "The Harbour Lights Job" — 3-phase heist: recon -> execution -> escape.
+  //  2. "Neon Mile Grand Prix"   — street-race showcase across the bay.
+  //  3. "Tide Line Rescue"      — rescue showcase: save a stranded crew.
+  // Mission 1 ("First Light Courier") pays +$200 & REP +100, exactly as spec.
+  // Every mission: id, name, description, stages[], money reward, REP.
+  // Stages are { text, sub, type, target:{x,z}, radius, timeLimit }.
+  // Types: go (reach the marker), wait (survive the timer), collect
+  // (reach + press E / auto-pickup), escape (lose the wanted level),
+  // race (handed to SB.Races), talk (reach an NPC marker).
+  // update(dt, state) advances stages by proximity / timer / flags, and
+  // writes the live objective into state.mission so SB.HUD can show it.
+  // ---------------------------------------------------------------------------
 
-export const RESPRAY_COST = 150;
-export const MAX_WANTED = 5;
-export const AIR_HELI_WANTED = 3;
+  var stateRef = null;
+  var active = null;      // active mission object (from MISSIONS)
+  var stageIdx = 0;
+  var stageTimer = 0;
+  var stageDone = false;
+  var completedIds = {};
+  var failedIds = {};
+  var availableCache = null;
 
-// Stage kinds the engine understands.
-export const STAGE_KINDS = ['go', 'talk', 'collect', 'deliver', 'race', 'rob', 'escape', 'hide', 'choice', 'park', 'chase'];
-
-// --- Mission catalogue: 18 missions, 49 stages ---------------------
-// Stage counts: 3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,6 = 49. Counted
-// in the self-test at the bottom of this file (validateMissions()).
-export const MISSIONS = [
-  {
-    id: 'm01-first-light', name: 'First Light on the Bay', giver: 'Auntie Rosa',
-    blurb: 'Rosa needs her delivery van back before the market opens.',
-    reward: { cash: 150, bonus: 50, rep: 100 },
-    nightOnly: false,
-    stages: [
-      { id: 'm01-s1', kind: 'talk', label: 'Talk to Auntie Rosa at the market stall', x: -120, z: 80 },
-      { id: 'm01-s2', kind: 'go', label: 'Find Rosa\'s van near the pier', x: -260, z: 210 },
-      { id: 'm01-s3', kind: 'deliver', label: 'Drive the van back to the market', x: -120, z: 80 },
-    ],
-  },
-  {
-    id: 'm02-gull-post', name: 'Gull Post', giver: 'Old Man Ferry',
-    blurb: 'Deliver Ferry\'s letters before the tide turns.',
-    reward: { cash: 80, bonus: 20, rep: 40 },
-    nightOnly: false,
-    stages: [
-      { id: 'm02-s1', kind: 'collect', label: 'Pick up the mailbag at the harbour office', x: -300, z: 260 },
-      { id: 'm02-s2', kind: 'deliver', label: 'Deliver the letters to the lighthouse keeper', x: -420, z: 380 },
-    ],
-  },
-  {
-    id: 'm03-salt-air', name: 'Salt Air Taxi', giver: 'Mina the Dispatcher',
-    blurb: 'Three tourists, one sunset, no wrong turns.',
-    reward: { cash: 120, bonus: 30, rep: 60 },
-    nightOnly: false,
-    stages: [
-      { id: 'm03-s1', kind: 'go', label: 'Pick up the tourists at Coral Plaza', x: 60, z: -40 },
-      { id: 'm03-s2', kind: 'deliver', label: 'Drop them at the beach viewpoint', x: -180, z: 320 },
-      { id: 'm03-s3', kind: 'deliver', label: 'Take them back to their hotel', x: 140, z: 60 },
-    ],
-  },
-  {
-    id: 'm04-crate-expectations', name: 'Crate Expectations', giver: 'Dockmaster Ilya',
-    blurb: 'Two crates, one forklift, zero excuses.',
-    reward: { cash: 100, bonus: 25, rep: 50 },
-    nightOnly: false,
-    stages: [
-      { id: 'm04-s1', kind: 'collect', label: 'Collect the blue crate from Pier 2', x: -320, z: 240 },
-      { id: 'm04-s2', kind: 'deliver', label: 'Stack it at the harbour warehouse', x: -260, z: 180 },
-    ],
-  },
-  {
-    id: 'm05-mural-run', name: 'The Mural Run', giver: 'Pip the Painter',
-    blurb: 'Pip\'s paint is across town and the wall will not wait.',
-    reward: { cash: 110, bonus: 30, rep: 55 },
-    nightOnly: false,
-    stages: [
-      { id: 'm05-s1', kind: 'go', label: 'Meet Pip at the underpass mural', x: 90, z: 150 },
-      { id: 'm05-s2', kind: 'collect', label: 'Fetch the paint cans from the art shop', x: 180, z: 90 },
-      { id: 'm05-s3', kind: 'deliver', label: 'Bring the paint back to Pip', x: 90, z: 150 },
-    ],
-  },
-  {
-    id: 'm06-lost-dog', name: 'The Lost Dog of Meridian', giver: 'Mrs. Alba',
-    blurb: 'Biscuit the dog is loose in downtown. Bring him home.',
-    reward: { cash: 90, bonus: 40, rep: 70 },
-    nightOnly: false,
-    stages: [
-      { id: 'm06-s1', kind: 'go', label: 'Search Meridian Avenue for Biscuit', x: 200, z: -120 },
-      { id: 'm06-s2', kind: 'deliver', label: 'Walk Biscuit home to Mrs. Alba', x: 240, z: -60 },
-    ],
-  },
-  {
-    id: 'm07-fish-fry', name: 'Fish Fry Friday', giver: 'Chef Tomas',
-    blurb: 'The fry stall needs ice, fish and a miracle before 7pm.',
-    reward: { cash: 130, bonus: 30, rep: 60 },
-    nightOnly: false,
-    stages: [
-      { id: 'm07-s1', kind: 'collect', label: 'Buy ice from the harbour shop', x: -280, z: 220 },
-      { id: 'm07-s2', kind: 'collect', label: 'Pick up the catch from the boats', x: -340, z: 300 },
-      { id: 'm07-s3', kind: 'deliver', label: 'Deliver everything to Chef Tomas', x: -140, z: 120 },
-    ],
-  },
-  {
-    id: 'm08-surfboard', name: 'Surfboard Rescue', giver: 'Kai the Surfer',
-    blurb: 'Kai\'s board floated off. The tide is not waiting.',
-    reward: { cash: 95, bonus: 25, rep: 45 },
-    nightOnly: false,
-    stages: [
-      { id: 'm08-s1', kind: 'go', label: 'Reach the board drifting near the rocks', x: -380, z: 420 },
-      { id: 'm08-s2', kind: 'deliver', label: 'Return the board to Kai on the beach', x: -200, z: 360 },
-    ],
-  },
-  {
-    id: 'm09-paper-trail', name: 'Paper Trail', giver: 'Nadia the Reporter',
-    blurb: 'Three sources, one story, and a deadline at midnight.',
-    reward: { cash: 140, bonus: 35, rep: 75 },
-    nightOnly: false,
-    stages: [
-      { id: 'm09-s1', kind: 'talk', label: 'Interview the night guard at the depot', x: 260, z: 180 },
-      { id: 'm09-s2', kind: 'collect', label: 'Photograph the harbour ledger', x: -300, z: 260 },
-      { id: 'm09-s3', kind: 'deliver', label: 'Bring the photos to Nadia\'s office', x: 120, z: -180 },
-    ],
-  },
-  {
-    id: 'm10-bus-stop', name: 'The Last Bus', giver: 'Driver Oka',
-    blurb: 'Oka\'s bus broke down. Drive the route yourself.',
-    reward: { cash: 115, bonus: 20, rep: 50 },
-    nightOnly: false,
-    stages: [
-      { id: 'm10-s1', kind: 'go', label: 'Reach the broken bus on Hill Road', x: 320, z: 240 },
-      { id: 'm10-s2', kind: 'deliver', label: 'Finish the route: drop passengers downtown', x: 80, z: -80 },
-    ],
-  },
-  {
-    id: 'm11-lantern', name: 'Lantern Festival Setup', giver: 'Festival Chief Lani',
-    blurb: 'Hang the lanterns before the crowd arrives.',
-    reward: { cash: 125, bonus: 30, rep: 65 },
-    nightOnly: false,
-    stages: [
-      { id: 'm11-s1', kind: 'collect', label: 'Collect lanterns from the festival store', x: 40, z: 200 },
-      { id: 'm11-s2', kind: 'go', label: 'Hang lanterns along Coral Plaza', x: 60, z: -40 },
-      { id: 'm11-s3', kind: 'talk', label: 'Report to Chief Lani', x: 60, z: -20 },
-    ],
-  },
-  {
-    id: 'm12-tide-pool', name: 'Tide Pool Science', giver: 'Dr. Selin',
-    blurb: 'Sample the tide pools before the water comes back.',
-    reward: { cash: 105, bonus: 25, rep: 55 },
-    nightOnly: false,
-    stages: [
-      { id: 'm12-s1', kind: 'collect', label: 'Sample the west tide pool', x: -420, z: 360 },
-      { id: 'm12-s2', kind: 'collect', label: 'Sample the east tide pool', x: -300, z: 430 },
-    ],
-  },
-  {
-    id: 'm13-alley-cat', name: 'Alley Cat Courier', giver: 'Whisper',
-    blurb: 'A package, no questions, and a very short fuse.',
-    reward: { cash: 160, bonus: 40, rep: 80 },
-    nightOnly: false,
-    stages: [
-      { id: 'm13-s1', kind: 'collect', label: 'Pick up the package in the back alley', x: 160, z: 140 },
-      { id: 'm13-s2', kind: 'chase', label: 'Lose the rival courier on your tail', x: 0, z: 0 },
-      { id: 'm13-s3', kind: 'deliver', label: 'Drop the package at the blue door', x: -80, z: -220 },
-    ],
-  },
-  {
-    id: 'm14-sunrise-yoga', name: 'Sunrise Yoga Run', giver: 'Instructor Bea',
-    blurb: 'Mats, music and mangoes for the dawn class.',
-    reward: { cash: 85, bonus: 20, rep: 45 },
-    nightOnly: false,
-    stages: [
-      { id: 'm14-s1', kind: 'collect', label: 'Pick up yoga mats from the sports shop', x: 220, z: 40 },
-      { id: 'm14-s2', kind: 'deliver', label: 'Set up on the beach at sunrise', x: -200, z: 360 },
-    ],
-  },
-  {
-    id: 'm15-storm-warning', name: 'Storm Warning', giver: 'Harbour Master Odo',
-    blurb: 'Warn the boats before the storm hits the bay.',
-    reward: { cash: 150, bonus: 50, rep: 85 },
-    nightOnly: false,
-    stages: [
-      { id: 'm15-s1', kind: 'go', label: 'Warn the fishing boats at Pier 1', x: -320, z: 280 },
-      { id: 'm15-s2', kind: 'go', label: 'Warn the sailboats at the marina', x: -240, z: 400 },
-      { id: 'm15-s3', kind: 'talk', label: 'Report back to Harbour Master Odo', x: -280, z: 220 },
-    ],
-  },
-  {
-    id: 'm16-open-mic', name: 'Open Mic Night', giver: 'June of Coral Rock',
-    blurb: 'The band\'s gear is in three places. The show is tonight.',
-    reward: { cash: 135, bonus: 35, rep: 70 },
-    nightOnly: false,
-    stages: [
-      { id: 'm16-s1', kind: 'collect', label: 'Fetch the amplifier from the rehearsal room', x: 180, z: 160 },
-      { id: 'm16-s2', kind: 'deliver', label: 'Bring the gear to the Coral Plaza stage', x: 60, z: -40 },
-    ],
-  },
-  {
-    id: 'm17-midnight-harbour-run', name: 'Midnight Harbour Run', giver: 'The Night Dispatcher',
-    blurb: 'NIGHT ONLY — a street race to the harbour, then a rush delivery back. The bay belongs to the night owls.',
-    reward: { cash: 300, bonus: 100, rep: 150 },
-    nightOnly: true,
-    stages: [
-      { id: 'm17-s1', kind: 'race', label: 'Night race: Meridian Avenue to the harbour gates', x: -300, z: 260 },
-      { id: 'm17-s2', kind: 'deliver', label: 'Rush delivery: harbour parcel to the lighthouse', x: -420, z: 380 },
-      { id: 'm17-s3', kind: 'escape', label: 'Slip away before the harbour patrol wakes up', x: -200, z: 200 },
-    ],
-  },
-  {
-    id: 'm18-harbour-lights', name: 'The Harbour Lights Job', giver: 'Whisper',
-    blurb: 'SHOWCASE HEIST — pick your getaway, pick your door, and outrun the whole bay. No scripted route: reach the end any way you can.',
-    reward: { cash: 900, bonus: 300, rep: 400 },
-    nightOnly: false,
-    showcase: true,
-    phases: ['prep', 'execution', 'escape'],
-    stages: [
-      // Phase A — Prep: choose 1 of 2 getaway cars, park it yourself.
-      { id: 'm18-s1', kind: 'choice', phase: 'prep', label: 'Choose your getaway: the fast Coral Coupe OR the tough Harbour Van', x: 100, z: 200, choices: ['coral-coupe', 'harbour-van'] },
-      { id: 'm18-s2', kind: 'park', phase: 'prep', label: 'Park the getaway car at a spot YOU choose near the harbour', x: -260, z: 220 },
-      // Phase B — Execution: 2 entrances, noise changes NPC reactions.
-      { id: 'm18-s3', kind: 'rob', phase: 'execution', label: 'Enter the harbour shop — busy front door OR quiet back alley', x: -280, z: 240, entrances: ['front', 'alley'] },
-      { id: 'm18-s4', kind: 'rob', phase: 'execution', label: 'Grab the till cash and get out — quiet means calm NPCs, loud means panic', x: -280, z: 240 },
-      // Phase C — Escape: systemic pursuit, any route counts.
-      { id: 'm18-s5', kind: 'escape', phase: 'escape', label: 'Escape the pursuit — swap cars to drop the vehicle trail', x: -100, z: -100 },
-      { id: 'm18-s6', kind: 'hide', phase: 'escape', label: 'Reach the safehouse on Hill Road by ANY route', x: 320, z: 260 },
-    ],
-  },
-];
-
-export function totalStages() {
-  return MISSIONS.reduce((n, m) => n + m.stages.length, 0);
-}
-
-export function validateMissions() {
-  const errors = [];
-  if (MISSIONS.length !== 18) errors.push('expected 18 missions, got ' + MISSIONS.length);
-  if (totalStages() !== 49) errors.push('expected 49 stages, got ' + totalStages());
-  const ids = new Set();
-  for (const m of MISSIONS) {
-    if (ids.has(m.id)) errors.push('duplicate mission id ' + m.id);
-    ids.add(m.id);
-    for (const s of m.stages) {
-      if (!STAGE_KINDS.includes(s.kind)) errors.push(m.id + ' stage ' + s.id + ' bad kind ' + s.kind);
-      if (ids.has(s.id)) errors.push('duplicate stage id ' + s.id);
-      ids.add(s.id);
+  function S(text, sub, type, x, z, extra) {
+    var st = {
+      text: text,
+      sub: sub || '',
+      type: type || 'go',
+      target: { x: x || 0, z: z || 0 },
+      radius: 14,
+      timeLimit: 0
+    };
+    if (extra) {
+      var k;
+      for (k in extra) st[k] = extra[k];
     }
-  }
-  const m1 = MISSIONS[0];
-  if (!m1 || m1.reward.cash !== 150 || m1.reward.bonus !== 50 || m1.reward.rep !== 100) {
-    errors.push('mission 1 reward must be +$150, +$50, REP +100');
-  }
-  const show = MISSIONS.find((m) => m.showcase);
-  if (!show || show.stages.length !== 6) errors.push('showcase heist must have 6 stages');
-  return { ok: errors.length === 0, errors, missions: MISSIONS.length, stages: totalStages() };
-}
-
-// --- Cop AI ----------------------------------------------------------
-// Systemic, not scripted: cops steer toward the player's CURRENT
-// position, with speed and numbers scaling by wanted level. At
-// wanted >= 3 the AIR-1 helicopter joins with a sweeping spotlight.
-export class CopAI {
-  constructor() {
-    this.cops = [];        // {x, z, speed, state}
-    this.heliActive = false;
-    this.heli = { x: 0, z: 0, spotlightAngle: 0, spotlightRadius: 60 };
-    this.roadblocks = [];  // {x, z} spike-strip / roadblock points
-    this.searchZone = null;
-    this.searchTimer = 0;
+    return st;
   }
 
-  wantedToCopCount(wanted) {
-    return [0, 2, 3, 4, 6, 8][Math.max(0, Math.min(5, wanted))] || 0;
-  }
-
-  spawnForWanted(wanted, playerX, playerZ) {
-    const n = this.wantedToCopCount(wanted);
-    this.cops = [];
-    for (let i = 0; i < n; i++) {
-      const a = (i / Math.max(1, n)) * Math.PI * 2;
-      this.cops.push({
-        x: playerX + Math.cos(a) * 120, z: playerZ + Math.sin(a) * 120,
-        speed: 14 + wanted * 3, state: 'chase',
-      });
+  function M(id, name, desc, money, rep, stages, extra) {
+    var m = {
+      id: id, name: name, desc: desc,
+      money: money, rep: rep,
+      stages: stages,
+      showcase: false,
+      district: 'Downtown',
+      difficulty: 1
+    };
+    if (extra) {
+      var k;
+      for (k in extra) m[k] = extra[k];
     }
-    this.heliActive = wanted >= AIR_HELI_WANTED;
-    if (this.heliActive) { this.heli.x = playerX; this.heli.z = playerZ; }
-    // 1-2 roadblocks ahead of the player during a hot pursuit.
-    this.roadblocks = [];
-    if (wanted >= 3) {
-      this.roadblocks.push({ x: playerX + 180, z: playerZ + 60, kind: 'spike-strip' });
-      if (wanted >= 4) this.roadblocks.push({ x: playerX - 150, z: playerZ + 180, kind: 'roadblock' });
+    return m;
+  }
+
+  // --- SHOWCASE 1: THE HARBOUR LIGHTS JOB (3-phase heist) -------------------
+  var HARBOUR_LIGHTS = M('heist-harbour-lights', 'The Harbour Lights Job',
+    'The big one. A vault of harbour cash moves through the port at dusk. ' +
+    'Recon the yard, hit the convoy, then vanish across the bridge before AIR-1 arrives.',
+    1200, 300,
+    [
+      // PHASE 1 — RECON (3 stages)
+      S('Phase 1 — Recon: reach the harbour overlook',
+        'Scout the port from the overlook. Stay out of sight — no wanted stars.',
+        'go', 168, -142, { phase: 1 }),
+      S('Phase 1 — Recon: photograph the convoy route',
+        'Hold position at the overlook for 20 seconds and log the patrol times.',
+        'wait', 168, -142, { phase: 1, timeLimit: 20 }),
+      S('Phase 1 — Recon: mark the getaway bridge',
+        'Drive to the north bridge and mark the escape route for the crew.',
+        'go', -40, -210, { phase: 1 }),
+      // PHASE 2 — EXECUTION (3 stages)
+      S('Phase 2 — Execute: intercept the convoy at the docks',
+        'The cash convoy is rolling. Block the road and take the truck.',
+        'go', 150, -90, { phase: 2, wanted: 2 }),
+      S('Phase 2 — Execute: crack the truck vault',
+        'Hold the docks for 30 seconds while the crew cracks the vault.',
+        'wait', 150, -90, { phase: 2, timeLimit: 30, wanted: 3 }),
+      S('Phase 2 — Execute: load the cash into the getaway car',
+        'Grab the bags and get back in the car. Cops are coming.',
+        'collect', 138, -78, { phase: 2 }),
+      // PHASE 3 — ESCAPE (3 stages)
+      S('Phase 3 — Escape: cross the north bridge at full speed',
+        'AIR-1 is in the air. Cross the bridge before the roadblock closes.',
+        'go', -40, -210, { phase: 3, wanted: 4 }),
+      S('Phase 3 — Escape: lose the helicopter over the water',
+        'Shake AIR-1 along the coastal highway — stay fast, stay low.',
+        'escape', -180, 120, { phase: 3, timeLimit: 45 }),
+      S('Phase 3 — Escape: reach the safehouse',
+        'Bring the cash home. The crew is waiting at the safehouse.',
+        'go', -190, 180, { phase: 3 })
+    ],
+    { showcase: true, district: 'Harbour', difficulty: 5 });
+
+  // --- SHOWCASE 2: NEON MILE GRAND PRIX (race) -------------------------------
+  var NEON_GRAND_PRIX = M('race-neon-grand-prix', 'Neon Mile Grand Prix',
+    'The bay\'s biggest illegal street race. Five checkpoints, one rival crew, ' +
+    'and the whole neon mile watching. Win it and the bay knows your name.',
+    900, 220,
+    [
+      S('Line up at the Neon Mile start',
+        'Get to the start line on the neon strip. The crowd is already loud.',
+        'go', 60, 40, { phase: 1 }),
+      S('Race: checkpoint 1 — Harbour turn',
+        'Flat out through the harbour turn. Don\'t clip the containers.',
+        'race', 150, -90, { phase: 2, checkpoint: 1 }),
+      S('Race: checkpoint 2 — bridge straight',
+        'Full throttle across the north bridge. Slipstream the leader.',
+        'race', -40, -210, { phase: 2, checkpoint: 2 }),
+      S('Race: checkpoint 3 — coastal highway',
+        'Sunset on your left, rivals on your bumper. Hold the racing line.',
+        'race', -180, 120, { phase: 2, checkpoint: 3 }),
+      S('Race: final sprint to the finish',
+        'Last 400 metres down the boardwalk. Win the Grand Prix.',
+        'race', 40, 190, { phase: 2, checkpoint: 4 }),
+      S('Collect the trophy at the finish',
+        'Park at the finish line and collect the Neon Mile trophy.',
+        'collect', 40, 190, { phase: 3 })
+    ],
+    { showcase: true, district: 'Neon Mile', difficulty: 4 });
+
+  // --- SHOWCASE 3: TIDE LINE RESCUE -----------------------------------------
+  var TIDE_RESCUE = M('rescue-tide-line', 'Tide Line Rescue',
+    'A tour boat broke down off the beach with a full deck of tourists — ' +
+    'including your crew\'s little sister. Get out there and bring them home.',
+    650, 180,
+    [
+      S('Reach the marina and take a boat',
+        'Sprint to the marina. Any boat will do — time is the tide.',
+        'go', 120, 170, { phase: 1 }),
+      S('Reach the stranded tour boat',
+        'Push out past the breakwater to the drifting tour boat.',
+        'go', 60, 230, { phase: 2 }),
+      S('Rescue the passengers',
+        'Hold alongside for 25 seconds while everyone climbs aboard.',
+        'wait', 60, 230, { phase: 2, timeLimit: 25 }),
+      S('Bring everyone back to the beach',
+        'Ride the swell home and beach the boat by the lifeguard tower.',
+        'go', -20, 195, { phase: 3 }),
+      S('Check on the little sister',
+        'Find her on the sand and make sure she is all right.',
+        'talk', -30, 185, { phase: 3 })
+    ],
+    { showcase: true, district: 'Boardwalk', difficulty: 3 });
+
+  // --- THE FULL MISSION LIST (22 missions, 79 stages) ------------------------
+  var MISSIONS = [
+    // Mission 1 — the opener. Reward fixed by spec: +$200 & REP +100.
+    M('courier-first-light', 'First Light Courier',
+      'Your first job in the bay. Deliver a sealed package across town before sunrise. Simple — if you drive clean.',
+      200, 100,
+      [
+        S('Pick up the package at the diner', 'The package is waiting behind the counter at the Sunrise Diner.', 'go', -60, 30),
+        S('Deliver it to the harbour office', 'Cross town to the harbour office. No scratches, no cops.', 'go', 150, -90),
+        S('Report back to the diner', 'Job done. Collect your cut and your first REP.', 'go', -60, 30)
+      ],
+      { district: 'Downtown', difficulty: 1 }),
+
+    HARBOUR_LIGHTS,
+    NEON_GRAND_PRIX,
+    TIDE_RESCUE,
+
+    M('taxi-sunset-run', 'Sunset Taxi Run',
+      'Three fares, one golden hour. Drive tourists along the coast before the light dies.',
+      180, 60,
+      [
+        S('Pick up the couple at the hotel', 'They are waiting outside the Palma Hotel.', 'go', 30, -20),
+        S('Drop them at the beach bar', 'Coastal road, easy pace — they want the view.', 'go', -120, 160),
+        S('Pick up the last fare at the pier', 'One more fare, then the meter stops.', 'go', 90, 150)
+      ],
+      { district: 'Boardwalk', difficulty: 1 }),
+
+    M('smuggler-cove-drop', 'Cove Drop',
+      'Move a crate from the cove to the warehouse. Quiet roads, quiet radio.',
+      320, 90,
+      [
+        S('Collect the crate at Smuggler\'s Cove', 'Park at the cove and load the crate.', 'collect', -210, -60),
+        S('Deliver to the warehouse', 'Avoid the main road — patrols sweep it at dusk.', 'go', 120, -40),
+        S('Lose any tail, then confirm delivery', 'If anyone followed you, shake them first.', 'escape', 120, -40, { timeLimit: 30 })
+      ],
+      { district: 'Harbour', difficulty: 2 }),
+
+    M('photo-golden-hour', 'Golden Hour Shots',
+      'A magazine wants the bay at its best. Shoot three postcard spots before dark.',
+      150, 70,
+      [
+        S('Photograph the lighthouse', 'Frame the lighthouse against the sunset.', 'collect', -230, 40),
+        S('Photograph the neon strip', 'Catch the first neon flickering on.', 'collect', 60, 40),
+        S('Photograph the marina', 'Last light on the masts. Make it count.', 'collect', 120, 170)
+      ],
+      { district: 'Boardwalk', difficulty: 1 }),
+
+    M('pizza-midnight-rush', 'Midnight Pizza Rush',
+      'Four pizzas, four addresses, one very impatient night shift. Go.',
+      140, 50,
+      [
+        S('Collect the pizzas', 'Hot box is ready at the pizzeria.', 'go', -20, -60),
+        S('Deliver to the tower block', 'Third floor, no lift. Leave it at the door.', 'go', 80, -120),
+        S('Deliver to the beach party', 'Last drop — the party is on the sand.', 'go', -140, 180)
+      ],
+      { district: 'Downtown', difficulty: 1 }),
+
+    M('repo-night-shift', 'Repo Night Shift',
+      'The loan shark\'s cars are parked all over the bay. Tow three before dawn.',
+      380, 110,
+      [
+        S('Tow the convertible on Neon Mile', 'Hook it fast — the owner is inside the club.', 'collect', 60, 40),
+        S('Tow the sedan by the marina', 'Second car, second warning. Keep it quick.', 'collect', 120, 170),
+        S('Drop both at the impound lot', 'Park them in the lot and get paid.', 'go', 180, -160)
+      ],
+      { district: 'Neon Mile', difficulty: 2 }),
+
+    M('street-race-rookie', 'Rookie Street Race',
+      'Your first race. Three checkpoints around the block — prove you can drive.',
+      250, 80,
+      [
+        S('Reach the start line', 'The others are already revving.', 'go', 0, 80),
+        S('Race: checkpoint 1', 'First turn is tight. Brake late.', 'race', 100, 80, { checkpoint: 1 }),
+        S('Race: finish line', 'Bring it home in first place.', 'race', 0, 80, { checkpoint: 2 })
+      ],
+      { district: 'Downtown', difficulty: 2 }),
+
+    M('street-race-harbour-sprint', 'Harbour Sprint',
+      'A short, sharp sprint through the container yard. No room for error.',
+      300, 90,
+      [
+        S('Reach the harbour start', 'Engines on at the container gate.', 'go', 140, -120),
+        S('Race: checkpoint 1 — container slalom', 'Thread the containers at speed.', 'race', 170, -60, { checkpoint: 1 }),
+        S('Race: finish at the crane', 'Finish under the big crane.', 'race', 150, -90, { checkpoint: 2 })
+      ],
+      { district: 'Harbour', difficulty: 2 }),
+
+    M('vigilante-alley', 'Alley Vigilante',
+      'A protection crew is shaking down the market stalls. Run them off.',
+      260, 100,
+      [
+        S('Reach the market alley', 'The stalls are on the east side of the market.', 'go', -90, -80),
+        S('Confront the crew', 'Stand your ground for 20 seconds — they will back down.', 'wait', -90, -80, { timeLimit: 20 }),
+        S('Escort the stall owner home', 'Walk her home so the crew knows the alley is watched.', 'go', -120, -40)
+      ],
+      { district: 'Old Town', difficulty: 2 }),
+
+    M('fish-market-dawn', 'Dawn Fish Market',
+      'The catch comes in at dawn. Buy low at the market, sell high uptown.',
+      200, 60,
+      [
+        S('Buy the morning catch', 'Pick up the crates at the fish market.', 'collect', 160, -130),
+        S('Deliver to the uptown restaurant', 'Fresh fish, still cold. Don\'t dawdle.', 'go', 40, -160),
+        S('Collect the payment', 'Cash in hand, back before the gulls wake.', 'go', 160, -130)
+      ],
+      { district: 'Harbour', difficulty: 1 }),
+
+    M('tour-guide-day', 'Bay Tour Guide',
+      'Drive a tour group to the three sights every visitor asks for.',
+      170, 60,
+      [
+        S('Pick up the tour group', 'They are waiting by the visitor centre.', 'go', 10, 10),
+        S('Show them the lighthouse', 'Slow down — they want photos.', 'go', -230, 40),
+        S('End the tour at the boardwalk', 'Drop them at the ice-cream stand.', 'go', -40, 185)
+      ],
+      { district: 'Boardwalk', difficulty: 1 }),
+
+    M('garage-chop-shop', 'Chop Shop Run',
+      'A client wants a specific car. Steal it, lose the heat, deliver it.',
+      420, 120,
+      [
+        S('Steal the target car', 'It is parked outside the casino. Be quick.', 'collect', 100, -20),
+        S('Lose the wanted level', 'Duck down the side streets until the stars fade.', 'escape', 0, 0, { timeLimit: 40 }),
+        S('Deliver to the chop shop', 'Park it inside and take the cash.', 'go', 190, -40)
+      ],
+      { district: 'Neon Mile', difficulty: 3 }),
+
+    M('beach-cleanup-crew', 'Beach Cleanup Crew',
+      'The tide brought in a mess. Help the lifeguards clear three spots.',
+      120, 50,
+      [
+        S('Clear the north beach', 'Grab the bags by the lifeguard tower.', 'collect', -80, 190),
+        S('Clear the pier', 'Debris under the pier, watch the waves.', 'collect', 90, 150),
+        S('Clear the cove', 'Last spot — the cove is the worst.', 'collect', -210, -60)
+      ],
+      { district: 'Boardwalk', difficulty: 1 }),
+
+    M('heli-spotlight-run', 'Spotlight Run',
+      'AIR-1 is sweeping the bridge. Cross it in the dark without being lit up.',
+      500, 150,
+      [
+        S('Reach the bridge approach', 'Wait for the spotlight to swing away.', 'go', -20, -180),
+        S('Cross the bridge', 'Keep moving — the spotlight is sweeping.', 'go', -40, -220),
+        S('Vanish into Old Town', 'Lose the helicopter in the narrow streets.', 'escape', -140, -100, { timeLimit: 35 })
+      ],
+      { district: 'Old Town', difficulty: 3 }),
+
+    M('casino-vip-escort', 'Casino VIP Escort',
+      'A high roller needs a quiet ride from the casino to the marina yacht.',
+      450, 130,
+      [
+        S('Pick up the VIP at the casino', 'Black car, back door, no photos.', 'go', 100, -20),
+        S('Drive to the marina', 'Smooth and fast — the yacht leaves in ten minutes.', 'go', 120, 170),
+        S('Confirm the handover', 'Watch him board, then disappear.', 'wait', 120, 170, { timeLimit: 15 })
+      ],
+      { district: 'Neon Mile', difficulty: 3 }),
+
+    M('storm-surge-rescue', 'Storm Surge Rescue',
+      'The storm hit the pier. Two fishermen are stranded on the breakwater.',
+      550, 160,
+      [
+        S('Reach the pier in the storm', 'Rain is hammering the boards. Hold on.', 'go', 90, 150),
+        S('Rescue the first fisherman', 'Get him off the breakwater.', 'collect', 110, 190),
+        S('Rescue the second fisherman', 'One more — the waves are rising.', 'collect', 130, 200),
+        S('Get everyone to shelter', 'Bring them to the lifeguard station.', 'go', -20, 195)
+      ],
+      { district: 'Boardwalk', difficulty: 4 }),
+
+    M('kingpin-audition', 'Kingpin Audition',
+      'The bay\'s boss wants to see what you are made of. Three tests, one night.',
+      800, 250,
+      [
+        S('Test 1 — win the midnight race', 'Beat the boss\'s driver on the coastal highway.', 'race', -180, 120, { checkpoint: 1 }),
+        S('Test 2 — deliver the package under heat', 'Two stars and a package. Deliver it anyway.', 'go', 180, -160),
+        S('Test 3 — meet the boss at the penthouse', 'Park at the tower and take the lift. Do not keep him waiting.', 'go', 40, -160)
+      ],
+      { district: 'Downtown', difficulty: 5 }),
+
+    M('sunset-finale', 'Sunset Finale',
+      'One last job before the sun goes down: the whole bay, end to end.',
+      1000, 300,
+      [
+        S('Start at the lighthouse', 'The finale begins where the bay begins.', 'go', -230, 40),
+        S('Race the coast to the harbour', 'Full send down the coastal highway.', 'race', 150, -90, { checkpoint: 1 }),
+        S('Escape across the bridge', 'AIR-1 is up. Cross the bridge and do not look back.', 'escape', -40, -210, { timeLimit: 40 }),
+        S('Finish at the boardwalk as the sun sets', 'Park on the boardwalk. The bay is yours.', 'go', -40, 185)
+      ],
+      { district: 'Boardwalk', difficulty: 5 }),
+
+    M('night-shift-patrol', 'Night Shift Patrol',
+      'The neighbourhood watch asked for help. Patrol three corners before midnight.',
+      220, 80,
+      [
+        S('Patrol the market corner', 'Check in at the market.', 'go', -90, -80),
+        S('Patrol the school corner', 'Check in at the school gate.', 'go', -30, -140),
+        S('Patrol the park corner', 'Last corner, then home.', 'go', 20, -60)
+      ],
+      { district: 'Old Town', difficulty: 1 })
+  ];
+
+  var SHOWCASE = [HARBOUR_LIGHTS, NEON_GRAND_PRIX, TIDE_RESCUE];
+
+  // --- Helpers ---------------------------------------------------------------
+
+  function findMission(id) {
+    var i;
+    for (i = 0; i < MISSIONS.length; i++) {
+      if (MISSIONS[i].id === id) return MISSIONS[i];
     }
-    this.searchZone = { x: playerX, z: playerZ, radius: 90 + wanted * 30 };
-    this.searchTimer = 45 + wanted * 10;
-    return this.cops;
+    return null;
   }
 
-  // One tick (dt seconds). Cops chase the player's live position.
-  update(dt, playerX, playerZ, playerSpeed) {
-    for (const cop of this.cops) {
-      const dx = playerX - cop.x, dz = playerZ - cop.z;
-      const d = Math.hypot(dx, dz) || 1;
-      const step = Math.min(d, cop.speed * dt);
-      cop.x += (dx / d) * step;
-      cop.z += (dz / d) * step;
-      cop.state = d < 12 ? 'busted-near' : 'chase';
+  function totalStages() {
+    var n = 0, i;
+    for (i = 0; i < MISSIONS.length; i++) n += MISSIONS[i].stages.length;
+    return n;
+  }
+
+  function currentStage() {
+    if (!active) return null;
+    return active.stages[stageIdx] || null;
+  }
+
+  function setStateMission() {
+    if (!stateRef) return;
+    if (!active) {
+      stateRef.mission = { id: null, stage: 0, text: '', reward: 0 };
+      return;
     }
-    if (this.heliActive) {
-      // Helicopter drifts above the player; spotlight sweeps the street.
-      this.heli.x += (playerX - this.heli.x) * 0.5 * dt;
-      this.heli.z += (playerZ - this.heli.z) * 0.5 * dt;
-      this.heli.spotlightAngle += dt * 0.9;
-      this.heli.spotlightRadius = 55 + Math.sin(Date.now() / 900) * 10;
-    }
-    if (this.searchTimer > 0) this.searchTimer = Math.max(0, this.searchTimer - dt);
-    // Search zone follows the last known position while visible.
-    if (this.searchZone && playerSpeed < 2) {
-      this.searchZone.x += (playerX - this.searchZone.x) * 0.1 * dt;
-      this.searchZone.z += (playerZ - this.searchZone.z) * 0.1 * dt;
-    }
-    return this.cops;
-  }
-
-  nearestCopDistance(playerX, playerZ) {
-    let best = Infinity;
-    for (const c of this.cops) best = Math.min(best, Math.hypot(c.x - playerX, c.z - playerZ));
-    return best;
-  }
-
-  clear() {
-    this.cops = []; this.heliActive = false;
-    this.roadblocks = []; this.searchZone = null; this.searchTimer = 0;
-  }
-}
-
-// --- Job system ------------------------------------------------------
-export class JobSystem {
-  constructor(callbacks) {
-    this.cb = callbacks || {};
-    this.money = 0;
-    this.rep = 0;
-    this.wanted = 0;
-    // Wanted memory: what the police know. 'car' | 'clothes' | 'face'.
-    this.wantedMemory = [];
-    this.completed = new Set();
-    this.active = null;       // { mission, stageIndex }
-    this.hour = 12;
-    this.cops = new CopAI();
-    this.safehouse = { x: 320, z: 260, label: 'Hill Road Safehouse' };
-    this.garage = { x: 100, z: 200, label: 'Sunset Garage' };
-    this.cashPickups = [];    // {x, z, amount, taken}
-    this.noise = 0;           // 0 quiet .. 1 loud; drives NPC reactions
-    this.getawayChoice = null;
-    this.getawayParkedAt = null;
-  }
-
-  emit(event, data) {
-    if (typeof this.cb[event] === 'function') this.cb[event](data);
-    if (typeof this.cb.onEvent === 'function') this.cb.onEvent(event, data);
-  }
-
-  availableMissions() {
-    const isNight = this.hour >= 20 || this.hour < 6;
-    return MISSIONS.filter((m) => !this.completed.has(m.id) && (!m.nightOnly || isNight));
-  }
-
-  setTime(hour) { this.hour = ((hour % 24) + 24) % 24; }
-
-  startMission(missionId) {
-    const m = MISSIONS.find((x) => x.id === missionId);
-    if (!m) return { ok: false, error: 'unknown mission ' + missionId };
-    if (this.completed.has(m.id)) return { ok: false, error: 'mission already completed' };
-    if (m.nightOnly && !(this.hour >= 20 || this.hour < 6)) {
-      return { ok: false, error: 'this mission only appears at night' };
-    }
-    if (this.active) return { ok: false, error: 'another mission is active' };
-    this.active = { mission: m, stageIndex: 0 };
-    this.noise = 0;
-    this.emit('mission-start', { mission: m, stage: m.stages[0] });
-    return { ok: true, mission: m, stage: m.stages[0] };
-  }
-
-  currentStage() {
-    if (!this.active) return null;
-    return this.active.mission.stages[this.active.stageIndex] || null;
-  }
-
-  // Advance one stage. `detail` carries stage-specific facts, e.g.
-  // { choice: 'coral-coupe' } or { entrance: 'alley', loud: false }.
-  completeStage(detail) {
-    if (!this.active) return { ok: false, error: 'no active mission' };
-    const { mission } = this.active;
-    const stage = this.currentStage();
-    if (!stage) return { ok: false, error: 'no current stage' };
-
-    if (stage.kind === 'choice' && detail && detail.choice) {
-      this.getawayChoice = detail.choice;
-      this.emit('getaway-chosen', { choice: detail.choice });
-    }
-    if (stage.kind === 'park' && detail && detail.x != null) {
-      this.getawayParkedAt = { x: detail.x, z: detail.z };
-      this.emit('getaway-parked', this.getawayParkedAt);
-    }
-    if (stage.kind === 'rob' && detail) {
-      // Noise drives NPC reactions: loud front-door entry panics the
-      // shop; a quiet back-alley entry keeps NPCs calm.
-      if (detail.entrance === 'front') this.noise = Math.min(1, this.noise + 0.7);
-      if (detail.entrance === 'alley') this.noise = Math.min(1, this.noise + 0.15);
-      if (detail.loud) this.noise = 1;
-      this.emit('robbery-noise', { noise: this.noise, entrance: detail.entrance || null });
-      if (this.noise > 0.6) this.raiseWanted(2, ['face', 'clothes']);
-    }
-
-    this.active.stageIndex++;
-    this.emit('stage-complete', { mission, stage });
-    if (this.active.stageIndex >= mission.stages.length) return this.completeMission();
-    return { ok: true, mission, stage: this.currentStage() };
-  }
-
-  completeMission() {
-    const { mission } = this.active;
-    const r = mission.reward;
-    this.money += r.cash + (r.bonus || 0);
-    this.rep += r.rep || 0;
-    this.completed.add(mission.id);
-    this.active = null;
-    this.emit('mission-complete', { mission, cash: r.cash + (r.bonus || 0), rep: r.rep || 0 });
-    return { ok: true, completed: true, mission, cash: r.cash + (r.bonus || 0), rep: r.rep || 0 };
-  }
-
-  failMission(reason) {
-    if (!this.active) return { ok: false };
-    const mission = this.active.mission;
-    this.active = null;
-    this.emit('mission-fail', { mission, reason: reason || 'failed' });
-    return { ok: true, mission, reason };
-  }
-
-  // --- Wanted + memory ----------------------------------------------
-  raiseWanted(levels, knows) {
-    this.wanted = Math.max(0, Math.min(MAX_WANTED, this.wanted + (levels || 1)));
-    for (const k of knows || []) {
-      if (!this.wantedMemory.includes(k)) this.wantedMemory.push(k);
-    }
-    this.emit('wanted-change', { wanted: this.wanted, memory: this.wantedMemory.slice() });
-    return this.wanted;
-  }
-
-  // Swapping cars drops the vehicle trail.
-  swapVehicle() {
-    this.wantedMemory = this.wantedMemory.filter((k) => k !== 'car');
-    this.emit('wanted-change', { wanted: this.wanted, memory: this.wantedMemory.slice() });
-    return this.wantedMemory.slice();
-  }
-
-  // Changing clothes at a shop drops the outfit trail.
-  changeClothes() {
-    this.wantedMemory = this.wantedMemory.filter((k) => k !== 'clothes');
-    this.emit('wanted-change', { wanted: this.wanted, memory: this.wantedMemory.slice() });
-    return this.wantedMemory.slice();
-  }
-
-  // Hide outside the red search zone until the timer runs out:
-  // everything is forgotten and wanted falls to zero.
-  tickHiding(dt, insideSearchZone) {
-    if (this.wanted === 0) return false;
-    if (!insideSearchZone) {
-      this.cops.searchTimer = Math.max(0, this.cops.searchTimer - dt);
-      if (this.cops.searchTimer <= 0) {
-        this.wanted = 0;
-        this.wantedMemory = [];
-        this.cops.clear();
-        this.emit('wanted-change', { wanted: 0, memory: [] });
-        this.emit('escaped', {});
-        return true;
-      }
-    }
-    return false;
-  }
-
-  // --- Safehouse / garage / shop -------------------------------------
-  respray() {
-    if (this.money < RESPRAY_COST) return { ok: false, error: 'need $' + RESPRAY_COST };
-    this.money -= RESPRAY_COST;
-    // A fresh paint job is a new car as far as the police are concerned.
-    this.swapVehicle();
-    this.emit('respray', { cost: RESPRAY_COST });
-    return { ok: true, cost: RESPRAY_COST, money: this.money };
-  }
-
-  atSafehouse(x, z) {
-    return Math.hypot(x - this.safehouse.x, z - this.safehouse.z) < 25;
-  }
-
-  restAtSafehouse() {
-    this.wanted = 0;
-    this.wantedMemory = [];
-    this.cops.clear();
-    this.emit('wanted-change', { wanted: 0, memory: [] });
-    return { ok: true };
-  }
-
-  // --- Cash pickups ----------------------------------------------------
-  spawnCashPickup(x, z, amount) {
-    const p = { x, z, amount: amount || 25, taken: false };
-    this.cashPickups.push(p);
-    return p;
-  }
-
-  collectCashPickup(x, z, radius) {
-    let gained = 0;
-    for (const p of this.cashPickups) {
-      if (!p.taken && Math.hypot(p.x - x, p.z - z) < (radius || 8)) {
-        p.taken = true;
-        gained += p.amount;
-      }
-    }
-    if (gained > 0) {
-      this.money += gained;
-      this.emit('cash-pickup', { amount: gained, money: this.money });
-    }
-    return gained;
-  }
-
-  // Distance (metres) from the player to the current objective.
-  distanceToObjective(px, pz) {
-    const st = this.currentStage();
-    if (!st || st.x == null) return null;
-    return Math.hypot(st.x - px, st.z - pz);
-  }
-
-  // Route for the HUD minimap: straight waypoints player -> objective.
-  // The showcase escape deliberately has NO fixed route — any path
-  // counts, so the HUD draws a direct line, not a spline to follow.
-  routeToObjective(px, pz) {
-    const st = this.currentStage();
-    if (!st || st.x == null) return [];
-    return [{ x: px, z: pz }, { x: st.x, z: st.z }];
-  }
-
-  save() {
-    return {
-      money: this.money, rep: this.rep, wanted: this.wanted,
-      wantedMemory: this.wantedMemory.slice(),
-      completed: Array.from(this.completed),
-      hour: this.hour, getawayChoice: this.getawayChoice,
-      getawayParkedAt: this.getawayParkedAt,
+    var st = currentStage();
+    stateRef.mission = {
+      id: active.id,
+      stage: stageIdx,
+      text: active.name + ' — ' + (st ? st.text : ''),
+      sub: st ? st.sub : '',
+      reward: active.money,
+      target: st ? st.target : null,
+      totalStages: active.stages.length
     };
   }
 
-  load(data) {
-    if (!data) return;
-    this.money = data.money || 0;
-    this.rep = data.rep || 0;
-    this.wanted = data.wanted || 0;
-    this.wantedMemory = Array.isArray(data.wantedMemory) ? data.wantedMemory.slice() : [];
-    this.completed = new Set(data.completed || []);
-    if (data.hour != null) this.hour = data.hour;
-    this.getawayChoice = data.getawayChoice || null;
-    this.getawayParkedAt = data.getawayParkedAt || null;
+  function hudSay(text) {
+    if (window.SB && window.SB.HUD) window.SB.HUD.showMission(text);
   }
-}
 
-export function createJobSystem(callbacks) { return new JobSystem(callbacks); }
+  function toast(text) {
+    if (window.SB && window.SB.HUD) window.SB.HUD.showToast(text);
+  }
 
-if (typeof window !== 'undefined') {
-  window.SunsetJobs = window.SunsetJobs || {};
-  window.SunsetJobs.MISSIONS = MISSIONS;
-  window.SunsetJobs.JobSystem = JobSystem;
-  window.SunsetJobs.CopAI = CopAI;
-  window.SunsetJobs.validateMissions = validateMissions;
-  window.SunsetJobs.RESPRAY_COST = RESPRAY_COST;
-}
+  function sfx(name) {
+    if (window.SB && window.SB.Audio) window.SB.Audio.sfx(name);
+  }
+
+  function applyWantedForStage(st) {
+    if (!st || !stateRef) return;
+    if (st.wanted && stateRef.wanted < st.wanted) {
+      stateRef.wanted = st.wanted;
+      stateRef.heat = Math.max(stateRef.heat || 0, st.wanted * 18);
+      if (window.SB && window.SB.Police) window.SB.Police.setWanted(st.wanted);
+    }
+  }
+
+  // --- Public API ------------------------------------------------------------
+
+  function init(state) {
+    stateRef = state || null;
+    active = null;
+    stageIdx = 0;
+    stageTimer = 0;
+    if (stateRef) {
+      stateRef.mission = { id: null, stage: 0, text: '', reward: 0 };
+      if (stateRef.stats) stateRef.stats.missionsDone = stateRef.stats.missionsDone || 0;
+    }
+  }
+
+  function update(dt, state) {
+    if (state) stateRef = state;
+    if (!active || !stateRef) return;
+    var st = currentStage();
+    if (!st) { completeMission(); return; }
+    var p = stateRef.player || { x: 0, z: 0 };
+    var dx = (st.target.x || 0) - (p.x || 0);
+    var dz = (st.target.z || 0) - (p.z || 0);
+    var dist = Math.sqrt(dx * dx + dz * dz);
+
+    if (st.type === 'go' || st.type === 'collect' || st.type === 'talk') {
+      if (dist <= st.radius) advanceStage();
+    } else if (st.type === 'wait') {
+      // Must stay near the marker for the full timer.
+      if (dist <= st.radius + 10) {
+        stageTimer += dt;
+        if (stageTimer >= (st.timeLimit || 10)) advanceStage();
+      } else {
+        stageTimer = Math.max(0, stageTimer - dt * 0.5);
+      }
+    } else if (st.type === 'escape') {
+      stageTimer += dt;
+      var wanted = stateRef.wanted || 0;
+      if (wanted === 0 && stageTimer > 5) {
+        advanceStage();
+      } else if (st.timeLimit && stageTimer >= st.timeLimit && wanted <= 1) {
+        advanceStage(); // close enough — the tail is cold
+      }
+    } else if (st.type === 'race') {
+      // Race stages are driven by SB.Races; Jobs watches its flag.
+      if (stateRef.flags && stateRef.flags['raceCheckpoint' + (st.checkpoint || 1)]) {
+        stateRef.flags['raceCheckpoint' + (st.checkpoint || 1)] = false;
+        advanceStage();
+      } else if (dist <= st.radius && stateRef.race) {
+        advanceStage();
+      }
+    }
+    setStateMission();
+  }
+
+  function startMission(id) {
+    var m = findMission(id);
+    if (!m) return false;
+    if (active) {
+      toast('Finish "' + active.name + '" first — one job at a time.');
+      return false;
+    }
+    if (completedIds[id]) {
+      toast('"' + m.name + '" is already done. Pick another job.');
+      return false;
+    }
+    active = m;
+    stageIdx = 0;
+    stageTimer = 0;
+    stageDone = false;
+    setStateMission();
+    applyWantedForStage(currentStage());
+    hudSay(m.name + ' — ' + (currentStage() ? currentStage().text : ''));
+    toast('Mission started: ' + m.name + '  ·  Reward ' +
+      '$' + m.money + '  ·  REP +' + m.rep);
+    sfx('pickup');
+    return true;
+  }
+
+  function advanceStage() {
+    if (!active) return false;
+    stageIdx++;
+    stageTimer = 0;
+    if (stageIdx >= active.stages.length) {
+      completeMission();
+      return true;
+    }
+    var st = currentStage();
+    setStateMission();
+    applyWantedForStage(st);
+    if (st) {
+      hudSay(active.name + ' — ' + st.text);
+      toast('Stage ' + (stageIdx + 1) + '/' + active.stages.length + ': ' + st.text);
+    }
+    sfx('checkpoint');
+    return true;
+  }
+
+  function completeMission() {
+    if (!active) return false;
+    var m = active;
+    if (stateRef) {
+      stateRef.money = (stateRef.money || 0) + m.money;
+      stateRef.rep = (stateRef.rep || 0) + m.rep;
+      stateRef.respect = (stateRef.respect || 0) + m.rep;
+      if (stateRef.stats) stateRef.stats.missionsDone = (stateRef.stats.missionsDone || 0) + 1;
+      if (stateRef.districtRep && m.district) {
+        stateRef.districtRep[m.district] = Math.min(100,
+          (stateRef.districtRep[m.district] || 0) + 8);
+      }
+    }
+    completedIds[m.id] = true;
+    active = null;
+    stageIdx = 0;
+    stageTimer = 0;
+    setStateMission();
+    toast('MISSION COMPLETE: ' + m.name + '  ·  +$' + m.money + '  ·  REP +' + m.rep);
+    if (window.SB && window.SB.HUD) {
+      window.SB.HUD.showMission('Sunset Bay', 'Mission complete — press M for the next job.');
+    }
+    sfx('win');
+    sfx('money');
+    return true;
+  }
+
+  function failMission(reason) {
+    if (!active) return false;
+    var m = active;
+    failedIds[m.id] = true;
+    active = null;
+    stageIdx = 0;
+    stageTimer = 0;
+    setStateMission();
+    toast('MISSION FAILED: ' + m.name + (reason ? ' — ' + reason : ''));
+    sfx('fail');
+    return true;
+  }
+
+  function abortMission() {
+    if (!active) return false;
+    var name = active.name;
+    active = null;
+    stageIdx = 0;
+    stageTimer = 0;
+    setStateMission();
+    toast('Mission abandoned: ' + name);
+    return true;
+  }
+
+  function available() {
+    if (availableCache) return availableCache;
+    var out = [];
+    var i;
+    for (i = 0; i < MISSIONS.length; i++) {
+      if (!completedIds[MISSIONS[i].id]) out.push(MISSIONS[i]);
+    }
+    return out;
+  }
+
+  function currentTarget() {
+    var st = currentStage();
+    return st ? st.target : null;
+  }
+
+  function progress() {
+    var done = 0, id;
+    for (id in completedIds) if (completedIds[id]) done++;
+    return { done: done, total: MISSIONS.length, active: active ? active.id : null };
+  }
+
+  window.SB.Jobs = {
+    init: init,
+    update: update,
+    startMission: startMission,
+    advanceStage: advanceStage,
+    completeMission: completeMission,
+    failMission: failMission,
+    abortMission: abortMission,
+    available: available,
+    currentTarget: currentTarget,
+    progress: progress,
+    findMission: findMission,
+    missions: MISSIONS,
+    showcase: SHOWCASE,
+    get active() { return active; },
+    get stage() { return stageIdx; },
+    get totalStages() { return totalStages(); },
+    get completed() { return completedIds; }
+  };
+})();

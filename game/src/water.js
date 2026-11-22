@@ -1,301 +1,303 @@
-// water.js — Laut "Sunset Bay" v11
-// Plane air dengan pantulan (specular tinggi), ombak (vertex sin sederhana),
-// perahu yang bergerak, dermaga. Water.draw HARUS dipanggil tiap frame.
-// Anti-soft-lock: exitBoat selalu bisa — tombol keluar perahu bekerja di
-// mana saja di dekat dermaga/pantai (nearestShore selalu mengembalikan
-// titik darat yang valid, tidak pernah null).
-// Modul logika + data mesh; renderer disuntikkan lewat Water.attachRenderer().
+window.SB = window.SB || {};
+(function(){
+'use strict';
 
-(function (global) {
-  'use strict';
+/* =========================================================================
+   SB.Water — Sunset Bay v12 (Builder C, dunia)
+   Laut barat (x < -172) + ombak + pantai + pelabuhan + 6 perahu.
+   Perahu bisa dinaiki (boardBoat) dan DITURUNKAN TANPA SOFT-LOCK:
+   exitBoat() SELALU berhasil — pemain diletakkan di titik darat
+   terdekat (dermaga / pantai / pelabuhan), tidak peduli posisi perahu.
+   Pelajaran v10: jangan pernah mengunci pemain di kendaraan air.
+   Ombak: ubin laut naik-turun sinusoidal mengikuti state.time.
+   Wake: cincin putih melebar di belakang perahu yang bergerak.
+   ========================================================================= */
 
-  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
-  function rand(a, b) { return a + Math.random() * (b - a); }
+var SEA_X = -172;       // garis pantai: laut di x < SEA_X
+var SHORE_X = -160;     // tepi pasir yang bisa dipijak
+var MAP_HALF = 178;
 
-  // ---------- perahu ----------
-  let boatSeq = 0;
-  class Boat {
-    constructor(opts) {
-      const o = opts || {};
-      this.id = 'boat-' + (++boatSeq);
-      this.x = o.x || -40; this.z = o.z || -190;
-      this.heading = o.heading || 0;
-      this.speed = o.speed || 0;
-      this.baseSpeed = o.baseSpeed || rand(2, 4);
-      this.color = o.color || [0.9, 0.85, 0.7];
-      this.rider = null;       // Player bila dinaiki
-      this.drifting = !!o.drifting; // perahu nelayan hanyut pelan
-      this.anchorX = this.x; this.anchorZ = this.z;
-      this.bobPhase = rand(0, Math.PI * 2);
-      this.y = 0;              // tinggi ombak saat ini
-    }
+var boats = [];         // {x,z,angle,speed,type,color,anchored,bobPhase}
+var wakes = [];         // {x,z,age,life}
+var state = null;
+var meshBoat = null;
+var meshSea = null;
+var meshWake = [];      // 3 ukuran cincin wake (tanpa scale di matriks)
+var meshBuoy = null;
+var meshPier = null;
+var initialized = false;
+var wavePhase = 0;
 
-    update(dt, time) {
-      // Ombak: naik-turun sinusoidal.
-      this.y = Math.sin(time * 1.3 + this.bobPhase) * 0.25;
-      if (this.rider) {
-        // Perahu dikendarai pemain: gerak lurus pelan, belok lambat.
-        this.speed = this.baseSpeed;
-        this.x += Math.sin(this.heading) * this.speed * dt;
-        this.z += -Math.cos(this.heading) * this.speed * dt;
-      } else if (this.drifting) {
-        // Hanyut melingkar pelan di sekitar jangkar.
-        const t = time * 0.05 + this.bobPhase;
-        this.x = this.anchorX + Math.cos(t) * 8;
-        this.z = this.anchorZ + Math.sin(t) * 5;
-        this.heading = t + Math.PI / 2;
-      } else {
-        // Perahu patroli: bolak-balik sejajar pantai.
-        this.x += Math.sin(this.heading) * this.baseSpeed * dt;
-        this.z += -Math.cos(this.heading) * this.speed * 0; // tetap di jalur z
-        if (this.x > 120) this.heading = Math.PI;
-        if (this.x < -160) this.heading = 0;
-      }
-    }
+var BOAT_TYPES = [
+  { name: 'Speedboat', top: 14, accel: 8,  color: [0.9, 0.2, 0.2] },
+  { name: 'Yacht',     top: 9,  accel: 5,  color: [0.95, 0.95, 0.9] },
+  { name: 'Fishing',   top: 7,  accel: 4,  color: [0.3, 0.6, 0.9] },
+  { name: 'Jet Ski',   top: 16, accel: 11, color: [0.95, 0.7, 0.1] }
+];
 
-    // Kemudi pemain (dipanggil dari game loop saat rider aktif).
-    steer(dt, input) {
-      if (!input) return;
-      if (input.left) this.heading += 0.9 * dt;
-      if (input.right) this.heading -= 0.9 * dt;
-      if (input.forward) this.baseSpeed = Math.min(7, this.baseSpeed + 2 * dt);
-      else if (input.back) this.baseSpeed = Math.max(1, this.baseSpeed - 2 * dt);
-    }
+function rr(a, b){ return a + Math.random() * (b - a); }
+function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
+
+function makeBoat(x, z, typeName){
+  var t = BOAT_TYPES[0];
+  for (var i = 0; i < BOAT_TYPES.length; i++){
+    if (BOAT_TYPES[i].name === typeName){ t = BOAT_TYPES[i]; break; }
   }
+  return {
+    x: x, z: z,
+    angle: rr(0, Math.PI * 2),
+    speed: 0,
+    type: t.name,
+    top: t.top,
+    accel: t.accel,
+    color: t.color,
+    anchored: Math.random() < 0.5,
+    bobPhase: rr(0, Math.PI * 2),
+    player: false
+  };
+}
 
-  // ---------- air ----------
-  class Water {
-    constructor(opts) {
-      const o = opts || {};
-      // Laut: bidang besar di sisi -Z kota (pantai di z ~ -150..-200).
-      this.x = o.x || 0;
-      this.z = o.z || -260;
-      this.width = o.width || 560;
-      this.depth = o.depth || 200;
-      this.shoreZ = o.shoreZ || -168; // garis pantai (z lebih besar = darat)
-      this.level = 0;                  // y permukaan air
-      this.specular = 0.9;             // pantulan tinggi
-      this.shininess = 64;
-      this.time = 0;
-      this.waveAmp = 0.35;
-      this.waveFreq = 0.08;
-      this.waveSpeed = 1.1;
-      this.boats = [];
-      this.pier = { x: -20, z: -168, len: 60, w: 6 };
-      this.renderer = null;
-      this.drawCalls = 0;              // penghitung: draw() terpanggil tiap frame
-      this._initBoats();
-    }
-
-    attachRenderer(renderer) { this.renderer = renderer; }
-
-    _initBoats() {
-      // 3 perahu nelayan hanyut + 1 perahu patroli + 1 perahu pemain di dermaga.
-      this.boats.push(new Boat({ x: -90, z: -210, drifting: true, color: [0.85, 0.7, 0.5] }));
-      this.boats.push(new Boat({ x: -40, z: -230, drifting: true, color: [0.7, 0.75, 0.8] }));
-      this.boats.push(new Boat({ x: 30, z: -220, drifting: true, color: [0.9, 0.6, 0.4] }));
-      this.boats.push(new Boat({ x: 0, z: -200, heading: 0, baseSpeed: 3, color: [0.95, 0.95, 0.95] }));
-      this.boats.push(new Boat({ x: -20, z: -180, heading: 0, baseSpeed: 3, color: [0.6, 0.8, 0.6] })); // di dermaga
-    }
-
-    // Tinggi ombak di satu titik (vertex sin sederhana).
-    waveHeight(x, z, time) {
-      const t = time == null ? this.time : time;
-      return Math.sin(x * this.waveFreq + t * this.waveSpeed) * this.waveAmp
-        + Math.sin(z * this.waveFreq * 1.3 + t * this.waveSpeed * 0.8) * this.waveAmp * 0.6;
-    }
-
-    // Grid vertex air (untuk renderer): posisi + normal pendekatan dari sin.
-    waterGrid(segments) {
-      const seg = segments || 24;
-      const verts = [];
-      for (let i = 0; i <= seg; i++) {
-        for (let j = 0; j <= seg; j++) {
-          const x = this.x - this.width / 2 + (i / seg) * this.width;
-          const z = this.z - this.depth / 2 + (j / seg) * this.depth;
-          verts.push({ x, y: this.waveHeight(x, z, this.time), z });
-        }
-      }
-      return verts;
-    }
-
-    isInWater(x, z) {
-      return z < this.shoreZ + 2 && z > this.z - this.depth / 2 - 40
-        && Math.abs(x - this.x) < this.width / 2 + 40;
-    }
-
-    nearestBoat(x, z, maxDist) {
-      let best = null, bestD = (maxDist || 4) * (maxDist || 4);
-      for (const b of this.boats) {
-        const dx = b.x - x, dz = b.z - z;
-        const d2 = dx * dx + dz * dz;
-        if (d2 < bestD) { bestD = d2; best = b; }
-      }
-      return best;
-    }
-
-    // Anti-soft-lock: SELALU mengembalikan titik darat yang valid.
-    // Prioritas: ujung dermaga -> garis pantai terdekat -> pantai (0, -160).
-    nearestShore(x, z) {
-      // 1) Dekat dermaga -> ujung dermaga.
-      const pier = this.pier;
-      if (Math.abs(x - pier.x) < 30 && z < pier.z + 10) {
-        return { x: pier.x, z: pier.z + pier.len / 2 + 2 };
-      }
-      // 2) Garis pantai terdekat: jaga x, z = shoreZ + 2 (darat).
-      if (Math.abs(x - this.x) < this.width / 2) {
-        return { x: clamp(x, -170, 170), z: this.shoreZ + 2 };
-      }
-      // 3) Fallback mutlak: pantai tengah — tidak pernah null.
-      return { x: 0, z: this.shoreZ + 2 };
-    }
-
-    // Keluar perahu: bekerja di mana saja. Mengembalikan posisi darat.
-    // Dipanggil Player.exitCurrentRide() dan juga langsung oleh game loop
-    // bila tombol keluar ditekan saat menaiki perahu.
-    exitBoat(boat, player) {
-      if (!boat) return { ok: false, reason: 'no-boat' };
-      const spot = this.nearestShore(boat.x, boat.z);
-      boat.rider = null;
-      if (player) {
-        player.inBoat = null;
-        player.x = spot.x; player.z = spot.z; player.y = 0;
-        player.wet = true; player.wetTimer = 60;
-      }
-      // Perahu ditambatkan di dekat titik keluar agar tidak hilang.
-      boat.anchorX = boat.x; boat.anchorZ = boat.z;
-      boat.drifting = true;
-      return { ok: true, x: spot.x, z: spot.z };
-    }
-
-    update(dt) {
-      this.time += dt;
-      for (const b of this.boats) b.update(dt, this.time);
-    }
-
-    // HARUS dipanggil tiap frame oleh game loop. Merender air + perahu +
-    // dermaga lewat renderer yang disuntikkan; bila belum ada renderer,
-    // tetap menghitung state (ombak, perahu) agar tidak ada frame kosong.
-    draw(frameState) {
-      this.drawCalls++;
-      this.update((frameState && frameState.dt) || 0.016);
-      const state = {
-        time: this.time,
-        level: this.level,
-        specular: this.specular,
-        shininess: this.shininess,
-        waveAmp: this.waveAmp,
-        boats: this.boats.map(b => ({ id: b.id, x: b.x, z: b.z, y: b.y, heading: b.heading, color: b.color, rider: !!b.rider })),
-        pier: this.pier,
-        grid: this.waterGrid(16),
-      };
-      if (this.renderer && typeof this.renderer.drawWater === 'function') {
-        this.renderer.drawWater(state);
-      } else if (this.renderer && typeof this.renderer.drawMesh === 'function') {
-        // Fallback: gambar plane air sebagai mesh datar + perahu via meshes.js.
-        const M = global.SunsetMeshes;
-        if (M) {
-          for (const b of this.boats) {
-            this.renderer.drawMesh(M.createBoatMesh(b.color), { x: b.x, y: b.y, z: b.z, rotY: b.heading });
-          }
-        }
-      }
-      return state;
-    }
-
-    // Camar terbang saat pemain mendekat (dipanggil game loop / ambient).
-    // Mengembalikan posisi camar; bila pemain dalam 8m, camar lepas landas.
-    seagullNear(playerX, playerZ, gull) {
-      if (!gull) return null;
-      const dx = playerX - gull.x, dz = playerZ - gull.z;
-      const d2 = dx * dx + dz * dz;
-      if (d2 < 8 * 8 && !gull.flying) {
-        gull.flying = true;
-        gull.vx = dx > 0 ? -3 : 3;
-        gull.vz = -4;
-      }
-      if (gull.flying) {
-        gull.x += (gull.vx || 0) * 0.016;
-        gull.z += (gull.vz || 0) * 0.016;
-        gull.y = (gull.y || 2) + 0.05;
-      }
-      return gull;
-    }
-
-    status() {
-      return {
-        time: +this.time.toFixed(2), drawCalls: this.drawCalls,
-        boats: this.boats.length, specular: this.specular,
-        shoreZ: this.shoreZ, waveAmp: this.waveAmp,
-      };
-    }
+function init(st){
+  state = st || null;
+  if (initialized) return;
+  initialized = true;
+  if (window.SB && SB.Meshes){
+    meshBoat = SB.Meshes.boat();
+    meshSea = SB.Meshes.plane(60, 60);
+    meshWake = [
+      SB.Meshes.plane(2.5, 2.5),
+      SB.Meshes.plane(5, 5),
+      SB.Meshes.plane(8, 8)
+    ];
+    meshBuoy = SB.Meshes.box(0.8, 0.8, 0.8);
+    meshPier = SB.Meshes.box(4, 0.4, 4);
   }
-
-  // ---------- event ambient (state machine murah) ----------
-  // 8 event: 4 subtle, 3 loud, 1 cuaca. Spawn di luar pandangan pemain,
-  // cooldown per distrik. Dikelola di sini agar city/vehicles/player tetap
-  // fokus; game loop memanggil AmbientEvents.update(dt, ctx) tiap frame.
-  const AMBIENT_DEFS = [
-    { id: 'turis-foto', kind: 'subtle', district: 'pantai-senja', cooldown: 45, desc: 'Turis berfoto di pantai' },
-    { id: 'penjual-keliling', kind: 'subtle', district: 'pasar-pagi', cooldown: 60, desc: 'Penjual keliling menawarkan dagangan' },
-    { id: 'anjing-kejar', kind: 'subtle', district: 'taman-anggrek', cooldown: 50, desc: 'Anjing mengejar pemain yang terlalu dekat' },
-    { id: 'camar-terbang', kind: 'subtle', district: 'pantai-senja', cooldown: 20, desc: 'Camar terbang saat pemain mendekat' },
-    { id: 'pencuri-kabur', kind: 'loud', district: 'jalan-kenanga', cooldown: 180, desc: 'Pencuri mobil kabur, tas uang berserakan' },
-    { id: 'balapan-jalanan', kind: 'loud', district: 'terminal-selatan', cooldown: 240, desc: 'Balapan jalanan menantang pemain' },
-    { id: 'polisi-kejar', kind: 'loud', district: 'alun-alun', cooldown: 200, desc: 'Polisi mengejar pelanggar lalu lintas' },
-    { id: 'hujan-lokal', kind: 'weather', district: 'bukit-melati', cooldown: 300, desc: 'Hujan lokal di satu zona, bergerak perlahan' },
+  // 6 perahu: 2 dekat dermaga pantai, 2 di marina, 2 lepas pantai
+  boats = [
+    makeBoat(-178, -30, 'Speedboat'),
+    makeBoat(-180, 20, 'Fishing'),
+    makeBoat(-176, 60, 'Yacht'),
+    makeBoat(-182, 120, 'Speedboat'),
+    makeBoat(-190, -90, 'Jet Ski'),
+    makeBoat(-185, 150, 'Fishing')
   ];
+  boats[0].anchored = false;
+  boats[2].anchored = false;
+  SB.Water.boats = boats;
+}
 
-  class AmbientEvents {
-    constructor() {
-      this.events = AMBIENT_DEFS.map(d => Object.assign({}, d, { timer: Math.random() * d.cooldown, active: false, x: 0, z: 0 }));
-      this.activeCount = 0;
+/* Titik darat terdekat dari (x,z): dermaga / pantai / pelabuhan.
+   Dipakai exitBoat — selalu mengembalikan titik yang bisa dipijak. */
+function nearestLand(x, z){
+  var best = { x: SHORE_X + 1, z: clamp(z, -170, 170) };
+  var bestD = Math.abs(x - best.x);
+  // Dermaga dari SB.City (papan kayu menjorok ke laut)
+  if (window.SB && SB.City && SB.City.piers){
+    var piers = SB.City.piers;
+    for (var i = 0; i < piers.length; i++){
+      var P = piers[i];
+      // Dermaga membujur sumbu Z dari z .. z+len
+      var pz = clamp(z, P.z, P.z + P.len);
+      var d = Math.sqrt((x - P.x) * (x - P.x) + (z - pz) * (z - pz));
+      if (d < bestD){ bestD = d; best = { x: P.x, z: pz }; }
     }
-    // ctx: {player:{x,z}, city, timeOfDay, onEvent}
-    update(dt, ctx) {
-      for (const ev of this.events) {
-        ev.timer -= dt;
-        if (!ev.active && ev.timer <= 0) {
-          // Spawn di luar pandangan pemain: minimal 30m dari pemain.
-          const spot = this._spawnSpot(ev, ctx);
-          if (spot) {
-            ev.active = true; ev.x = spot.x; ev.z = spot.z;
-            ev.duration = ev.kind === 'loud' ? 30 : 20;
-            if (ctx && ctx.onEvent) ctx.onEvent('ambient-start', { id: ev.id, kind: ev.kind, x: ev.x, z: ev.z });
-          } else {
-            ev.timer = 5; // coba lagi sebentar lagi
-          }
-        } else if (ev.active) {
-          ev.duration -= dt;
-          if (ev.duration <= 0) {
-            ev.active = false;
-            ev.timer = ev.cooldown;
-            if (ctx && ctx.onEvent) ctx.onEvent('ambient-end', { id: ev.id });
-          }
-        }
+  }
+  // Pelabuhan tenggara (darat di x > 120, z > 120)
+  if (z > 100){
+    var hd = Math.sqrt((x - 140) * (x - 140) + (z - 175) * (z - 175));
+    if (hd < bestD){ best = { x: 140, z: 175 }; }
+  }
+  return best;
+}
+
+/* Naik perahu terdekat (maks 6 unit dari pemain). */
+function boardBoat(){
+  if (!state) return false;
+  var p = state.player;
+  if (!p || p.vehicle || p.boat) return false;
+  var best = null, bestD = 6;
+  for (var i = 0; i < boats.length; i++){
+    var b = boats[i];
+    if (b.player) continue;
+    var dx = b.x - p.x, dz = b.z - p.z;
+    var d = Math.sqrt(dx*dx + dz*dz);
+    if (d < bestD){ bestD = d; best = b; }
+  }
+  if (!best){
+    if (window.SB && SB.HUD) SB.HUD.showToast('Tidak ada perahu di dekatmu. Cari di dermaga.');
+    return false;
+  }
+  best.player = true;
+  best.anchored = false;
+  best.speed = 0;
+  p.boat = best;
+  p.onFoot = false;
+  p.x = best.x; p.z = best.z; p.angle = best.angle;
+  if (window.SB && SB.HUD) SB.HUD.showToast('Naik ' + best.type + '! (F = turun di darat terdekat)');
+  if (window.SB && SB.Audio) SB.Audio.sfx('board');
+  return true;
+}
+
+/* Turun dari perahu — SELALU BISA, tanpa soft-lock (pelajaran v10).
+   Pemain diletakkan di darat terdekat; perahu dibiarkan mengapung
+   di tempat (anchored) agar bisa dinaiki lagi. */
+function exitBoat(){
+  if (!state) return false;
+  var p = state.player;
+  var b = p ? p.boat : null;
+  if (!b) return false;
+  var land = nearestLand(b.x, b.z);
+  b.player = false;
+  b.speed = 0;
+  b.anchored = true;      // perahu menunggu di dekat darat
+  p.boat = null;
+  p.onFoot = true;
+  p.x = land.x;
+  p.z = land.z;
+  p.y = 0;
+  p.angle = b.angle;
+  if (window.SB && SB.HUD) SB.HUD.showToast('Turun di darat. Perahu menunggu di dekat sini.');
+  if (window.SB && SB.Audio) SB.Audio.sfx('board');
+  return true;
+}
+
+/* Wake: cincin putih di belakang perahu. Dipanggil tiap frame oleh
+   update() untuk perahu pemain, dan bisa dipanggil modul lain. */
+function wake(x, z){
+  if (wakes.length > 40) wakes.shift();
+  wakes.push({ x: x, z: z, age: 0, life: 1.6 });
+}
+
+function updatePlayerBoat(b, dt){
+  var input = state.input || {};
+  var keys = input.keys || {};
+  var steering = 0;
+  if (keys.a || keys.arrowleft) steering += 1;
+  if (keys.d || keys.arrowright) steering -= 1;
+  if (keys.w || keys.arrowup) b.speed += b.accel * dt;
+  else if (keys.s || keys.arrowdown) b.speed -= b.accel * 0.8 * dt;
+  else b.speed -= Math.sign(b.speed) * 2.5 * dt;   // hambatan air
+  if (Math.abs(b.speed) < 0.2) b.speed = 0;
+  b.speed = clamp(b.speed, -4, b.top);
+  // Belok lebih lambat di air
+  b.angle += steering * 1.4 * dt * clamp(Math.abs(b.speed) / 6, 0.2, 1) * (b.speed >= 0 ? 1 : -1);
+  b.x += Math.sin(b.angle) * b.speed * dt;
+  b.z += Math.cos(b.angle) * b.speed * dt;
+  // Batas laut: jangan sampai menabrak pantai / keluar peta
+  if (b.x > SEA_X - 2){
+    b.x = SEA_X - 2;
+    b.speed *= -0.3;
+    if (window.SB && SB.HUD) SB.HUD.showToast('Perahu kandas di pantai! Turun (F).');
+  }
+  b.x = clamp(b.x, -260, SEA_X - 2);
+  b.z = clamp(b.z, -200, 200);
+  // Wake di belakang perahu saat bergerak
+  if (Math.abs(b.speed) > 3 && Math.random() < 0.6){
+    wake(b.x - Math.sin(b.angle) * 3.5, b.z - Math.cos(b.angle) * 3.5);
+  }
+  // Sinkron pemain ke perahu
+  state.player.x = b.x;
+  state.player.z = b.z;
+  state.player.angle = b.angle;
+}
+
+function update(dt, st){
+  if (st) state = st;
+  if (!state) return;
+  wavePhase += dt;
+  // Ombak: perahu tak berpenumpang hanyut pelan + bob
+  for (var i = 0; i < boats.length; i++){
+    var b = boats[i];
+    b.bobPhase += dt * 1.4;
+    if (!b.player){
+      if (!b.anchored){
+        // Hanyut pelan mengikuti arus (utara-selatan)
+        b.z += Math.sin(wavePhase * 0.3 + i) * 0.4 * dt;
+        b.x = clamp(b.x + Math.cos(wavePhase * 0.2 + i) * 0.3 * dt, -260, SEA_X - 4);
+        b.angle += Math.sin(wavePhase * 0.5 + i) * 0.05 * dt;
       }
-      this.activeCount = this.events.filter(e => e.active).length;
+    } else {
+      updatePlayerBoat(b, dt);
     }
-    _spawnSpot(ev, ctx) {
-      if (!ctx || !ctx.city) return { x: 0, z: -150 };
-      const d = ctx.city.districts.find(x => x.id === ev.district);
-      if (!d) return null;
-      const px = ctx.player ? ctx.player.x : 0;
-      const pz = ctx.player ? ctx.player.z : 0;
-      for (let i = 0; i < 8; i++) {
-        const ang = Math.random() * Math.PI * 2;
-        const rad = d.r * (0.3 + Math.random() * 0.6);
-        const x = d.cx + Math.cos(ang) * rad;
-        const z = d.cz + Math.sin(ang) * rad;
-        const dx = x - px, dz = z - pz;
-        if (dx * dx + dz * dz > 30 * 30) return { x, z };
-      }
-      return null; // pemain terlalu dekat dengan seluruh distrik; tunda
-    }
-    activeEvents() { return this.events.filter(e => e.active); }
+  }
+  // Wake menua & menghilang
+  for (var w = wakes.length - 1; w >= 0; w--){
+    wakes[w].age += dt;
+    if (wakes[w].age > wakes[w].life) wakes.splice(w, 1);
+  }
+  // Perahu pemain jatuh ke air? Tidak mungkin — pemain di atas perahu.
+  // Tapi bila pemain berjalan ke laut tanpa perahu, Water tidak intervensi;
+  // Player.update yang mendorongnya kembali ke pantai.
+}
+
+function draw(gl, st){
+  if (st) state = st;
+  if (!gl || !SB.GL || !SB.Math3 || !state) return;
+  var M = SB.Math3;
+  var t = state.time || 0;
+  var cam = state.camera ? state.camera.look : { x: 0, z: 0 };
+
+  function mat(x, y, z, ry){
+    var m = M.mat4Identity();
+    m = M.mat4Translate(m, x, y, z);
+    if (ry) m = M.mat4RotateY(m, ry);
+    return m;
   }
 
-  const api = { Water, Boat, AmbientEvents, AMBIENT_DEFS };
-  if (typeof module !== 'undefined' && module.exports) module.exports = api;
-  global.SunsetWater = api;
-})(typeof globalThis !== 'undefined' ? globalThis : this);
+  // Laut: ubin 60x60 dari x=-260..-172, z=-200..200, naik-turun ombak.
+  // Warna biru laut berubah halus dengan fase ombak (kilau golden hour).
+  var seaBase = [0.1, 0.35, 0.55];
+  for (var tx = -260; tx < SEA_X; tx += 60){
+    for (var tz = -200; tz < 200; tz += 60){
+      var waveY = Math.sin(t * 1.1 + tx * 0.08 + tz * 0.05) * 0.18;
+      var shimmer = 0.03 * Math.sin(t * 0.7 + tx + tz);
+      SB.GL.drawMesh(meshSea, mat(tx + 30, waveY, tz + 30, 0),
+        [seaBase[0] + shimmer, seaBase[1] + shimmer, seaBase[2] + shimmer]);
+    }
+  }
+  // Garis buih di pantai (pita putih tipis di garis air, bergerak)
+  var foamX = SEA_X + Math.sin(t * 0.9) * 0.8;
+  for (var fz = -180; fz < 180; fz += 30){
+    SB.GL.drawMesh(meshWake[0], mat(foamX, 0.12, fz, 0), [0.95, 0.97, 0.95]);
+  }
+
+  // Pelampung penanda jalur perahu (oranye, bob naik-turun)
+  for (var bi = 0; bi < 8; bi++){
+    var bx = -195 - (bi % 3) * 12;
+    var bz = -140 + bi * 40;
+    var by = 0.4 + Math.sin(t * 1.3 + bi) * 0.15;
+    SB.GL.drawMesh(meshBuoy, mat(bx, by, bz, 0), [1.0, 0.5, 0.1]);
+  }
+
+  // Perahu (bob + oleng kecil mengikuti ombak)
+  for (var i = 0; i < boats.length; i++){
+    var b = boats[i];
+    var dx = b.x - (cam.x || 0), dz = b.z - (cam.z || 0);
+    if (dx*dx + dz*dz > 220*220) continue;
+    var bobY = Math.sin(b.bobPhase) * 0.18;
+    SB.GL.drawMesh(meshBoat, mat(b.x, bobY, b.z, b.angle), b.color);
+  }
+
+  // Wake: cincin putih melebar & memudar (3 ukuran, dipilih dari umur)
+  for (var wi = 0; wi < wakes.length; wi++){
+    var W = wakes[wi];
+    var frac = W.age / W.life;
+    var idx = frac < 0.33 ? 0 : (frac < 0.66 ? 1 : 2);
+    var fade = 1 - frac;
+    SB.GL.drawMesh(meshWake[idx], mat(W.x, 0.15, W.z, 0),
+      [0.9 * fade + 0.1, 0.95 * fade + 0.05, 1.0 * fade]);
+  }
+}
+
+window.SB.Water = {
+  init: init,
+  update: update,
+  draw: draw,
+  boardBoat: boardBoat,
+  exitBoat: exitBoat,
+  boats: boats,
+  wake: wake,
+  nearestLand: nearestLand
+};
+
+})();

@@ -1,54 +1,55 @@
-# Sunset Bay v11 — ignore rules for the repository.
+# Sunset Bay v12 — files git must never track.
 #
-# Anything generated, local-only, or machine-specific stays out of git.
-# The game itself (game/), its screenshots, and the entry-point sources
-# are tracked; everything a tool or a run produces is not.
+# Rule of thumb: if a machine made it, or only one machine needs it,
+# it stays out of the repository. The entry is source + screenshots.
 
-# ---- build and submission output -----------------------------------
-/output
-dist
-build
-out
-*.tgz
-*.zip
+# --- build output ---
+/output/
+/dist/
+/build/
 
-# ---- dependencies and package-manager state ------------------------
-node_modules
+# --- dependencies & package managers ---
+node_modules/
 .pnp
 .pnp.*
-.yarn/cache
-.yarn/install-state.gz
-package-lock.json
-yarn.lock
-pnpm-lock.yaml
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+.npm/
+.bun/
 
-# ---- logs, caches, and coverage ------------------------------------
-*.log
+# --- scratch & temporary files ---
+/tmp/
+tmp/
 *.tmp
 *.temp
-.cache
-.parcel-cache
-coverage
-.nyc_output
-
-# ---- operating-system and editor droppings -------------------------
-.DS_Store
-Thumbs.db
-Desktop.ini
 *.swp
 *.swo
 *~
-.idea
-.vscode
-*.code-workspace
 
-# ---- environment and secrets ---------------------------------------
+# --- logs & crash reports ---
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- OS & editor clutter ---
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# --- environment & secrets ---
 .env
 .env.*
 !.env.example
 *.pem
 *.key
-
-# ---- test and QA scratch -------------------------------------------
-/tmp-qa
-qa-output

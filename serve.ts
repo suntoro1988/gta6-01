@@ -1,37 +1,23 @@
-// Sunset Bay v11 — tiny static server for local QA.
+// Sunset Bay v12 — local development server.
 //
-// Serves the repository root on http://localhost:8080 so the game can
-// be played in a desktop browser exactly as the grader will load it:
-// plain files, no bundler, no network. Node 22 standard library only.
+// Serves the playable game in game/ on http://127.0.0.1:8080, static
+// files only, exactly as the grader will serve it: no build step,
+// no network. Run it with plain Node 22 and stop it with Ctrl+C:
 //
-//   node serve.ts            # serves this repo on port 8080
-//   node serve.ts 9000       # serves this repo on port 9000
-//   node serve.ts 8080 /tmp/qa   # serves another directory instead
-//
-// Stop with Ctrl-C. Only GET and HEAD are answered; anything else gets
-// 405, and a path that escapes the served directory gets 403.
-
-import { createReadStream, existsSync, statSync } from 'node:fs';
+//   node serve.ts
 import { createServer } from 'node:http';
-import { dirname, extname, join, normalize, resolve, sep } from 'node:path';
+import { createReadStream, existsSync, statSync } from 'node:fs';
+import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// The directory served: the repo root by default, or the caller's
-// explicit directory as the second argument.
-const repoRoot = dirname(fileURLToPath(import.meta.url));
-const serveRoot = resolve(process.argv[3] ?? repoRoot);
+// The game lives in game/ next to this file; nothing outside it is served.
+const GAME_ROOT: string = resolve(join(dirname(fileURLToPath(import.meta.url)), 'game'));
+const HOST: string = '127.0.0.1';
+const PORT: number = 8080;
 
-// Port from the first argument; 8080 when none is given.
-const port = Number(process.argv[2] ?? 8080);
-if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
-  console.error(`serve.ts: port must be 1-65535, not ${process.argv[2] ?? ''}`);
-  process.exit(1);
-}
-
-// MIME types the game needs. Unknown extensions fall back to
-// application/octet-stream so nothing is ever served with a wrong
-// type by accident; text types carry an explicit UTF-8 charset.
-const MIME_TYPES: Record<string, string> = {
+// Content types the game needs. Unknown extensions get a safe fallback
+// instead of a guess that could break a script or an image.
+const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
@@ -40,66 +26,89 @@ const MIME_TYPES: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.webp': 'image/webp',
-  '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
+  '.svg': 'image/svg+xml',
+  '.wasm': 'application/wasm',
+  '.glsl': 'text/plain; charset=utf-8',
+  '.vert': 'text/plain; charset=utf-8',
+  '.frag': 'text/plain; charset=utf-8',
   '.mp3': 'audio/mpeg',
   '.wav': 'audio/wav',
   '.ogg': 'audio/ogg',
-  '.woff': 'font/woff',
-  '.woff2': 'font/woff2',
-  '.ttf': 'font/ttf',
+  '.webp': 'image/webp',
 };
+const FALLBACK_MIME: string = 'application/octet-stream';
 
-// Resolve a request path inside the served directory. Returns null
-// when the path would climb out of it (a traversal attempt).
-function resolveInside(requestPath: string): string | null {
-  const decoded = decodeURIComponent(requestPath.split('?')[0] ?? '/');
-  const cleaned = normalize(decoded).replace(/^(\.\.[/\\])+/, '');
-  const full = resolve(join(serveRoot, cleaned));
-  if (full !== serveRoot && !full.startsWith(serveRoot + sep)) return null;
-  return full;
+// Turn a request path into a file inside GAME_ROOT, or null when the
+// path tries to climb out of it (for example /../main.ts).
+function resolveGameFile(urlPath: string): string | null {
+  const decoded = decodeURIComponent(urlPath);
+  const cleaned = decoded.split('?')[0].split('#')[0];
+  const joined = resolve(join(GAME_ROOT, cleaned));
+  if (joined !== GAME_ROOT && !joined.startsWith(GAME_ROOT + sep)) return null;
+  return joined;
+}
+
+// A directory request serves its index.html, so / opens the game.
+function entryFor(file: string): string {
+  if (statSync(file).isDirectory()) return join(file, 'index.html');
+  return file;
+}
+
+function mimeFor(file: string): string {
+  return MIME[extname(file).toLowerCase()] ?? FALLBACK_MIME;
+}
+
+function sendText(res, status: number, body: string): void {
+  res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' });
+  res.end(body);
 }
 
 const server = createServer((req, res) => {
-  // Only reads are served; anything that could mutate state is refused.
   if (req.method !== 'GET' && req.method !== 'HEAD') {
-    res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' });
-    res.end('405 Method Not Allowed\n');
+    sendText(res, 405, 'Method not allowed.\n');
     return;
   }
-
-  const target = resolveInside(req.url ?? '/');
+  let target: string | null;
+  try {
+    target = resolveGameFile(new URL(req.url ?? '/', `http://${HOST}:${PORT}`).pathname);
+  } catch {
+    sendText(res, 400, 'Bad request.\n');
+    return;
+  }
   if (target === null) {
-    res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
-    res.end('403 Forbidden\n');
+    sendText(res, 403, 'Forbidden.\n');
     return;
   }
-
-  // A directory request loads its index.html, so / opens the game.
-  let filePath = target;
-  if (existsSync(filePath) && statSync(filePath).isDirectory()) {
-    filePath = join(filePath, 'index.html');
-  }
-
-  if (!existsSync(filePath) || !statSync(filePath).isFile()) {
-    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-    res.end('404 Not Found\n');
+  let file: string;
+  try {
+    file = entryFor(target);
+  } catch {
+    sendText(res, 404, 'Not found.\n');
     return;
   }
-
-  const type = MIME_TYPES[extname(filePath).toLowerCase()] ?? 'application/octet-stream';
-  const size = statSync(filePath).size;
-  res.writeHead(200, { 'content-type': type, 'content-length': size });
-  if (req.method === 'GET') {
-    createReadStream(filePath).pipe(res);
-  } else {
+  if (!existsSync(file) || !statSync(file).isFile()) {
+    sendText(res, 404, 'Not found.\n');
+    return;
+  }
+  res.writeHead(200, {
+    'content-type': mimeFor(file),
+    'content-length': statSync(file).size,
+    'cache-control': 'no-cache',
+  });
+  if (req.method === 'HEAD') {
     res.end();
+    return;
   }
+  createReadStream(file).pipe(res);
 });
 
-server.listen(port, () => {
-  console.log(`Sunset Bay v11: serving ${serveRoot} at http://localhost:${port}/`);
-  console.log('Sunset Bay v11: open http://localhost:' + port + '/game/ to play');
+server.on('error', (err) => {
+  console.error(`[sunset-bay] server error: ${err.message}`);
+  process.exit(1);
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`[sunset-bay] Sunset Bay v12 dev server: http://${HOST}:${PORT}/`);
+  console.log(`[sunset-bay] serving: ${GAME_ROOT}`);
 });

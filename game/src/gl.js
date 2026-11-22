@@ -1,1024 +1,1192 @@
-// gl.js — Sunset Bay v11 (Builder B: game core + rendering)
-// Wrapper WebGL2: shader, mesh, instancing, tekstur prosedural, skybox
-// gradien golden hour, satu shadow map directional, blob shadow,
-// genangan reflektif murah, hujan, dan awan billboard.
+window.SB = window.SB || {};
+// gl.js — Sunset Bay v12 (Builder B: graphics engine)
+// WebGL murni, tanpa library eksternal. Mesin render golden hour:
+//  - directional matahari oranye rendah (#ff9a3c) + hemisphere biru dingin
+//  - fog / haze hangat, langit gradien oranye -> ungu
+//  - shadow map directional 1024x1024, bayangan panjang
+//  - emissive (jendela & neon menyala), warna per-vertex
+//  - post-processing: vignette ringan lewat render-to-texture
 //
-// TANPA library eksternal, TANPA request eksternal: semua tekstur dibuat
-// prosedural dari canvas 2D. Target: WebGL2 (fallback: null + pesan).
+// API spec (WAJIB): init(canvas), clear(r,g,b), useProgram(name),
+//   drawMesh(mesh, matrix, color), setSun(dir, color),
+//   setFog(color, near, far), beginShadow(), endShadow().
+// Tambahan internal: beginFrame(view, proj), endFrame(), drawSky(),
+//   createMesh(data), setTimeOfDay(h), resize(), stats.
+(function () {
+  'use strict';
 
-import * as M from './math3.js';
+  var M3 = null; // diisi saat init dari window.SB.Math3
 
-export const VERSION = '11.0.0';
-export const SHADOW_SIZE = 1024;
+  // ------------------------------------------------------------------
+  // State internal
+  // ------------------------------------------------------------------
+  var gl = null;
+  var canvas = null;
+  var isWebGL2 = false;
+  var programs = {};       // nama -> { program, attribs, uniforms }
+  var currentProgram = null;
+  var currentProgramName = '';
+  var meshCache = {};      // key -> mesh GL
+  var meshCacheOrder = [];
+  var MAX_MESH_CACHE = 512;
 
-// ------------------------------------------------------------- GLSL ------
-const VS_LIT = `#version 300 es
-layout(location = 0) in vec3 aPos;
-layout(location = 1) in vec3 aNormal;
-layout(location = 2) in vec3 aColor;
-layout(location = 3) in vec2 aUv;
-uniform mat4 uProj;
-uniform mat4 uView;
-uniform mat4 uModel;
-uniform mat4 uLightSpace;
-out vec3 vNormal;
-out vec3 vWorldPos;
-out vec3 vColor;
-out vec2 vUv;
-out vec4 vLightSpacePos;
-void main() {
-  vec4 wp = uModel * vec4(aPos, 1.0);
-  vWorldPos = wp.xyz;
-  vNormal = mat3(uModel) * aNormal;
-  vColor = aColor;
-  vUv = aUv;
-  vLightSpacePos = uLightSpace * wp;
-  gl_Position = uProj * uView * wp;
-}`;
+  // Kamera & pencahayaan frame aktif
+  var viewMatrix = null;
+  var projMatrix = null;
+  var viewProj = null;
+  var cameraPos = { x: 0, y: 8, z: 12 };
+  var timeOfDay = 18.33;   // jam; 18.33 = 18:20 golden hour
+  var sunDir = { x: -0.55, y: -0.28, z: -0.79 }; // arah KE matahari (dinormalisasi)
+  var sunColor = [1.0, 0.60, 0.24];              // oranye #ff9a3c
+  var sunIntensity = 1.15;
+  var hemiSky = [0.42, 0.55, 0.85];              // biru dingin langit
+  var hemiGround = [0.32, 0.20, 0.16];           // pantulan tanah hangat
+  var hemiIntensity = 0.55;
+  var fogColor = [0.98, 0.62, 0.38];
+  var fogNear = 90, fogFar = 420;
+  var fogDensity = 1.0;
+  var ambientBoost = 0.06;
 
-const VS_LIT_INSTANCED = `#version 300 es
-layout(location = 0) in vec3 aPos;
-layout(location = 1) in vec3 aNormal;
-layout(location = 2) in vec3 aColor;
-layout(location = 3) in vec2 aUv;
-layout(location = 4) in vec3 aOffset;
-layout(location = 5) in vec2 aScaleRot;
-layout(location = 6) in vec3 aInstColor;
-uniform mat4 uProj;
-uniform mat4 uView;
-uniform mat4 uModel;
-uniform mat4 uLightSpace;
-out vec3 vNormal;
-out vec3 vWorldPos;
-out vec3 vColor;
-out vec2 vUv;
-out vec4 vLightSpacePos;
-void main() {
-  float c = cos(aScaleRot.y);
-  float s = sin(aScaleRot.y);
-  vec3 p = aPos * aScaleRot.x;
-  vec3 rp = vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z);
-  vec3 rn = vec3(c * aNormal.x + s * aNormal.z, aNormal.y, -s * aNormal.x + c * aNormal.z);
-  vec4 wp = uModel * vec4(rp + aOffset, 1.0);
-  vWorldPos = wp.xyz;
-  vNormal = mat3(uModel) * rn;
-  vColor = aColor * aInstColor;
-  vUv = aUv;
-  vLightSpacePos = uLightSpace * wp;
-  gl_Position = uProj * uView * wp;
-}`;
+  // Shadow map
+  var SHADOW_SIZE = 1024;
+  var shadowFBO = null;
+  var shadowTex = null;
+  var shadowDepthRB = null;
+  var lightView = null;
+  var lightProj = null;
+  var lightViewProj = null;
+  var shadowBias = 0.0016;
+  var shadowEnabled = true;
+  var softwareRenderer = false; // true bila GL init mendeteksi SwiftShader/dll
+  var inShadowPass = false;
+  var shadowBounds = 130; // setengah lebar ortho shadow (meter)
 
-// Fragment shader utama: directional sun + hemisphere + fog +
-// specular (naik saat basah) + emissive (neon / jendela malam) +
-// satu shadow map directional (PCF 3x3).
-const FS_LIT = `#version 300 es
-precision highp float;
-in vec3 vNormal;
-in vec3 vWorldPos;
-in vec3 vColor;
-in vec2 vUv;
-in vec4 vLightSpacePos;
-uniform vec3 uSunDir;
-uniform vec3 uSunColor;
-uniform float uSunIntensity;
-uniform vec3 uSkyColor;
-uniform vec3 uGroundColor;
-uniform vec3 uFogColor;
-uniform vec2 uFogRange;
-uniform vec3 uCamPos;
-uniform vec3 uEmissive;
-uniform float uEmissiveStrength;
-uniform float uSpecular;
-uniform float uShininess;
-uniform float uWetness;
-uniform float uAlpha;
-uniform float uUseShadow;
-uniform sampler2D uShadowMap;
-uniform float uUseTex;
-uniform sampler2D uTex;
-out vec4 fragColor;
+  // Post-processing (render scene ke texture, lalu blit + vignette)
+  var sceneFBO = null;
+  var sceneTex = null;
+  var sceneDepthRB = null;
+  var sceneW = 0, sceneH = 0;
+  var postEnabled = true;
+  var vignetteStrength = 0.42;
+  var vignetteSoftness = 0.55;
+  var exposure = 1.06;
+  var inScenePass = false;
 
-float sampleShadow(vec4 lightPos) {
-  vec3 proj = lightPos.xyz / lightPos.w;
-  proj = proj * 0.5 + 0.5;
-  if (proj.z > 1.0 || proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0) return 0.0;
-  float bias = 0.0018;
-  vec2 texel = 1.0 / vec2(textureSize(uShadowMap, 0));
-  float shadow = 0.0;
-  for (int x = -1; x <= 1; x++) {
-    for (int y = -1; y <= 1; y++) {
-      float d = texture(uShadowMap, proj.xy + vec2(float(x), float(y)) * texel).r;
-      shadow += (proj.z - bias > d) ? 1.0 : 0.0;
-    }
-  }
-  return shadow / 9.0;
-}
+  // Statistik frame (untuk HUD debug / fps badge)
+  var stats = { drawCalls: 0, triangles: 0, meshes: 0, shadowCalls: 0 };
 
-void main() {
-  vec3 N = normalize(vNormal);
-  if (!gl_FrontFacing) N = -N;
-  vec3 base = vColor;
-  if (uUseTex > 0.5) base *= texture(uTex, vUv).rgb;
-
-  float hemi = N.y * 0.5 + 0.5;
-  vec3 ambient = mix(uGroundColor, uSkyColor, hemi) * 0.7;
-
-  vec3 L = normalize(-uSunDir);
-  float diff = max(dot(N, L), 0.0);
-  float shadow = 0.0;
-  if (uUseShadow > 0.5) shadow = sampleShadow(vLightSpacePos);
-  float lit = 1.0 - shadow * 0.6;
-  vec3 light = ambient + uSunColor * (uSunIntensity * diff * lit);
-
-  vec3 V = normalize(uCamPos - vWorldPos);
-  vec3 H = normalize(L + V);
-  float spec = pow(max(dot(N, H), 0.0), uShininess) * uSpecular * (1.0 + uWetness * 2.5) * lit;
-  vec3 col = base * light + uSunColor * spec;
-
-  col += uEmissive * uEmissiveStrength;
-  col *= (1.0 - uWetness * 0.10);
-
-  float dist = distance(uCamPos, vWorldPos);
-  float f = smoothstep(uFogRange.x, uFogRange.y, dist);
-  col = mix(col, uFogColor, f);
-
-  fragColor = vec4(col, uAlpha);
-}`;
-
-const VS_DEPTH = `#version 300 es
-layout(location = 0) in vec3 aPos;
-uniform mat4 uLightProj;
-uniform mat4 uLightView;
-uniform mat4 uModel;
-void main() {
-  gl_Position = uLightProj * uLightView * uModel * vec4(aPos, 1.0);
-}`;
-
-const VS_DEPTH_INSTANCED = `#version 300 es
-layout(location = 0) in vec3 aPos;
-layout(location = 4) in vec3 aOffset;
-layout(location = 5) in vec2 aScaleRot;
-uniform mat4 uLightProj;
-uniform mat4 uLightView;
-uniform mat4 uModel;
-void main() {
-  float c = cos(aScaleRot.y);
-  float s = sin(aScaleRot.y);
-  vec3 p = aPos * aScaleRot.x;
-  vec3 rp = vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z);
-  gl_Position = uLightProj * uLightView * uModel * vec4(rp + aOffset, 1.0);
-}`;
-
-const FS_DEPTH = `#version 300 es
-precision highp float;
-void main() {}`;
-
-const VS_FLAT = `#version 300 es
-layout(location = 0) in vec3 aPos;
-layout(location = 2) in vec3 aColor;
-layout(location = 3) in vec2 aUv;
-uniform mat4 uProj;
-uniform mat4 uView;
-uniform mat4 uModel;
-out vec3 vColor;
-out vec2 vUv;
-out vec3 vWorldPos;
-void main() {
-  vec4 wp = uModel * vec4(aPos, 1.0);
-  vWorldPos = wp.xyz;
-  vColor = aColor;
-  vUv = aUv;
-  gl_Position = uProj * uView * wp;
-}`;
-
-const VS_FLAT_INSTANCED = `#version 300 es
-layout(location = 0) in vec3 aPos;
-layout(location = 2) in vec3 aColor;
-layout(location = 3) in vec2 aUv;
-layout(location = 4) in vec3 aOffset;
-layout(location = 5) in vec2 aScaleRot;
-layout(location = 6) in vec3 aInstColor;
-uniform mat4 uProj;
-uniform mat4 uView;
-uniform mat4 uModel;
-out vec3 vColor;
-out vec2 vUv;
-out vec3 vWorldPos;
-void main() {
-  float c = cos(aScaleRot.y);
-  float s = sin(aScaleRot.y);
-  vec3 p = aPos * aScaleRot.x;
-  vec3 rp = vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z);
-  vec4 wp = uModel * vec4(rp + aOffset, 1.0);
-  vWorldPos = wp.xyz;
-  vColor = aColor * aInstColor;
-  vUv = aUv;
-  gl_Position = uProj * uView * wp;
-}`;
-
-const FS_FLAT = `#version 300 es
-precision highp float;
-in vec3 vColor;
-in vec2 vUv;
-in vec3 vWorldPos;
-uniform vec3 uFogColor;
-uniform vec2 uFogRange;
-uniform vec3 uCamPos;
-uniform float uUseFog;
-uniform float uAlpha;
-uniform float uUseTex;
-uniform sampler2D uTex;
-uniform vec3 uTint;
-out vec4 fragColor;
-void main() {
-  vec3 col = vColor * uTint;
-  if (uUseTex > 0.5) {
-    vec4 t = texture(uTex, vUv);
-    col *= t.rgb;
-    fragColor = vec4(col, t.a * uAlpha);
-  } else {
-    fragColor = vec4(col, uAlpha);
-  }
-  if (uUseFog > 0.5) {
-    float dist = distance(uCamPos, vWorldPos);
-    float f = smoothstep(uFogRange.x, uFogRange.y, dist);
-    fragColor.rgb = mix(fragColor.rgb, uFogColor, f);
-  }
-}`;
-
-const VS_SKY = `#version 300 es
-layout(location = 0) in vec2 aPos;
-uniform mat4 uInvViewProj;
-out vec3 vDir;
-void main() {
-  vec4 d = uInvViewProj * vec4(aPos, 0.0, 1.0);
-  vDir = d.xyz / d.w;
-  gl_Position = vec4(aPos, 1.0, 1.0);
-}`;
-
-const FS_SKY = `#version 300 es
-precision highp float;
-in vec3 vDir;
-uniform vec3 uHorizon;
-uniform vec3 uMid;
-uniform vec3 uZenith;
-uniform vec3 uSunDir;
-uniform vec3 uSunColor;
-uniform float uNight;
-uniform float uTime;
-out vec4 fragColor;
-
-float hash13(vec3 p) {
-  p = fract(p * 0.1031);
-  p += dot(p, p.zyx + 31.32);
-  return fract((p.x + p.y) * p.z);
-}
-
-void main() {
-  vec3 d = normalize(vDir);
-  float h = clamp(d.y, -0.12, 1.0);
-  vec3 col = mix(uHorizon, uMid, smoothstep(0.0, 0.28, h));
-  col = mix(col, uZenith, smoothstep(0.22, 0.8, h));
-  col = mix(uHorizon * 0.5, col, smoothstep(-0.10, 0.02, d.y));
-
-  float s = max(dot(d, normalize(-uSunDir)), 0.0);
-  col += uSunColor * (pow(s, 600.0) * 2.0 + pow(s, 32.0) * 0.55 + pow(s, 6.0) * 0.16);
-
-  if (uNight > 0.02 && d.y > 0.04) {
-    vec3 cell = floor(d * 160.0);
-    float star = hash13(cell);
-    float twinkle = 0.6 + 0.4 * sin(uTime * 2.0 + star * 40.0);
-    float m = step(0.997, star) * twinkle;
-    col += vec3(0.9, 0.95, 1.0) * m * uNight * smoothstep(0.04, 0.3, d.y);
-  }
-
-  fragColor = vec4(col, 1.0);
-}`;
-
-// ---------------------------------------------------------- helpers ------
-function compileShader(gl, type, src) {
-  const sh = gl.createShader(type);
-  gl.shaderSource(sh, src);
-  gl.compileShader(sh);
-  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-    const log = gl.getShaderInfoLog(sh);
-    gl.deleteShader(sh);
-    throw new Error('Shader compile gagal: ' + log);
-  }
-  return sh;
-}
-
-function createProgram(gl, vsSrc, fsSrc) {
-  const vs = compileShader(gl, gl.VERTEX_SHADER, vsSrc);
-  const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSrc);
-  const prog = gl.createProgram();
-  gl.attachShader(prog, vs);
-  gl.attachShader(prog, fs);
-  gl.linkProgram(prog);
-  gl.deleteShader(vs);
-  gl.deleteShader(fs);
-  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-    throw new Error('Program link gagal: ' + gl.getProgramInfoLog(prog));
-  }
-  return prog;
-}
-
-function getUniforms(gl, prog, names) {
-  const out = {};
-  for (const n of names) out[n] = gl.getUniformLocation(prog, n);
-  return out;
-}
-
-function toRGB(c, fallback = [1, 1, 1]) {
-  if (!c) return fallback;
-  if (Array.isArray(c)) return [c[0], c[1], c[2]];
-  if (typeof c.r === 'number') return [c.r, c.g, c.b];
-  return fallback;
-}
-
-// hash deterministik untuk posisi hujan / awan (tanpa alokasi per frame)
-function hash1(n) {
-  const s = Math.sin(n * 127.1 + 311.7) * 43758.5453;
-  return s - Math.floor(s);
-}
-
-// ------------------------------------------------- geometri prosedural ----
-// Semua fungsi geo* mengembalikan data mentah {positions, normals, colors,
-// uvs, indices} yang siap ke createMesh(). Warna per-vertex (pastel).
-
-export function geoBox(w, h, d, color, faceColors) {
-  const hw = w / 2, hh = h / 2, hd = d / 2;
-  const c = faceColors || [color, color, color, color, color, color];
-  const faces = [
-    { n: [0, 0, 1], v: [[-hw, -hh, hd], [hw, -hh, hd], [hw, hh, hd], [-hw, hh, hd]] },
-    { n: [0, 0, -1], v: [[hw, -hh, -hd], [-hw, -hh, -hd], [-hw, hh, -hd], [hw, hh, -hd]] },
-    { n: [1, 0, 0], v: [[hw, -hh, hd], [hw, -hh, -hd], [hw, hh, -hd], [hw, hh, hd]] },
-    { n: [-1, 0, 0], v: [[-hw, -hh, -hd], [-hw, -hh, hd], [-hw, hh, hd], [-hw, hh, -hd]] },
-    { n: [0, 1, 0], v: [[-hw, hh, hd], [hw, hh, hd], [hw, hh, -hd], [-hw, hh, -hd]] },
-    { n: [0, -1, 0], v: [[-hw, -hh, -hd], [hw, -hh, -hd], [hw, -hh, hd], [-hw, -hh, hd]] },
+  // Warna langit per fase hari (dipakai drawSky + clear fallback)
+  var SKY_STOPS = [
+    // [jam, horizonTop, horizonBottom, fog]
+    { h: 0,  top: [0.05, 0.07, 0.22], mid: [0.13, 0.12, 0.32], low: [0.22, 0.16, 0.38] },
+    { h: 5,  top: [0.10, 0.12, 0.30], mid: [0.25, 0.20, 0.38], low: [0.42, 0.28, 0.38] },
+    { h: 7,  top: [0.35, 0.55, 0.85], mid: [0.75, 0.72, 0.78], low: [0.98, 0.80, 0.60] },
+    { h: 12, top: [0.25, 0.55, 0.95], mid: [0.55, 0.75, 0.95], low: [0.85, 0.88, 0.95] },
+    { h: 16, top: [0.30, 0.55, 0.90], mid: [0.65, 0.72, 0.88], low: [0.99, 0.82, 0.55] },
+    { h: 18.33, top: [0.45, 0.22, 0.55], mid: [0.98, 0.45, 0.30], low: [1.00, 0.62, 0.24] },
+    { h: 19.5, top: [0.16, 0.10, 0.38], mid: [0.55, 0.22, 0.42], low: [0.95, 0.38, 0.30] },
+    { h: 21, top: [0.04, 0.05, 0.18], mid: [0.10, 0.08, 0.28], low: [0.20, 0.12, 0.34] },
+    { h: 24, top: [0.05, 0.07, 0.22], mid: [0.13, 0.12, 0.32], low: [0.22, 0.16, 0.38] }
   ];
-  const positions = [], normals = [], colors = [], uvs = [], indices = [];
-  faces.forEach((f, fi) => {
-    const base = positions.length / 3;
-    const col = toRGB(c[fi]);
-    f.v.forEach((p, k) => {
-      positions.push(p[0], p[1], p[2]);
-      normals.push(f.n[0], f.n[1], f.n[2]);
-      colors.push(col[0], col[1], col[2]);
-      uvs.push(k === 0 || k === 3 ? 0 : 1, k < 2 ? 0 : 1);
-    });
-    indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
-  });
-  return { positions: new Float32Array(positions), normals: new Float32Array(normals), colors: new Float32Array(colors), uvs: new Float32Array(uvs), indices: new Uint16Array(indices) };
-}
 
-// Bidang datar di XZ (normal +Y). origin di tengah.
-export function geoPlane(w, d, color) {
-  const hw = w / 2, hd = d / 2;
-  const col = toRGB(color);
-  return {
-    positions: new Float32Array([-hw, 0, -hd, hw, 0, -hd, hw, 0, hd, -hw, 0, hd]),
-    normals: new Float32Array([0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0]),
-    colors: new Float32Array([...col, ...col, ...col, ...col]),
-    uvs: new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]),
-    // Winding HARUS normal +Y: [0,1,2] memberi normal -Y sehingga bidang
-    // ter-cull oleh CULL_FACE bila dilihat dari atas (tanah/jalan/laut
-    // hilang total — bug integrasi v11, ketahuan dari QA piksel).
-    indices: new Uint16Array([0, 2, 1, 0, 3, 2]),
-  };
-}
+  // ------------------------------------------------------------------
+  // SHADER: program utama (lit) — per-vertex color + emissive + fog + shadow
+  // ------------------------------------------------------------------
+  var VERT_LIT = [
+    'attribute vec3 aPos;',
+    'attribute vec3 aNormal;',
+    'attribute vec3 aColor;',
+    'attribute float aEmissive;',
+    'uniform mat4 uModel;',
+    'uniform mat4 uView;',
+    'uniform mat4 uProj;',
+    'uniform mat4 uLightVP;',
+    'varying vec3 vNormal;',
+    'varying vec3 vColor;',
+    'varying float vEmissive;',
+    'varying vec3 vWorld;',
+    'varying vec4 vShadowCoord;',
+    'varying float vFogDepth;',
+    'void main() {',
+    '  vec4 world = uModel * vec4(aPos, 1.0);',
+    '  vWorld = world.xyz;',
+    '  vNormal = mat3(uModel) * aNormal;',
+    '  vColor = aColor;',
+    '  vEmissive = aEmissive;',
+    '  vShadowCoord = uLightVP * world;',
+    '  vec4 viewPos = uView * world;',
+    '  vFogDepth = -viewPos.z;',
+    '  gl_Position = uProj * viewPos;',
+    '}'
+  ].join('\n');
 
-// Quad vertikal di XY menghadap +Z (untuk awan, billboard, hujan).
-export function geoQuad(w, h, color) {
-  const hw = w / 2, hh = h / 2;
-  const col = toRGB(color);
-  return {
-    positions: new Float32Array([-hw, -hh, 0, hw, -hh, 0, hw, hh, 0, -hw, hh, 0]),
-    normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]),
-    colors: new Float32Array([...col, ...col, ...col, ...col]),
-    uvs: new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]),
-    indices: new Uint16Array([0, 1, 2, 0, 2, 3]),
-  };
-}
+  var FRAG_LIT = [
+    'precision mediump float;',
+    'varying vec3 vNormal;',
+    'varying vec3 vColor;',
+    'varying float vEmissive;',
+    'varying vec3 vWorld;',
+    'varying vec4 vShadowCoord;',
+    'varying float vFogDepth;',
+    'uniform vec3 uSunDir;',      // arah KE matahari (ternormalisasi)
+    'uniform vec3 uSunColor;',
+    'uniform float uSunIntensity;',
+    'uniform vec3 uHemiSky;',
+    'uniform vec3 uHemiGround;',
+    'uniform float uHemiIntensity;',
+    'uniform vec3 uTint;',        // tint per-draw (warna mobil dll)
+    'uniform vec3 uFogColor;',
+    'uniform float uFogNear;',
+    'uniform float uFogFar;',
+    'uniform sampler2D uShadowMap;',
+    'uniform float uUseShadow;',
+    'uniform float uShadowBias;',
+    'uniform float uTime;',
+    'uniform float uNightGlow;',  // 0 siang .. 1 malam (neon menyala)
+    'float shadowFactor(vec4 sc) {',
+    '  if (uUseShadow < 0.5) return 1.0;',
+    '  vec3 p = sc.xyz / sc.w;',
+    '  p = p * 0.5 + 0.5;',
+    '  if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0 || p.z > 1.0) return 1.0;',
+    '  float closest = texture2D(uShadowMap, p.xy).r;',
+    '  float cur = p.z - uShadowBias;',
+    '  float s = 0.0;',
+    '  vec2 texel = vec2(1.0 / 1024.0);',
+    '  s += step(cur, texture2D(uShadowMap, p.xy + vec2(-texel.x, -texel.y)).r);',
+    '  s += step(cur, texture2D(uShadowMap, p.xy + vec2( texel.x, -texel.y)).r);',
+    '  s += step(cur, texture2D(uShadowMap, p.xy + vec2(-texel.x,  texel.y)).r);',
+    '  s += step(cur, texture2D(uShadowMap, p.xy + vec2( texel.x,  texel.y)).r);',
+    '  s += step(cur, closest);',
+    '  return mix(0.42, 1.0, s / 5.0);',
+    '}',
+    'void main() {',
+    '  vec3 N = normalize(vNormal);',
+    '  vec3 L = normalize(uSunDir);',
+    '  float ndl = max(dot(N, L), 0.0);',
+    // Golden hour: matahari rendah -> diffuse hangat kuat di sisi
+    // menghadap matahari, sisi berlawanan jatuh ke biru dingin.
+    '  float wrap = pow(max(dot(N, L) * 0.5 + 0.5, 0.0), 1.6);',
+    '  vec3 diffuse = uSunColor * (ndl * 0.85 + wrap * 0.35) * uSunIntensity;',
+    '  float shadow = shadowFactor(vShadowCoord);',
+    '  diffuse *= mix(0.55, 1.0, shadow);',
+    // Hemisphere: langit biru dingin dari atas, tanah hangat dari bawah.
+    '  float hemiT = N.y * 0.5 + 0.5;',
+    '  vec3 hemi = mix(uHemiGround, uHemiSky, hemiT) * uHemiIntensity;',
+    // Specular Blinn-Phong halus: pantulan kaca / bodi mobil basah.
+    '  vec3 V = normalize(uCamPos - vWorld);',
+    '  vec3 H = normalize(L + V);',
+    '  float spec = pow(max(dot(N, H), 0.0), 42.0) * 0.35 * shadow;',
+    '  vec3 base = vColor * uTint;',
+    '  vec3 col = base * (diffuse + hemi + 0.10);',
+    '  col += uSunColor * spec * 0.9;',
+    // Emissive: jendela & neon. Malam hari menyala penuh, siang redup.
+    '  float glow = vEmissive * (0.25 + 0.85 * uNightGlow);',
+    '  col += base * glow * 1.6;',
+    '  col += uSunColor * glow * 0.35;',
+    // Fog / haze hangat golden hour.
+    '  float fogF = clamp((vFogDepth - uFogNear) / max(uFogFar - uFogNear, 1.0), 0.0, 1.0);',
+    '  fogF = fogF * fogF * (3.0 - 2.0 * fogF);',
+    '  col = mix(col, uFogColor, fogF);',
+    '  gl_FragColor = vec4(col, 1.0);',
+    '}'
+  ].join('\n');
 
-// Silinder low-poly (tiang lampu, batang palma). segments = 8 default.
-export function geoCylinder(radiusTop, radiusBottom, height, color, segments = 8) {
-  const col = toRGB(color);
-  const positions = [], normals = [], colors = [], uvs = [], indices = [];
-  const hh = height / 2;
-  for (let i = 0; i <= segments; i++) {
-    const a = (i / segments) * Math.PI * 2;
-    const ca = Math.cos(a), sa = Math.sin(a);
-    positions.push(ca * radiusTop, hh, sa * radiusTop, ca * radiusBottom, -hh, sa * radiusBottom);
-    normals.push(ca, 0, sa, ca, 0, sa);
-    colors.push(...col, ...col);
-    uvs.push(i / segments, 1, i / segments, 0);
+  // Uniform kamera ditambahkan ke FRAG_LIT lewat string replace saat
+  // kompilasi (menjaga shader tetap satu blok di atas).
+  var FRAG_LIT_CAM = 'uniform vec3 uCamPos;\n';
+
+  // ------------------------------------------------------------------
+  // SHADER: depth (shadow map) — hanya posisi
+  // ------------------------------------------------------------------
+  var VERT_DEPTH = [
+    'attribute vec3 aPos;',
+    'uniform mat4 uModel;',
+    'uniform mat4 uLightVP;',
+    'void main() {',
+    '  gl_Position = uLightVP * uModel * vec4(aPos, 1.0);',
+    '}'
+  ].join('\n');
+
+  var FRAG_DEPTH = [
+    'precision mediump float;',
+    'void main() {',
+    '  gl_FragColor = vec4(gl_FragCoord.z, 0.0, 0.0, 1.0);',
+    '}'
+  ].join('\n');
+
+  // ------------------------------------------------------------------
+  // SHADER: langit gradien (fullscreen triangle, tanpa depth)
+  // ------------------------------------------------------------------
+  var VERT_SKY = [
+    'attribute vec2 aPos;',
+    'varying vec2 vUV;',
+    'void main() {',
+    '  vUV = aPos * 0.5 + 0.5;',
+    '  gl_Position = vec4(aPos, 0.9999, 1.0);',
+    '}'
+  ].join('\n');
+
+  var FRAG_SKY = [
+    'precision mediump float;',
+    'varying vec2 vUV;',
+    'uniform vec3 uTop;',
+    'uniform vec3 uMid;',
+    'uniform vec3 uLow;',
+    'uniform vec3 uSunDirView;', // arah matahari dalam view space (xy)'
+    'uniform vec3 uSunColor;',
+    'uniform float uTime;',
+    'uniform float uStars;',     // 0..1 intensitas bintang malam
+    'float hash21(vec2 p) {',
+    '  p = fract(p * vec2(123.34, 456.21));',
+    '  p += dot(p, p + 45.32);',
+    '  return fract(p.x * p.y);',
+    '}',
+    'void main() {',
+    '  float y = vUV.y;',
+    // Gradien 3-stop: zenith -> horizon -> bawah cakrawala.
+    '  vec3 col = mix(uLow, uMid, smoothstep(0.0, 0.42, y));',
+    '  col = mix(col, uTop, smoothstep(0.42, 1.0, y));',
+    // Piringan matahari + halo hangat di sekitarnya.
+    '  vec2 dir = vUV - vec2(0.5 + uSunDirView.x * 0.28, 0.42 + uSunDirView.y * 0.22);',
+    '  float d = length(dir * vec2(1.6, 1.0));',
+    '  float disc = smoothstep(0.055, 0.035, d);',
+    '  float halo = pow(max(1.0 - d * 1.7, 0.0), 2.6);',
+    '  col += uSunColor * (disc * 1.5 + halo * 0.85);',
+    // Awan tipis prosedural (pita horizontal yang melayang pelan).
+    '  float band = sin(vUV.y * 34.0 + uTime * 0.05 + sin(vUV.x * 9.0) * 1.4);',
+    '  float cloud = smoothstep(0.55, 0.95, band) * smoothstep(0.25, 0.6, y) * (1.0 - smoothstep(0.8, 1.0, y));',
+    '  col = mix(col, vec3(1.0, 0.82, 0.72), cloud * 0.16);',
+    // Bintang saat malam.
+    '  vec2 g = floor(vUV * vec2(160.0, 90.0));',
+    '  float star = step(0.9975, hash21(g));',
+    '  float tw = 0.6 + 0.4 * sin(uTime * 2.0 + hash21(g + 7.0) * 20.0);',
+    '  col += vec3(star * tw * uStars * smoothstep(0.35, 0.75, y));',
+    '  gl_FragColor = vec4(col, 1.0);',
+    '}'
+  ].join('\n');
+
+  // ------------------------------------------------------------------
+  // SHADER: post-processing — blit scene texture + vignette + exposure
+  // ------------------------------------------------------------------
+  var VERT_POST = [
+    'attribute vec2 aPos;',
+    'varying vec2 vUV;',
+    'void main() {',
+    '  vUV = aPos * 0.5 + 0.5;',
+    '  gl_Position = vec4(aPos, 0.0, 1.0);',
+    '}'
+  ].join('\n');
+
+  var FRAG_POST = [
+    'precision mediump float;',
+    'varying vec2 vUV;',
+    'uniform sampler2D uScene;',
+    'uniform float uVignette;',
+    'uniform float uSoftness;',
+    'uniform float uExposure;',
+    'uniform float uTime;',
+    'void main() {',
+    '  vec3 col = texture2D(uScene, vUV).rgb;',
+    // Exposure + lift bayangan tipis (filmic-ish, murah).
+    '  col = 1.0 - exp(-col * uExposure);',
+    '  col = pow(col, vec3(0.96));',
+    // Vignette ringan: gelapkan tepi, jaga tengah tetap terang.
+    '  vec2 c = vUV - 0.5;',
+    '  float r = length(c * vec2(1.25, 1.45));',
+    '  float vig = 1.0 - uVignette * smoothstep(1.0 - uSoftness, 1.05, r);',
+    '  col *= vig;',
+    // Sedikit warm tint di tepi (golden hour bleed).
+    '  col = mix(col, col * vec3(1.05, 0.94, 0.86), r * 0.22);',
+    '  gl_FragColor = vec4(col, 1.0);',
+    '}'
+  ].join('\n');
+
+  // ------------------------------------------------------------------
+  // SHADER: air — dipakai modul water lewat useProgram('water')
+  // (gelombang + fresnel + refleksi warna langit, tanpa tekstur)
+  // ------------------------------------------------------------------
+  var VERT_WATER = [
+    'attribute vec3 aPos;',
+    'attribute vec3 aNormal;',
+    'attribute vec3 aColor;',
+    'attribute float aEmissive;',
+    'uniform mat4 uModel;',
+    'uniform mat4 uView;',
+    'uniform mat4 uProj;',
+    'uniform mediump float uTime;', // mediump eksplisit: samakan dengan
+    // 'precision mediump float' di FRAG_WATER — kalau tidak, linker
+    // menolak (presisi uniform uTime beda antar shader).
+    'varying vec3 vNormal;',
+    'varying vec3 vColor;',
+    'varying vec3 vWorld;',
+    'varying float vFogDepth;',
+    'void main() {',
+    '  vec3 p = aPos;',
+    '  float w1 = sin(p.x * 0.22 + uTime * 1.3) * 0.14;',
+    '  float w2 = cos(p.z * 0.18 - uTime * 0.9) * 0.12;',
+    '  float w3 = sin((p.x + p.z) * 0.09 + uTime * 0.5) * 0.18;',
+    '  p.y += w1 + w2 + w3;',
+    '  vec4 world = uModel * vec4(p, 1.0);',
+    '  vWorld = world.xyz;',
+    '  vNormal = mat3(uModel) * aNormal;',
+    '  vColor = aColor;',
+    '  vec4 viewPos = uView * world;',
+    '  vFogDepth = -viewPos.z;',
+    '  gl_Position = uProj * viewPos;',
+    '}'
+  ].join('\n');
+
+  var FRAG_WATER = [
+    'precision mediump float;',
+    'varying vec3 vNormal;',
+    'varying vec3 vColor;',
+    'varying vec3 vWorld;',
+    'varying float vFogDepth;',
+    'uniform vec3 uSunDir;',
+    'uniform vec3 uSunColor;',
+    'uniform vec3 uHemiSky;',
+    'uniform vec3 uFogColor;',
+    'uniform float uFogNear;',
+    'uniform float uFogFar;',
+    'uniform vec3 uCamPos;',
+    'uniform float uTime;',
+    'void main() {',
+    '  vec3 N = normalize(vNormal + vec3(',
+    '    sin(vWorld.x * 0.6 + uTime * 1.7) * 0.18,',
+    '    0.0,',
+    '    cos(vWorld.z * 0.5 - uTime * 1.3) * 0.18));',
+    '  vec3 V = normalize(uCamPos - vWorld);',
+    '  float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);',
+    '  vec3 deep = vColor * 0.55;',
+    '  vec3 skyRef = mix(vec3(0.98, 0.55, 0.30), uHemiSky, 0.45);',
+    '  vec3 col = mix(deep, skyRef, clamp(0.25 + fres * 0.75, 0.0, 1.0));',
+    '  vec3 L = normalize(uSunDir);',
+    '  vec3 H = normalize(L + V);',
+    '  float glitter = pow(max(dot(N, H), 0.0), 90.0) * 1.4;',
+    '  col += uSunColor * glitter;',
+    '  float fogF = clamp((vFogDepth - uFogNear) / max(uFogFar - uFogNear, 1.0), 0.0, 1.0);',
+    '  fogF = fogF * fogF * (3.0 - 2.0 * fogF);',
+    '  col = mix(col, uFogColor, fogF);',
+    '  gl_FragColor = vec4(col, 0.92);',
+    '}'
+  ].join('\n');
+
+  // ------------------------------------------------------------------
+  // Kompilasi shader
+  // ------------------------------------------------------------------
+  function compileShader(type, src) {
+    var sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      var log = gl.getShaderInfoLog(sh);
+      var kind = type === gl.VERTEX_SHADER ? 'VERTEX' : 'FRAGMENT';
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('[SB.GL] compile ' + kind + ' gagal: ' + log);
+      }
+      gl.deleteShader(sh);
+      return null;
+    }
+    return sh;
   }
-  for (let i = 0; i < segments; i++) {
-    const b = i * 2;
-    indices.push(b, b + 1, b + 2, b + 1, b + 3, b + 2);
+
+  function linkProgram(vsSrc, fsSrc) {
+    var vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+    var fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+    if (!vs || !fs) return null;
+    var prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('[SB.GL] link gagal: ' + gl.getProgramInfoLog(prog));
+      }
+      gl.deleteProgram(prog);
+      return null;
+    }
+    // Kumpulkan lokasi attribute & uniform yang dipakai.
+    var info = { program: prog, attribs: {}, uniforms: {} };
+    var nA = gl.getProgramParameter(prog, gl.ACTIVE_ATTRIBUTES);
+    for (var i = 0; i < nA; i++) {
+      var a = gl.getActiveAttrib(prog, i);
+      if (a) info.attribs[a.name] = gl.getAttribLocation(prog, a.name);
+    }
+    var nU = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS);
+    for (var j = 0; j < nU; j++) {
+      var u = gl.getActiveUniform(prog, j);
+      if (u) info.uniforms[u.name] = gl.getUniformLocation(prog, u.name);
+    }
+    return info;
   }
-  // tutup atas
-  const topBase = positions.length / 3;
-  positions.push(0, hh, 0);
-  normals.push(0, 1, 0);
-  colors.push(...col);
-  uvs.push(0.5, 0.5);
-  for (let i = 0; i < segments; i++) {
-    indices.push(topBase, i * 2 + 2, i * 2);
-  }
-  return { positions: new Float32Array(positions), normals: new Float32Array(normals), colors: new Float32Array(colors), uvs: new Float32Array(uvs), indices: new Uint16Array(indices) };
-}
 
-// ----------------------------------------------------------- renderer ----
-export function createRenderer(canvas, opts = {}) {
-  const gl = canvas.getContext('webgl2', {
-    antialias: true,
-    alpha: false,
-    depth: true,
-    stencil: false,
-    powerPreference: 'high-performance',
-  });
-  if (!gl) {
-    console.error('[gl] WebGL2 tidak tersedia di browser ini.');
-    if (opts.onError) opts.onError('WebGL2 tidak tersedia. Coba browser modern (Chrome/Edge/Firefox terbaru).');
-    return null;
+  function getUniform(prog, name) {
+    var u = prog.uniforms[name];
+    return (u === undefined || u === null) ? null : u;
   }
 
-  const extAniso = gl.getExtension('EXT_texture_filter_anisotropic');
+  function setUniform3f(prog, name, v) {
+    var u = getUniform(prog, name);
+    if (u) gl.uniform3f(u, v[0], v[1], v[2]);
+  }
+  function setUniform1f(prog, name, v) {
+    var u = getUniform(prog, name);
+    if (u) gl.uniform1f(u, v);
+  }
+  function setUniformMat4(prog, name, m) {
+    var u = getUniform(prog, name);
+    if (u) gl.uniformMatrix4fv(u, false, m);
+  }
 
-  // --- program ---
-  const progLit = createProgram(gl, VS_LIT, FS_LIT);
-  const progLitI = createProgram(gl, VS_LIT_INSTANCED, FS_LIT);
-  const progDepth = createProgram(gl, VS_DEPTH, FS_DEPTH);
-  const progDepthI = createProgram(gl, VS_DEPTH_INSTANCED, FS_DEPTH);
-  const progFlat = createProgram(gl, VS_FLAT, FS_FLAT);
-  const progFlatI = createProgram(gl, VS_FLAT_INSTANCED, FS_FLAT);
-  const progSky = createProgram(gl, VS_SKY, FS_SKY);
 
-  const U_LIT = getUniforms(gl, progLit, ['uProj', 'uView', 'uModel', 'uLightSpace', 'uSunDir', 'uSunColor', 'uSunIntensity', 'uSkyColor', 'uGroundColor', 'uFogColor', 'uFogRange', 'uCamPos', 'uEmissive', 'uEmissiveStrength', 'uSpecular', 'uShininess', 'uWetness', 'uAlpha', 'uUseShadow', 'uShadowMap', 'uUseTex', 'uTex']);
-  const U_LITI = getUniforms(gl, progLitI, Object.keys(U_LIT));
-  const U_DEPTH = getUniforms(gl, progDepth, ['uLightProj', 'uLightView', 'uModel']);
-  const U_DEPTHI = getUniforms(gl, progDepthI, ['uLightProj', 'uLightView', 'uModel']);
-  const U_FLAT = getUniforms(gl, progFlat, ['uProj', 'uView', 'uModel', 'uFogColor', 'uFogRange', 'uCamPos', 'uUseFog', 'uAlpha', 'uUseTex', 'uTex', 'uTint']);
-  const U_FLATI = getUniforms(gl, progFlatI, Object.keys(U_FLAT));
-  const U_SKY = getUniforms(gl, progSky, ['uInvViewProj', 'uHorizon', 'uMid', 'uZenith', 'uSunDir', 'uSunColor', 'uNight', 'uTime']);
 
-  // --- shadow map: satu directional saja ---
-  const shadowTex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, shadowTex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, SHADOW_SIZE, SHADOW_SIZE, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  const shadowFbo = gl.createFramebuffer();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFbo);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, shadowTex, 0);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  // ------------------------------------------------------------------
+  // Langit: interpolasi warna berdasarkan jam
+  // ------------------------------------------------------------------
+  function skyStopsFor(h) {
+    var hh = ((h % 24) + 24) % 24;
+    var prev = SKY_STOPS[0], next = SKY_STOPS[SKY_STOPS.length - 1];
+    for (var i = 0; i < SKY_STOPS.length; i++) {
+      if (SKY_STOPS[i].h <= hh) prev = SKY_STOPS[i];
+      if (SKY_STOPS[i].h >= hh) { next = SKY_STOPS[i]; break; }
+    }
+    var span = next.h - prev.h;
+    var t = span > 0 ? (hh - prev.h) / span : 0;
+    if (t < 0) t = 0; if (t > 1) t = 1;
+    function mix3(a, b) {
+      return [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t
+      ];
+    }
+    return {
+      top: mix3(prev.top, next.top),
+      mid: mix3(prev.mid, next.mid),
+      low: mix3(prev.low, next.low)
+    };
+  }
 
-  // --- tekstur prosedural (canvas 2D, tanpa request eksternal) ---
-  function canvasTexture(w, h, drawFn) {
-    const cv = document.createElement('canvas');
-    cv.width = w; cv.height = h;
-    drawFn(cv.getContext('2d'), w, h);
-    const tex = gl.createTexture();
+  // 0 = siang penuh, 1 = malam penuh. Golden hour ~0.15.
+  function nightFactor(h) {
+    var hh = ((h % 24) + 24) % 24;
+    if (hh >= 20.5 || hh < 5.5) return 1;
+    if (hh >= 19.5) return (hh - 19.5) / 1.0;
+    if (hh < 6.5) return 1 - (hh - 5.5) / 1.0;
+    if (hh >= 17.5 && hh < 18.8) return 0.15;
+    return 0;
+  }
+
+  // Posisi matahari dari jam: terbit timur (06.00), tenggelam barat (19.00).
+  // Mengembalikan arah KE matahari (ternormalisasi).
+  function sunDirFor(h) {
+    var hh = ((h % 24) + 24) % 24;
+    var frac = (hh - 6) / 13;             // 0 saat terbit, 1 saat tenggelam
+    if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+    var elev = Math.sin(frac * Math.PI) * 0.95;   // ketinggian 0..~1
+    var azim = frac * Math.PI;                    // timur -> barat
+    var d = {
+      x: Math.cos(azim) * 0.85,
+      y: 0.12 + elev * 0.85,
+      z: -0.45
+    };
+    return M3.normalize(d);
+  }
+
+  // ------------------------------------------------------------------
+  // Framebuffer helpers
+  // ------------------------------------------------------------------
+  function createDepthTexture(size) {
+    var tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.generateMipmap(gl.TEXTURE_2D);
-    if (extAniso) gl.texParameterf(gl.TEXTURE_2D, extAniso.TEXTURE_MAX_ANISOTROPY_EXT, 4);
+    gl.bindTexture(gl.TEXTURE_2D, null);
     return tex;
   }
 
-  const cloudTex = canvasTexture(128, 128, (c, w, h) => {
-    c.clearRect(0, 0, w, h);
-    const blobs = [[64, 70, 46], [36, 78, 30], [94, 78, 32], [58, 52, 30], [84, 58, 24]];
-    for (const [x, y, r] of blobs) {
-      const g = c.createRadialGradient(x, y, 2, x, y, r);
-      g.addColorStop(0, 'rgba(255,255,255,0.95)');
-      g.addColorStop(0.7, 'rgba(255,255,255,0.55)');
-      g.addColorStop(1, 'rgba(255,255,255,0)');
-      c.fillStyle = g;
-      c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fill();
-    }
-  });
-
-  const blobTex = canvasTexture(64, 64, (c, w, h) => {
-    const g = c.createRadialGradient(32, 32, 2, 32, 32, 30);
-    g.addColorStop(0, 'rgba(0,0,0,0.85)');
-    g.addColorStop(0.7, 'rgba(0,0,0,0.35)');
-    g.addColorStop(1, 'rgba(0,0,0,0)');
-    c.fillStyle = g;
-    c.fillRect(0, 0, w, h);
-  });
-
-  const streakTex = canvasTexture(16, 64, (c, w, h) => {
-    const g = c.createLinearGradient(0, 0, 0, h);
-    g.addColorStop(0, 'rgba(180,200,255,0)');
-    g.addColorStop(0.5, 'rgba(180,200,255,0.9)');
-    g.addColorStop(1, 'rgba(180,200,255,0)');
-    c.fillStyle = g;
-    c.fillRect(6, 0, 4, h);
-  });
-
-  // --- mesh util ---
-  function createBuffer(data, target, usage) {
-    const buf = gl.createBuffer();
-    gl.bindBuffer(target, buf);
-    gl.bufferData(target, data, usage || gl.STATIC_DRAW);
-    return buf;
+  function createColorTexture(w, h) {
+    var tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    return tex;
   }
 
-  function setupMeshAttributes(vao, mesh) {
-    gl.bindVertexArray(vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.buffers.position);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.buffers.normal);
-    gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.buffers.color);
-    gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.buffers.uv);
-    gl.enableVertexAttribArray(3);
-    gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 0, 0);
-    if (mesh.indexed) gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer);
-    gl.bindVertexArray(null);
+  function createDepthRenderbuffer(w, h) {
+    var rb = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+    gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+    return rb;
+  }
+
+  function buildShadowFBO() {
+    if (shadowFBO) {
+      gl.deleteFramebuffer(shadowFBO);
+      gl.deleteTexture(shadowTex);
+      gl.deleteRenderbuffer(shadowDepthRB);
+    }
+    shadowTex = createDepthTexture(SHADOW_SIZE);
+    shadowDepthRB = createDepthRenderbuffer(SHADOW_SIZE, SHADOW_SIZE);
+    shadowFBO = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, shadowTex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, shadowDepthRB);
+    var ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (!ok) { shadowEnabled = false; }
+  }
+
+  function buildSceneFBO(w, h) {
+    if (sceneFBO) {
+      gl.deleteFramebuffer(sceneFBO);
+      gl.deleteTexture(sceneTex);
+      gl.deleteRenderbuffer(sceneDepthRB);
+    }
+    sceneW = w; sceneH = h;
+    sceneTex = createColorTexture(w, h);
+    sceneDepthRB = createDepthRenderbuffer(w, h);
+    sceneFBO = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sceneTex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, sceneDepthRB);
+    var ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (!ok) { postEnabled = false; }
+  }
+
+  // ------------------------------------------------------------------
+  // init(canvas) — API spec
+  // ------------------------------------------------------------------
+  function init(c) {
+    M3 = window.SB.Math3;
+    canvas = c;
+    var opts = { antialias: true, alpha: false, depth: true, stencil: false,
+                 preserveDrawingBuffer: false, powerPreference: 'high-performance' };
+    gl = canvas.getContext('webgl2', opts) || canvas.getContext('webgl', opts) ||
+         canvas.getContext('experimental-webgl', opts);
+    if (!gl) {
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('[SB.GL] WebGL tidak tersedia di browser ini.');
+      }
+      return false;
+    }
+    isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') &&
+               (gl instanceof WebGL2RenderingContext);
+
+    // Renderer software (SwiftShader / llvmpipe) tidak kuat menjalankan
+    // shadow pass 1024 + PCF 5-tap: satu frame bisa macet puluhan detik
+    // dan tab headless tidak pernah lanjut (frame 2 tidak pernah tiba).
+    // Di renderer software, matikan shadow & post sejak awal; GPU asli
+    // tetap jalan kualitas penuh. Flag ini juga mengunci setShadowEnabled
+    // / setPostEnabled agar adaptive-perf tidak menyalakannya lagi.
+    try {
+      var dbgInfo = gl.getExtension('WEBGL_debug_renderer_info');
+      var rendererStr = '';
+      if (dbgInfo) {
+        rendererStr = String(gl.getParameter(dbgInfo.UNMASKED_RENDERER_WEBGL) || '');
+      }
+      if (/swiftshader|llvmpipe|softpipe|software|basic render/i.test(rendererStr)) {
+        softwareRenderer = true;
+        shadowEnabled = false;
+        postEnabled = false;
+        if (typeof console !== 'undefined' && console.info) {
+          console.info('[SB.GL] renderer software terdeteksi — shadow & post dimatikan: ' + rendererStr);
+        }
+      }
+    } catch (e) { /* abaikan: lanjut kualitas penuh */ }
+
+    // Kompilasi semua program. FRAG_LIT butuh uniform kamera.
+    var fragLit = FRAG_LIT.replace('precision mediump float;',
+      'precision mediump float;\nuniform vec3 uCamPos;');
+    programs.lit = linkProgram(VERT_LIT, fragLit);
+    programs.depth = linkProgram(VERT_DEPTH, FRAG_DEPTH);
+    programs.sky = linkProgram(VERT_SKY, FRAG_SKY);
+    programs.post = linkProgram(VERT_POST, FRAG_POST);
+    programs.water = linkProgram(VERT_WATER, FRAG_WATER);
+    if (!programs.lit || !programs.depth || !programs.sky ||
+        !programs.post || !programs.water) {
+      return false;
+    }
+
+    gl.enable(gl.DEPTH_TEST);
+    gl.enable(gl.CULL_FACE);
+    gl.cullFace(gl.BACK);
+    gl.frontFace(gl.CCW);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.clearColor(fogColor[0], fogColor[1], fogColor[2], 1.0);
+    gl.clearDepth(1.0);
+
+    buildShadowFBO();
+    resize();
+    updateSunFromTime();
+    return true;
+  }
+
+  // Sinkronkan matahari + fog + hemisphere dengan jam hari ini.
+  function updateSunFromTime() {
+    var d = sunDirFor(timeOfDay);
+    sunDir = d;
+    var night = nightFactor(timeOfDay);
+    var golden = 1 - Math.abs(timeOfDay - 18.33) / 2.2;
+    if (golden < 0) golden = 0; if (golden > 1) golden = 1;
+    // Siang: matahari putih-kuning tinggi. Golden hour: oranye rendah.
+    // Malam: bulan pucat kebiruan, intensitas kecil.
+    if (night >= 0.99) {
+      sunColor = [0.55, 0.62, 0.85];
+      sunIntensity = 0.22;
+      hemiSky = [0.10, 0.12, 0.28];
+      hemiGround = [0.08, 0.07, 0.12];
+      hemiIntensity = 0.35;
+      fogColor = [0.10, 0.10, 0.20];
+    } else if (golden > 0.4) {
+      sunColor = [1.0, 0.60, 0.24];
+      sunIntensity = 1.15 + golden * 0.25;
+      hemiSky = [0.42, 0.55, 0.85];
+      hemiGround = [0.34, 0.20, 0.15];
+      hemiIntensity = 0.55;
+      fogColor = [0.98, 0.62, 0.38];
+    } else {
+      var warm = 1 - night;
+      sunColor = [1.0, 0.85 - 0.25 * (1 - warm), 0.55];
+      sunIntensity = 0.55 + 0.6 * warm;
+      hemiSky = [0.42, 0.58, 0.9];
+      hemiGround = [0.30, 0.26, 0.22];
+      hemiIntensity = 0.6;
+      fogColor = [0.82, 0.85, 0.92];
+    }
+    ambientBoost = 0.06 + night * 0.02;
+  }
+
+  // Sesuaikan ukuran drawing buffer dengan ukuran CSS canvas.
+  function resize() {
+    if (!gl || !canvas) return;
+    var w = canvas.clientWidth || canvas.width || 1280;
+    var h = canvas.clientHeight || canvas.height || 720;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var bw = Math.floor(w * dpr);
+    var bh = Math.floor(h * dpr);
+    if (canvas.width !== bw || canvas.height !== bh) {
+      canvas.width = bw;
+      canvas.height = bh;
+    }
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    if (postEnabled && (sceneW !== canvas.width || sceneH !== canvas.height)) {
+      buildSceneFBO(canvas.width, canvas.height);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // clear(r, g, b) — API spec
+  // ------------------------------------------------------------------
+  function clear(r, g, b) {
+    if (!gl) return;
+    gl.clearColor(r, g, b, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  }
+
+  // ------------------------------------------------------------------
+  // useProgram(name) — API spec
+  // ------------------------------------------------------------------
+  function useProgram(name) {
+    var p = programs[name];
+    if (!p) return false;
+    if (currentProgramName !== name) {
+      gl.useProgram(p.program);
+      currentProgram = p;
+      currentProgramName = name;
+    }
+    return true;
+  }
+
+  // ------------------------------------------------------------------
+  // Mesh: upload data {vertices, normals, colors?, emissive?, indices}
+  // ------------------------------------------------------------------
+  function meshKey(data) {
+    // Kunci murah: jumlah vertex + jumlah index + checksum kasar.
+    var sum = 0;
+    var v = data.vertices || [];
+    var step = Math.max(1, Math.floor(v.length / 64));
+    for (var i = 0; i < v.length; i += step) sum += v[i] * 1000;
+    return 'm' + v.length + '_' + (data.indices ? data.indices.length : 0) +
+           '_' + Math.floor(sum);
   }
 
   function createMesh(data) {
-    const vertexCount = data.positions.length / 3;
-    const mesh = {
-      vertexCount,
-      indexed: !!data.indices,
-      indexCount: data.indices ? data.indices.length : 0,
-      buffers: {
-        position: createBuffer(data.positions, gl.ARRAY_BUFFER),
-        normal: createBuffer(data.normals || new Float32Array(vertexCount * 3), gl.ARRAY_BUFFER),
-        color: createBuffer(data.colors || new Float32Array(vertexCount * 3).fill(1), gl.ARRAY_BUFFER),
-        uv: createBuffer(data.uvs || new Float32Array(vertexCount * 2), gl.ARRAY_BUFFER),
-      },
-      indexBuffer: null,
-      vao: gl.createVertexArray(),
-    };
-    if (data.indices) {
-      const idx = data.indices instanceof Uint32Array || vertexCount > 65535
-        ? new Uint32Array(data.indices) : new Uint16Array(data.indices);
-      mesh.indexBuffer = createBuffer(idx, gl.ELEMENT_ARRAY_BUFFER);
-      mesh.indexType = idx instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+    if (!gl || !data || !data.vertices || !data.indices) return null;
+    var key = meshKey(data);
+    var cached = meshCache[key];
+    if (cached) return cached;
+
+    var vCount = data.vertices.length / 3;
+    var colors = data.colors;
+    if (!colors || colors.length !== vCount * 3) {
+      colors = new Float32Array(vCount * 3);
+      for (var i = 0; i < vCount; i++) {
+        colors[i * 3] = 1; colors[i * 3 + 1] = 1; colors[i * 3 + 2] = 1;
+      }
     }
-    setupMeshAttributes(mesh.vao, mesh);
+    var emissive = data.emissive;
+    if (!emissive || emissive.length !== vCount) {
+      emissive = new Float32Array(vCount);
+    }
+    var normals = data.normals;
+    if (!normals || normals.length !== vCount * 3) {
+      normals = computeNormals(data.vertices, data.indices);
+    }
+
+    var mesh = {
+      key: key,
+      vbo: gl.createBuffer(),
+      nbo: gl.createBuffer(),
+      cbo: gl.createBuffer(),
+      ebo: gl.createBuffer(),
+      ibo: gl.createBuffer(),
+      indexCount: data.indices.length,
+      vertexCount: vCount
+    };
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data.vertices), gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.nbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(normals), gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.cbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colors), gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.ebo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(emissive), gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ibo);
+    var idx = data.indices.length > 65535
+      ? new Uint32Array(data.indices) : new Uint16Array(data.indices);
+    mesh.indexType = data.indices.length > 65535 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+
+    meshCache[key] = mesh;
+    meshCacheOrder.push(key);
+    if (meshCacheOrder.length > MAX_MESH_CACHE) {
+      var old = meshCacheOrder.shift();
+      var om = meshCache[old];
+      if (om) {
+        gl.deleteBuffer(om.vbo); gl.deleteBuffer(om.nbo);
+        gl.deleteBuffer(om.cbo); gl.deleteBuffer(om.ebo);
+        gl.deleteBuffer(om.ibo);
+      }
+      delete meshCache[old];
+    }
+    stats.meshes = meshCacheOrder.length;
     return mesh;
   }
 
-  function createInstancedMesh(baseMesh, maxCount) {
-    const inst = {
-      base: baseMesh,
-      maxCount,
-      count: 0,
-      offsets: new Float32Array(maxCount * 3),
-      scaleRot: new Float32Array(maxCount * 2),
-      colors: new Float32Array(maxCount * 3),
-      vao: gl.createVertexArray(),
-      buffers: {},
-    };
-    inst.buffers.offset = createBuffer(inst.offsets, gl.ARRAY_BUFFER, gl.DYNAMIC_DRAW);
-    inst.buffers.scaleRot = createBuffer(inst.scaleRot, gl.ARRAY_BUFFER, gl.DYNAMIC_DRAW);
-    inst.buffers.color = createBuffer(inst.colors, gl.ARRAY_BUFFER, gl.DYNAMIC_DRAW);
-    gl.bindVertexArray(inst.vao);
-    // atribut dasar (lokasi 0..3) — pinjam buffer mesh dasar
-    gl.bindBuffer(gl.ARRAY_BUFFER, baseMesh.buffers.position);
-    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, baseMesh.buffers.normal);
-    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, baseMesh.buffers.color);
-    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, baseMesh.buffers.uv);
-    gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 0, 0);
-    if (baseMesh.indexed) gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, baseMesh.indexBuffer);
-    // atribut instance (lokasi 4..6) dengan divisor 1
-    gl.bindBuffer(gl.ARRAY_BUFFER, inst.buffers.offset);
-    gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4, 3, gl.FLOAT, false, 0, 0);
-    gl.vertexAttribDivisor(4, 1);
-    gl.bindBuffer(gl.ARRAY_BUFFER, inst.buffers.scaleRot);
-    gl.enableVertexAttribArray(5); gl.vertexAttribPointer(5, 2, gl.FLOAT, false, 0, 0);
-    gl.vertexAttribDivisor(5, 1);
-    gl.bindBuffer(gl.ARRAY_BUFFER, inst.buffers.color);
-    gl.enableVertexAttribArray(6); gl.vertexAttribPointer(6, 3, gl.FLOAT, false, 0, 0);
-    gl.vertexAttribDivisor(6, 1);
-    gl.bindVertexArray(null);
-    return inst;
-  }
-
-  // list: [{offset:{x,y,z}, scale, rotY, color:[r,g,b]}]
-  function setInstances(inst, list) {
-    const n = Math.min(list.length, inst.maxCount);
-    for (let i = 0; i < n; i++) {
-      const it = list[i];
-      const o = it.offset || it.pos || { x: 0, y: 0, z: 0 };
-      inst.offsets[i * 3] = o.x; inst.offsets[i * 3 + 1] = o.y; inst.offsets[i * 3 + 2] = o.z;
-      inst.scaleRot[i * 2] = it.scale !== undefined ? it.scale : 1;
-      inst.scaleRot[i * 2 + 1] = it.rotY || it.yaw || 0;
-      const col = toRGB(it.color, [1, 1, 1]);
-      inst.colors[i * 3] = col[0]; inst.colors[i * 3 + 1] = col[1]; inst.colors[i * 3 + 2] = col[2];
+  // Hitung normal per-vertex dari segitiga (rata-rata face normal).
+  function computeNormals(vertices, indices) {
+    var vCount = vertices.length / 3;
+    var n = new Float32Array(vCount * 3);
+    for (var i = 0; i + 2 < indices.length; i += 3) {
+      var a = indices[i] * 3, b = indices[i + 1] * 3, c = indices[i + 2] * 3;
+      var abx = vertices[b] - vertices[a];
+      var aby = vertices[b + 1] - vertices[a + 1];
+      var abz = vertices[b + 2] - vertices[a + 2];
+      var acx = vertices[c] - vertices[a];
+      var acy = vertices[c + 1] - vertices[a + 1];
+      var acz = vertices[c + 2] - vertices[a + 2];
+      var nx = aby * acz - abz * acy;
+      var ny = abz * acx - abx * acz;
+      var nz = abx * acy - aby * acx;
+      var len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+      nx /= len; ny /= len; nz /= len;
+      n[a] += nx; n[a + 1] += ny; n[a + 2] += nz;
+      n[b] += nx; n[b + 1] += ny; n[b + 2] += nz;
+      n[c] += nx; n[c + 1] += ny; n[c + 2] += nz;
     }
-    inst.count = n;
-    gl.bindBuffer(gl.ARRAY_BUFFER, inst.buffers.offset);
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, inst.offsets.subarray(0, n * 3));
-    gl.bindBuffer(gl.ARRAY_BUFFER, inst.buffers.scaleRot);
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, inst.scaleRot.subarray(0, n * 2));
-    gl.bindBuffer(gl.ARRAY_BUFFER, inst.buffers.color);
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, inst.colors.subarray(0, n * 3));
+    for (var j = 0; j < vCount; j++) {
+      var x = n[j * 3], y = n[j * 3 + 1], z = n[j * 3 + 2];
+      var l = Math.sqrt(x * x + y * y + z * z) || 1;
+      n[j * 3] = x / l; n[j * 3 + 1] = y / l; n[j * 3 + 2] = z / l;
+    }
     return n;
   }
 
-  // --- state renderer ---
-  const state = {
-    view: M.m4Identity(),
-    proj: M.m4Identity(),
-    camPos: { x: 0, y: 5, z: 10 },
-    env: null,
-    lightSpace: M.m4Identity(),
-    lightView: M.m4Identity(),
-    lightProj: M.m4Identity(),
-    shadowPass: false,
-    shadowsEnabled: true,
-    width: 0,
-    height: 0,
-  };
-
-  const IDENTITY = M.m4Identity();
-  const WHITE = [1, 1, 1];
-
-  function applyLitUniforms(U, model, material, useShadow) {
-    const mat = material || {};
-    gl.uniformMatrix4fv(U.uProj, false, state.proj);
-    gl.uniformMatrix4fv(U.uView, false, state.view);
-    gl.uniformMatrix4fv(U.uModel, false, model || IDENTITY);
-    gl.uniformMatrix4fv(U.uLightSpace, false, state.lightSpace);
-    const env = state.env || {};
-    gl.uniform3fv(U.uSunDir, toRGB(env.sunDir || [0.3, -0.8, 0.2]));
-    gl.uniform3fv(U.uSunColor, toRGB(env.sunColor || [1, 0.6, 0.35]));
-    gl.uniform1f(U.uSunIntensity, env.sunIntensity !== undefined ? env.sunIntensity : 1.1);
-    gl.uniform3fv(U.uSkyColor, toRGB(env.skyColor || [0.5, 0.4, 0.7]));
-    gl.uniform3fv(U.uGroundColor, toRGB(env.groundColor || [0.85, 0.5, 0.3]));
-    gl.uniform3fv(U.uFogColor, toRGB(env.fogColor || [0.95, 0.55, 0.45]));
-    gl.uniform2f(U.uFogRange, env.fogNear !== undefined ? env.fogNear : 120, env.fogFar !== undefined ? env.fogFar : 520);
-    gl.uniform3f(U.uCamPos, state.camPos.x, state.camPos.y, state.camPos.z);
-    gl.uniform3fv(U.uEmissive, toRGB(mat.emissive, [0, 0, 0]));
-    gl.uniform1f(U.uEmissiveStrength, mat.emissiveStrength !== undefined ? mat.emissiveStrength : 0);
-    gl.uniform1f(U.uSpecular, mat.specular !== undefined ? mat.specular : 0.25);
-    gl.uniform1f(U.uShininess, mat.shininess !== undefined ? mat.shininess : 24);
-    gl.uniform1f(U.uWetness, env.wetness !== undefined ? env.wetness : 0);
-    gl.uniform1f(U.uAlpha, mat.alpha !== undefined ? mat.alpha : 1);
-    gl.uniform1f(U.uUseShadow, useShadow && state.shadowsEnabled ? 1 : 0);
-    if (mat.texture) {
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, mat.texture);
-      gl.uniform1i(U.uTex, 1);
-      gl.uniform1f(U.uUseTex, 1);
-    } else {
-      gl.uniform1f(U.uUseTex, 0);
+  // Ikat attribute mesh ke program aktif.
+  function bindMeshAttribs(prog, mesh) {
+    var aPos = prog.attribs.aPos;
+    if (aPos !== undefined && aPos >= 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vbo);
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
     }
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, shadowTex);
-    gl.uniform1i(U.uShadowMap, 0);
+    var aNormal = prog.attribs.aNormal;
+    if (aNormal !== undefined && aNormal >= 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.nbo);
+      gl.enableVertexAttribArray(aNormal);
+      gl.vertexAttribPointer(aNormal, 3, gl.FLOAT, false, 0, 0);
+    }
+    var aColor = prog.attribs.aColor;
+    if (aColor !== undefined && aColor >= 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.cbo);
+      gl.enableVertexAttribArray(aColor);
+      gl.vertexAttribPointer(aColor, 3, gl.FLOAT, false, 0, 0);
+    }
+    var aEm = prog.attribs.aEmissive;
+    if (aEm !== undefined && aEm >= 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.ebo);
+      gl.enableVertexAttribArray(aEm);
+      gl.vertexAttribPointer(aEm, 1, gl.FLOAT, false, 0, 0);
+    }
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ibo);
   }
 
-  function applyFlatUniforms(U, model, material) {
-    const mat = material || {};
-    const env = state.env || {};
-    gl.uniformMatrix4fv(U.uProj, false, state.proj);
-    gl.uniformMatrix4fv(U.uView, false, state.view);
-    gl.uniformMatrix4fv(U.uModel, false, model || IDENTITY);
-    gl.uniform3fv(U.uFogColor, toRGB(env.fogColor || [0.95, 0.55, 0.45]));
-    gl.uniform2f(U.uFogRange, env.fogNear !== undefined ? env.fogNear : 120, env.fogFar !== undefined ? env.fogFar : 520);
-    gl.uniform3f(U.uCamPos, state.camPos.x, state.camPos.y, state.camPos.z);
-    gl.uniform1f(U.uUseFog, mat.useFog ? 1 : 0);
-    gl.uniform1f(U.uAlpha, mat.alpha !== undefined ? mat.alpha : 1);
-    gl.uniform3fv(U.uTint, toRGB(mat.tint, WHITE));
-    if (mat.texture) {
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, mat.texture);
-      gl.uniform1i(U.uTex, 1);
-      gl.uniform1f(U.uUseTex, 1);
-    } else {
-      gl.uniform1f(U.uUseTex, 0);
-    }
-  }
-
-  function setupBlend(material) {
-    const mat = material || {};
-    const blend = mat.blend || (mat.alpha !== undefined && mat.alpha < 1);
-    if (blend) {
-      gl.enable(gl.BLEND);
-      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    } else {
-      gl.disable(gl.BLEND);
-    }
-    gl.depthMask(mat.depthWrite !== undefined ? mat.depthWrite : true);
-  }
-
-  function drawIndexed(mesh, count) {
-    if (mesh.indexed) {
-      if (count !== undefined) gl.drawElementsInstanced(gl.TRIANGLES, mesh.indexCount, mesh.indexType, 0, count);
-      else gl.drawElements(gl.TRIANGLES, mesh.indexCount, mesh.indexType, 0);
-    } else {
-      if (count !== undefined) gl.drawArraysInstanced(gl.TRIANGLES, 0, mesh.vertexCount, count);
-      else gl.drawArrays(gl.TRIANGLES, 0, mesh.vertexCount);
-    }
-  }
-
-  function drawMesh(mesh, model, material) {
-    if (!mesh) return;
-    const mat = material || {};
-    if (state.shadowPass) {
-      if (mat.noShadow) return; // transparan / emissive-only tidak melempar bayangan
-      gl.useProgram(progDepth);
-      gl.uniformMatrix4fv(U_DEPTH.uLightProj, false, state.lightProj);
-      gl.uniformMatrix4fv(U_DEPTH.uLightView, false, state.lightView);
-      gl.uniformMatrix4fv(U_DEPTH.uModel, false, model || IDENTITY);
-      gl.bindVertexArray(mesh.vao);
-      drawIndexed(mesh);
-      gl.bindVertexArray(null);
+  // ------------------------------------------------------------------
+  // drawMesh(mesh, matrix, color) — API spec
+  // mesh: data mentah {vertices, normals, indices} ATAU mesh GL hasil
+  // createMesh. matrix: Float32Array(16) model. color: [r,g,b] tint
+  // atau hex "#rrggbb". Saat shadow pass aktif, digambar ke depth map.
+  // ------------------------------------------------------------------
+  function drawMesh(mesh, matrix, color) {
+    if (!gl || !mesh) return;
+    var m = matrix || M3.mat4Identity();
+    if (inShadowPass) {
+      var dp = programs.depth;
+      if (!dp) return;
+      useProgram('depth');
+      setUniformMat4(dp, 'uModel', m);
+      // lightViewProj null bila shadow pass tidak jalan (bayangan mati) —
+      // jangan upload null: uniformMatrix4fv(null) melempar dan seluruh
+      // draw modul gagal (dunia jadi tak terlihat sama sekali).
+      if (lightViewProj) setUniformMat4(dp, 'uLightVP', lightViewProj);
+      var gm = mesh.key ? mesh : createMesh(mesh);
+      if (!gm) return;
+      bindMeshAttribs(dp, gm);
+      gl.drawElements(gl.TRIANGLES, gm.indexCount, gm.indexType, 0);
+      stats.shadowCalls++;
+      stats.triangles += gm.indexCount / 3;
       return;
     }
-    setupBlend(mat);
-    gl.useProgram(progLit);
-    applyLitUniforms(U_LIT, model, mat, mat.castShadow !== false);
-    gl.bindVertexArray(mesh.vao);
-    drawIndexed(mesh);
-    gl.bindVertexArray(null);
-    gl.disable(gl.BLEND);
-    gl.depthMask(true);
-  }
 
-  function drawInstanced(inst, count, model, material) {
-    if (!inst || inst.count === 0) return;
-    const n = Math.min(count !== undefined ? count : inst.count, inst.count);
-    const mat = material || {};
-    if (state.shadowPass) {
-      if (mat.noShadow) return;
-      gl.useProgram(progDepthI);
-      gl.uniformMatrix4fv(U_DEPTHI.uLightProj, false, state.lightProj);
-      gl.uniformMatrix4fv(U_DEPTHI.uLightView, false, state.lightView);
-      gl.uniformMatrix4fv(U_DEPTHI.uModel, false, model || IDENTITY);
-      gl.bindVertexArray(inst.vao);
-      drawIndexed(inst.base, n);
-      gl.bindVertexArray(null);
-      return;
+    var progName = currentProgramName === 'water' ? 'water' : 'lit';
+    var prog = programs[progName];
+    if (!prog) return;
+    useProgram(progName);
+
+    var gm2 = mesh.key ? mesh : createMesh(mesh);
+    if (!gm2) return;
+
+    var tint = [1, 1, 1];
+    if (color) {
+      if (typeof color === 'string') tint = M3.hexToRgb(color);
+      else if (Array.isArray(color) && color.length >= 3) tint = [color[0], color[1], color[2]];
     }
-    setupBlend(mat);
-    gl.useProgram(progLitI);
-    applyLitUniforms(U_LITI, model, mat, mat.castShadow !== false);
-    gl.bindVertexArray(inst.vao);
-    drawIndexed(inst.base, n);
-    gl.bindVertexArray(null);
-    gl.disable(gl.BLEND);
-    gl.depthMask(true);
-  }
 
-  function drawFlat(mesh, model, material) {
-    if (!mesh || state.shadowPass) return; // flat = transparan/dekor, tidak ikut shadow pass
-    const mat = material || {};
-    setupBlend(mat);
-    gl.useProgram(progFlat);
-    applyFlatUniforms(U_FLAT, model, mat);
-    gl.bindVertexArray(mesh.vao);
-    drawIndexed(mesh);
-    gl.bindVertexArray(null);
-    gl.disable(gl.BLEND);
-    gl.depthMask(true);
-  }
-
-  function drawFlatInstanced(inst, count, model, material) {
-    if (!inst || inst.count === 0 || state.shadowPass) return;
-    const n = Math.min(count !== undefined ? count : inst.count, inst.count);
-    const mat = material || {};
-    setupBlend(mat);
-    gl.useProgram(progFlatI);
-    applyFlatUniforms(U_FLATI, model, mat);
-    gl.bindVertexArray(inst.vao);
-    drawIndexed(inst.base, n);
-    gl.bindVertexArray(null);
-    gl.disable(gl.BLEND);
-    gl.depthMask(true);
-  }
-
-  // --- skybox gradien fullscreen ---
-  const skyVao = gl.createVertexArray();
-  const skyVbo = createBuffer(new Float32Array([-1, -1, 3, -1, -1, 3]), gl.ARRAY_BUFFER);
-  gl.bindVertexArray(skyVao);
-  gl.bindBuffer(gl.ARRAY_BUFFER, skyVbo);
-  gl.enableVertexAttribArray(0);
-  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-  gl.bindVertexArray(null);
-
-  function drawSky(env) {
-    const vp = M.m4Multiply(state.proj, state.view);
-    const inv = M.m4Invert(vp) || IDENTITY;
-    gl.disable(gl.DEPTH_TEST);
-    gl.depthMask(false);
-    gl.useProgram(progSky);
-    gl.uniformMatrix4fv(U_SKY.uInvViewProj, false, inv);
-    gl.uniform3fv(U_SKY.uHorizon, toRGB(env.horizon || [1, 0.55, 0.3]));
-    gl.uniform3fv(U_SKY.uMid, toRGB(env.mid || [0.75, 0.4, 0.55]));
-    gl.uniform3fv(U_SKY.uZenith, toRGB(env.zenith || [0.35, 0.25, 0.6]));
-    gl.uniform3fv(U_SKY.uSunDir, toRGB(env.sunDir || [0.3, -0.8, 0.2]));
-    gl.uniform3fv(U_SKY.uSunColor, toRGB(env.sunColor || [1, 0.6, 0.35]));
-    gl.uniform1f(U_SKY.uNight, env.night !== undefined ? env.night : 0);
-    gl.uniform1f(U_SKY.uTime, env.time !== undefined ? env.time : 0);
-    gl.bindVertexArray(skyVao);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    gl.bindVertexArray(null);
-    gl.depthMask(true);
-    gl.enable(gl.DEPTH_TEST);
-  }
-
-  // --- mesh sekali pakai untuk efek ---
-  const quadMesh = createMesh(geoQuad(1, 1, [1, 1, 1]));
-  const rainQuad = createMesh(geoQuad(0.08, 1.4, [1, 1, 1]));
-  const rainInst = createInstancedMesh(rainQuad, 600);
-
-  // Awan: 14 gumpalan, posisi tetap (hash), melayang perlahan.
-  const CLOUDS = [];
-  for (let i = 0; i < 14; i++) {
-    CLOUDS.push({
-      x: (hash1(i * 3 + 1) - 0.5) * 1100,
-      y: 70 + hash1(i * 7 + 2) * 55,
-      z: (hash1(i * 5 + 3) - 0.5) * 1100,
-      size: 45 + hash1(i * 11 + 4) * 55,
-      speed: 0.6 + hash1(i * 13 + 5) * 1.1,
-      tint: 0.75 + hash1(i * 17 + 6) * 0.25,
-    });
-  }
-
-  function drawClouds(env, time) {
-    if (state.shadowPass) return;
-    const night = env.night || 0;
-    const tintBase = [
-      M.lerp(1, 0.25, night),
-      M.lerp(0.82, 0.28, night),
-      M.lerp(0.85, 0.45, night),
-    ];
-    for (const c of CLOUDS) {
-      // melayang ke +X, wrap di sekitar kamera
-      let x = c.x + time * c.speed;
-      const rel = x - state.camPos.x;
-      x = state.camPos.x + ((((rel + 550) % 1100) + 1100) % 1100 - 550);
-      const dx = state.camPos.x - x;
-      const dz = state.camPos.z - c.z;
-      const yaw = Math.atan2(dx, dz);
-      const tint = [tintBase[0] * c.tint, tintBase[1] * c.tint, tintBase[2] * c.tint];
-      // 2 lapis per awan: gumpalan utama + gumpalan kecil di samping
-      for (let layer = 0; layer < 2; layer++) {
-        const lx = layer === 0 ? 0 : c.size * 0.32;
-        const ly = layer === 0 ? 0 : c.size * 0.08;
-        const ls = layer === 0 ? 1 : 0.62;
-        const model = M.m4FromTRS({ x: x + lx, y: c.y + ly, z: c.z }, yaw, { x: c.size * ls, y: c.size * 0.42 * ls, z: 1 });
-        drawFlat(quadMesh, model, { texture: cloudTex, alpha: 0.85, tint, blend: true, depthWrite: false, useFog: false });
+    setUniformMat4(prog, 'uModel', m);
+    setUniformMat4(prog, 'uView', viewMatrix);
+    setUniformMat4(prog, 'uProj', projMatrix);
+    if (progName === 'lit') {
+      // uLightVP hanya dipakai shader bila uUseShadow=1; bila bayangan
+      // mati, lightViewProj masih null (beginShadow tidak jalan) — upload
+      // null akan melempar dan menggagalkan seluruh draw modul ini.
+      if (lightViewProj) setUniformMat4(prog, 'uLightVP', lightViewProj);
+      setUniform3f(prog, 'uSunDir', [sunDir.x, sunDir.y, sunDir.z]);
+      setUniform3f(prog, 'uSunColor', sunColor);
+      setUniform1f(prog, 'uSunIntensity', sunIntensity);
+      setUniform3f(prog, 'uHemiSky', hemiSky);
+      setUniform3f(prog, 'uHemiGround', hemiGround);
+      setUniform1f(prog, 'uHemiIntensity', hemiIntensity);
+      setUniform3f(prog, 'uTint', tint);
+      setUniform3f(prog, 'uFogColor', fogColor);
+      setUniform1f(prog, 'uFogNear', fogNear);
+      setUniform1f(prog, 'uFogFar', fogFar);
+      setUniform1f(prog, 'uUseShadow', shadowEnabled ? 1 : 0);
+      setUniform1f(prog, 'uShadowBias', shadowBias);
+      setUniform1f(prog, 'uNightGlow', nightFactor(timeOfDay));
+      setUniform3f(prog, 'uCamPos', [cameraPos.x, cameraPos.y, cameraPos.z]);
+      setUniform1f(prog, 'uTime', SB.state ? SB.state.time : 0);
+      var su = getUniform(prog, 'uShadowMap');
+      if (su) {
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+        gl.uniform1i(su, 0);
       }
+    } else {
+      // water
+      setUniform3f(prog, 'uSunDir', [sunDir.x, sunDir.y, sunDir.z]);
+      setUniform3f(prog, 'uSunColor', sunColor);
+      setUniform3f(prog, 'uHemiSky', hemiSky);
+      setUniform3f(prog, 'uFogColor', fogColor);
+      setUniform1f(prog, 'uFogNear', fogNear);
+      setUniform1f(prog, 'uFogFar', fogFar);
+      setUniform3f(prog, 'uCamPos', [cameraPos.x, cameraPos.y, cameraPos.z]);
+      setUniform1f(prog, 'uTime', SB.state ? SB.state.time : 0);
     }
+
+    bindMeshAttribs(prog, gm2);
+    gl.drawElements(gl.TRIANGLES, gm2.indexCount, gm2.indexType, 0);
+    stats.drawCalls++;
+    stats.triangles += gm2.indexCount / 3;
   }
 
-  // Blob shadow murah: lingkaran gelap transparan di bawah pohon/palma.
-  function drawBlobShadow(x, y, z, radius, alpha = 0.35) {
-    if (state.shadowPass) return;
-    const model = M.m4FromTRS({ x, y: y + 0.02, z }, 0, { x: radius * 2, y: 1, z: radius * 2 });
-    // putar quad vertikal menjadi datar: rotasi -90 derajat di X
-    const flat = M.m4Multiply(model, M.m4RotateX(-Math.PI / 2));
-    drawFlat(quadMesh, flat, { texture: blobTex, alpha, tint: [0, 0, 0], blend: true, depthWrite: false, useFog: false });
+  // Gambar mesh dengan program air (dipakai SB.Water).
+  function drawWaterMesh(mesh, matrix, color) {
+    var prev = currentProgramName;
+    useProgram('water');
+    drawMesh(mesh, matrix, color);
+    if (prev && prev !== 'water') useProgram(prev);
   }
 
-  // Genangan reflektif murah: bidang semi-transparan warna langit.
-  function drawPuddle(x, y, z, w, d, env) {
-    if (state.shadowPass) return;
-    const horizon = toRGB(env.horizon || [1, 0.55, 0.3]);
-    const tint = [
-      M.lerp(horizon[0], 0.35, 0.45),
-      M.lerp(horizon[1], 0.4, 0.45),
-      M.lerp(horizon[2], 0.65, 0.45),
-    ];
-    const model = M.m4Multiply(
-      M.m4FromTRS({ x, y: y + 0.03, z }, 0, { x: w, y: 1, z: d }),
-      M.m4RotateX(-Math.PI / 2)
-    );
-    drawFlat(quadMesh, model, { alpha: 0.5, tint, blend: true, depthWrite: false, useFog: true });
+  // ------------------------------------------------------------------
+  // Shadow pass — API spec: beginShadow() / endShadow()
+  // ------------------------------------------------------------------
+  function updateLightMatrices(focus) {
+    var f = focus || cameraPos;
+    var lightPos = {
+      x: f.x + sunDir.x * 160,
+      y: f.y + sunDir.y * 160 + 60,
+      z: f.z + sunDir.z * 160
+    };
+    // Matahari rendah -> bayangan panjang: naikkan posisi cahaya
+    // sedikit agar ortho tetap mencakup kota di sekitar kamera.
+    lightView = M3.mat4LookAt(lightPos, { x: f.x, y: 0, z: f.z }, { x: 0, y: 1, z: 0 });
+    lightProj = M3.mat4Ortho(-shadowBounds, shadowBounds, -shadowBounds,
+      shadowBounds, 1, 420);
+    lightViewProj = M3.mat4Multiply(lightProj, lightView);
   }
 
-  // Hujan lokal: streak instanced di sekitar kamera, jatuh dengan waktu.
-  function drawRain(center, radius, count, time, strength) {
-    if (state.shadowPass || strength <= 0.01) return;
-    const n = Math.min(count, 600);
-    const list = [];
-    for (let i = 0; i < n; i++) {
-      const rx = (hash1(i * 3 + 11) - 0.5) * 2 * radius;
-      const rz = (hash1(i * 5 + 23) - 0.5) * 2 * radius;
-      const fall = 24;
-      const y0 = hash1(i * 7 + 37) * 26;
-      const y = ((y0 - time * fall) % 26 + 26) % 26;
-      list.push({
-        offset: { x: center.x + rx, y: center.y + y, z: center.z + rz },
-        scale: 0.8 + hash1(i * 11 + 41) * 0.5,
-        rotY: 0.12,
-        color: [0.75, 0.82, 1],
-      });
-    }
-    setInstances(rainInst, list);
-    drawFlatInstanced(rainInst, n, IDENTITY, {
-      texture: streakTex, alpha: 0.32 * strength, tint: [1, 1, 1],
-      blend: true, depthWrite: false, useFog: false,
-    });
-  }
-
-  // --- shadow pass ---
-  function startShadow(sunDir, target, orthoSize = 220, near = 1, far = 600) {
-    const dir = M.v3Normalize(M.toVec3(sunDir));
-    const tgt = M.toVec3(target);
-    const lightPos = { x: tgt.x - dir.x * 260, y: tgt.y - dir.y * 260, z: tgt.z - dir.z * 260 };
-    state.lightView = M.m4LookAt(lightPos, tgt, { x: 0, y: 1, z: 0 });
-    state.lightProj = M.m4Ortho(-orthoSize, orthoSize, -orthoSize, orthoSize, near, far);
-    state.lightSpace = M.m4Multiply(state.lightProj, state.lightView);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFbo);
+  function beginShadow() {
+    if (!gl || !shadowEnabled || !shadowFBO) return false;
+    updateLightMatrices(cameraPos);
+    inShadowPass = true;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO);
     gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE);
-    gl.clear(gl.DEPTH_BUFFER_BIT);
-    gl.enable(gl.DEPTH_TEST);
-    gl.disable(gl.BLEND);
-    state.shadowPass = true;
+    gl.clearColor(1, 1, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.cullFace(gl.FRONT); // kurangi acne bayangan
+    return true;
   }
 
   function endShadow() {
-    state.shadowPass = false;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, state.width, state.height);
+    if (!gl) return;
+    inShadowPass = false;
+    gl.cullFace(gl.BACK);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, inScenePass ? sceneFBO : null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
   }
 
-  // --- frame ---
-  function beginFrame(camera, env) {
-    state.view = camera.view;
-    state.proj = camera.proj;
-    state.camPos = camera.position || state.camPos;
-    state.env = env;
-    gl.viewport(0, 0, state.width, state.height);
-    const fog = toRGB(env.fogColor || [0.95, 0.55, 0.45]);
-    gl.clearColor(fog[0], fog[1], fog[2], 1);
+  // ------------------------------------------------------------------
+  // Frame: beginFrame(view, proj, eye) / endFrame() — post vignette
+  // ------------------------------------------------------------------
+  function beginFrame(view, proj, eye) {
+    if (!gl) return;
+    resize();
+    viewMatrix = view;
+    projMatrix = proj;
+    viewProj = M3.mat4Multiply(proj, view);
+    if (eye) cameraPos = { x: eye.x, y: eye.y, z: eye.z };
+    stats.drawCalls = 0;
+    stats.triangles = 0;
+    stats.shadowCalls = 0;
+
+    if (postEnabled && sceneFBO) {
+      inScenePass = true;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+    } else {
+      inScenePass = false;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
+    var sky = skyStopsFor(timeOfDay);
+    gl.clearColor(sky.mid[0], sky.mid[1], sky.mid[2], 1.0);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    gl.enable(gl.DEPTH_TEST);
-    gl.depthFunc(gl.LESS);
-    gl.enable(gl.CULL_FACE);
-    gl.cullFace(gl.BACK);
-    drawSky(env);
+    drawSky();
   }
 
   function endFrame() {
-    // Penanda akhir frame; state dibersihkan untuk frame berikut.
-    gl.disable(gl.BLEND);
+    if (!gl) return;
+    if (postEnabled && sceneFBO && inScenePass) {
+      inScenePass = false;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.disable(gl.DEPTH_TEST);
+      gl.disable(gl.CULL_FACE);
+      useProgram('post');
+      var prog = programs.post;
+      var su = getUniform(prog, 'uScene');
+      if (su) {
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+        gl.uniform1i(su, 0);
+      }
+      setUniform1f(prog, 'uVignette', vignetteStrength);
+      setUniform1f(prog, 'uSoftness', vignetteSoftness);
+      setUniform1f(prog, 'uExposure', exposure);
+      setUniform1f(prog, 'uTime', SB.state ? SB.state.time : 0);
+      drawFullscreenQuad(prog);
+      gl.enable(gl.DEPTH_TEST);
+      gl.enable(gl.CULL_FACE);
+    }
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    currentProgramName = '';
+    currentProgram = null;
+  }
+
+  // Quad fullscreen: segitiga besar (3 vertex, tanpa buffer indeks).
+  var quadVBO = null;
+  function drawFullscreenQuad(prog) {
+    if (!quadVBO) {
+      quadVBO = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+      gl.bufferData(gl.ARRAY_BUFFER,
+        new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    }
+    var aPos = prog.attribs.aPos;
+    if (aPos !== undefined && aPos >= 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+    }
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  }
+
+  // Langit gradien golden hour + matahari + bintang.
+  function drawSky() {
+    var prog = programs.sky;
+    if (!prog) return;
+    useProgram('sky');
+    gl.disable(gl.DEPTH_TEST);
+    gl.depthMask(false);
+    var sky = skyStopsFor(timeOfDay);
+    setUniform3f(prog, 'uTop', sky.top);
+    setUniform3f(prog, 'uMid', sky.mid);
+    setUniform3f(prog, 'uLow', sky.low);
+    setUniform3f(prog, 'uSunColor', sunColor);
+    setUniform1f(prog, 'uTime', SB.state ? SB.state.time : 0);
+    setUniform1f(prog, 'uStars', nightFactor(timeOfDay));
+    // Proyeksikan arah matahari ke view space (x, y saja).
+    var sd = M3.mat4TransformDir(viewMatrix, sunDir);
+    setUniform3f(prog, 'uSunDirView', [sd.x, sd.y, sd.z]);
+    drawFullscreenQuad(prog);
     gl.depthMask(true);
+    gl.enable(gl.DEPTH_TEST);
   }
 
-  function resize(width, height) {
-    state.width = width;
-    state.height = height;
-    canvas.width = width;
-    canvas.height = height;
+  // ------------------------------------------------------------------
+  // Setter API spec: setSun(dir, color), setFog(color, near, far)
+  // ------------------------------------------------------------------
+  function setSun(dir, color) {
+    if (dir) {
+      var d = M3.vec3From(dir);
+      if (M3.lengthSq(d) > 1e-8) sunDir = M3.normalize(d);
+    }
+    if (color) {
+      if (typeof color === 'string') sunColor = M3.hexToRgb(color);
+      else if (Array.isArray(color)) sunColor = [color[0], color[1], color[2]];
+    }
   }
 
-  function setShadowsEnabled(on) {
-    state.shadowsEnabled = !!on;
+  function setSunIntensity(v) {
+    sunIntensity = Math.max(0, v);
   }
 
-  return {
-    gl,
-    canvas,
-    version: VERSION,
-    get shadowPass() { return state.shadowPass; },
-    get width() { return state.width; },
-    get height() { return state.height; },
-    createMesh,
-    createInstancedMesh,
-    setInstances,
-    createCanvasTexture: canvasTexture,
-    textures: { cloud: cloudTex, blob: blobTex, streak: streakTex },
-    drawMesh,
-    drawInstanced,
-    drawFlat,
-    drawFlatInstanced,
-    drawSky,
-    drawClouds,
-    drawBlobShadow,
-    drawPuddle,
-    drawRain,
-    startShadow,
-    endShadow,
-    beginFrame,
-    endFrame,
-    resize,
-    setShadowsEnabled,
-    identity: IDENTITY,
+  function setFog(color, near, far) {
+    if (color) {
+      if (typeof color === 'string') fogColor = M3.hexToRgb(color);
+      else if (Array.isArray(color)) fogColor = [color[0], color[1], color[2]];
+    }
+    if (typeof near === 'number') fogNear = near;
+    if (typeof far === 'number') fogFar = far;
+  }
+
+  function setTimeOfDay(h) {
+    timeOfDay = ((h % 24) + 24) % 24;
+    updateSunFromTime();
+  }
+
+  function setVignette(strength, softness) {
+    if (typeof strength === 'number') vignetteStrength = strength;
+    if (typeof softness === 'number') vignetteSoftness = softness;
+  }
+
+  function setExposure(v) {
+    if (typeof v === 'number') exposure = v;
+  }
+
+  // Di renderer software, shadow/post terkunci mati (lihat init):
+  // adaptive-perf tidak boleh menyalakannya lagi.
+  function setShadowEnabled(v) { shadowEnabled = softwareRenderer ? false : !!v; }
+  function setPostEnabled(v) { postEnabled = softwareRenderer ? false : !!v; }
+  function setShadowBounds(v) {
+    if (typeof v === 'number' && v > 10) shadowBounds = v;
+  }
+
+  // Proyeksi titik dunia ke layar (0..1). Berguna untuk HUD marker.
+  function projectToScreen(p) {
+    if (!viewProj) return null;
+    var clip = M3.mat4TransformPoint(viewProj, p);
+    return { x: clip.x * 0.5 + 0.5, y: 0.5 - clip.y * 0.5, z: clip.z, behind: clip.z > 1 || clip.z < -1 };
+  }
+
+  function getStats() {
+    return {
+      drawCalls: stats.drawCalls,
+      triangles: stats.triangles,
+      meshes: stats.meshes,
+      shadowCalls: stats.shadowCalls,
+      webgl2: isWebGL2,
+      width: canvas ? canvas.width : 0,
+      height: canvas ? canvas.height : 0
+    };
+  }
+
+  function getContext() { return gl; }
+  function getCanvas() { return canvas; }
+
+  // ------------------------------------------------------------------
+  // Ekspor namespace
+  // ------------------------------------------------------------------
+  window.SB.GL = {
+    // API spec
+    init: init,
+    clear: clear,
+    useProgram: useProgram,
+    drawMesh: drawMesh,
+    setSun: setSun,
+    setFog: setFog,
+    beginShadow: beginShadow,
+    endShadow: endShadow,
+    // Frame & utilitas
+    beginFrame: beginFrame,
+    endFrame: endFrame,
+    drawSky: drawSky,
+    drawWaterMesh: drawWaterMesh,
+    createMesh: createMesh,
+    computeNormals: computeNormals,
+    resize: resize,
+    setTimeOfDay: setTimeOfDay,
+    setSunIntensity: setSunIntensity,
+    setVignette: setVignette,
+    setExposure: setExposure,
+    setShadowEnabled: setShadowEnabled,
+    setPostEnabled: setPostEnabled,
+    setShadowBounds: setShadowBounds,
+    updateSunFromTime: updateSunFromTime,
+    projectToScreen: projectToScreen,
+    skyStopsFor: skyStopsFor,
+    nightFactor: nightFactor,
+    sunDirFor: sunDirFor,
+    getStats: getStats,
+    getContext: getContext,
+    getCanvas: getCanvas,
+    get softwareRenderer() { return softwareRenderer; },
+    get timeOfDay() { return timeOfDay; },
+    get sunDir() { return sunDir; },
+    get sunColor() { return sunColor; },
+    get fogColor() { return fogColor; }
   };
-}
+})();

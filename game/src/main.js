@@ -1,471 +1,475 @@
-// main.js — Sunset Bay v11 (Builder B: game core + rendering)
-// Entry point game: init WebGL, muat semua modul (dinamis + guarded),
-// game loop, input keyboard/mouse/sentuh, resize, pause, dan
-// save/load localStorage (key sunset-bay-save-v1) dengan Continue.
-//
-// Modul lain (city, player, vehicles, water, audio, hud, jobs, meshes,
-// rng, shots) dimuat dengan dynamic import + try/catch: bila satu modul
-// belum ada atau gagal, game tetap jalan dengan fallback prosedural
-// dari game.js. JANGAN jadikan import mereka statis — satu file rusak
-// tidak boleh mematikan seluruh game.
+window.SB = window.SB || {};
+// main.js — Sunset Bay v12 (Builder B: graphics engine)
+// Boot + game loop + input. Satu-satunya tugas file ini:
+//   1. init canvas & panggil SB.Game.init()
+//   2. requestAnimationFrame dengan dt ter-clamp
+//   3. kumpulkan input keyboard/mouse/touch -> SB.input
+//   4. panggil SB.Game.frame(dt) tiap frame
+// Logika game TIDAK ada di sini — semuanya di SB.Game & modul lain.
+(function () {
+  'use strict';
 
-import { createRenderer } from './gl.js';
-import { Game, SAVE_KEY } from './game.js';
-import * as math3 from './math3.js';
-
-export const VERSION = '11.0.0';
-
-// Modul yang diharapkan ada di game/src/ (ditulis builder lain).
-// Urutan tidak mengikat — semuanya opsional dan guarded.
-const MODULE_NAMES = ['city', 'player', 'vehicles', 'water', 'audio', 'hud', 'jobs', 'meshes', 'rng', 'shots'];
-
-const $ = (id) => document.getElementById(id);
-
-function collectDom() {
-  return {
-    hud: $('hud'),
-    toast: $('toast'),
-    hint: $('hint'),
-    missionOverlay: $('mission-overlay'),
-    missionTitle: $('mission-title'),
-    missionDesc: $('mission-desc'),
-    missionProgress: $('mission-progress'),
-    hpFill: $('hp-fill'),
-    staminaFill: $('stamina-fill'),
-    moneyText: $('money-text'),
-    wantedStars: $('wanted-stars'),
-    weaponText: $('weapon-text'),
-    clockText: $('clock-text'),
-    radioText: $('radio-text'),
-    speedText: $('speed-text'),
-    playerState: $('player-state'),
-    vehicleText: $('vehicle-text'),
-    minimap: $('minimap'),
-    fpsMeter: $('fps-meter'),
-    crosshair: $('crosshair'),
-    startOverlay: $('start-overlay'),
-    pauseOverlay: $('pause-overlay'),
-    pauseStats: $('pause-stats'),
-    btnContinue: $('btn-continue'),
-    btnStart: $('btn-start'),
-    btnResume: $('btn-resume'),
-    btnRestart: $('btn-restart'),
-    btnQuitToMenu: $('btn-quit-to-menu'),
-    loading: $('loading'),
-    loadingText: $('loading-text'),
-    webglError: $('webgl-error'),
-    saveNote: $('save-note'),
-  };
-}
-
-// Normalisasi satu modul hasil dynamic import ke "instance" yang bisa
-// dipanggil game.js lewat callModule(name, method, ...args):
-//  - default export class   -> new default()
-//  - default export object  -> object itu
-//  - named exports          -> namespace (fungsi init/update/render dicari di sini)
-// Gagal total -> null (game memakai fallback).
-async function loadModule(name) {
-  try {
-    const mod = await import('./' + name + '.js');
-    if (mod.default && typeof mod.default === 'function') {
-      try {
-        return new mod.default();
-      } catch (err) {
-        console.warn(`[main] modul ${name}: konstruktor butuh argumen, pakai namespace:`, err);
-        return mod;
-      }
-    }
-    if (mod.default && typeof mod.default === 'object') return mod.default;
-    return mod;
-  } catch (err) {
-    console.warn(`[main] modul ${name} tidak dimuat (pakai fallback):`, err.message);
-    return null;
-  }
-}
-
-function loadSave() {
-  try {
-    const raw = localStorage.getItem(SAVE_KEY);
-    if (!raw) return null;
-    const data = JSON.parse(raw);
-    if (!data || typeof data !== 'object') return null;
-    return data;
-  } catch (err) {
-    console.warn('[main] save korup, diabaikan:', err);
-    return null;
-  }
-}
-
-function writeSave(data) {
-  try {
-    localStorage.setItem(SAVE_KEY, JSON.stringify(data));
-    return true;
-  } catch (err) {
-    console.warn('[main] gagal menulis save:', err);
-    return false;
-  }
-}
-
-async function boot() {
-  const dom = collectDom();
-  const canvas = $('game-canvas');
-  const loadingText = dom.loadingText;
-
-  const setLoading = (msg) => { if (loadingText) loadingText.textContent = msg; };
-
-  setLoading('Menyiapkan WebGL…');
-  const renderer = createRenderer(canvas, {
-    onError: (msg) => {
-      if (dom.webglError) {
-        dom.webglError.style.display = 'block';
-        dom.webglError.textContent = msg;
-      }
-      const spinner = document.querySelector('#loading .spinner');
-      if (spinner) spinner.style.display = 'none';
-      setLoading('Game tidak bisa dimulai.');
-    },
-  });
-  if (!renderer) return; // pesan error sudah ditampilkan oleh onError
-
-  // ---- input bersama (dibaca game.js) ----
-  const input = {
-    keys: new Set(),
-    lookDX: 0,
-    lookDY: 0,
-    actions: [], // antrean aksi sekali-tekan {type, data}
+  // ------------------------------------------------------------------
+  // Input bersama — dibaca SB.Game.frame -> modul (khususnya Player)
+  // ------------------------------------------------------------------
+  // SB.input: { keys:Set kode tombol, axes:{x,y}, mouse:{x,y,dx,dy,down},
+  //   pressed:Set (sekali per frame), touch:{...}, sprint, brake }
+  var input = {
+    keys: {},
+    pressed: {},
+    axes: { x: 0, y: 0 },       // -1..1, dari WASD / panah
+    mouse: { x: 0, y: 0, dx: 0, dy: 0, down: false, moved: false },
+    touch: { active: false, sx: 0, sy: 0, x: 0, y: 0 },
+    sprint: false,
+    brake: false,
+    interact: false,            // E ditekan (edge)
+    shootHeld: false,
+    wheel: 0,
+    anyKey: false
   };
 
-  setLoading('Memuat modul game…');
-  const rawModules = {};
-  for (const name of MODULE_NAMES) {
-    rawModules[name] = await loadModule(name);
-  }
-  const loadedNames = MODULE_NAMES.filter((n) => rawModules[n]);
-  console.log('[main] modul termuat:', loadedNames.join(', ') || '(tidak ada — full fallback)');
-  console.log('[main] math3', math3.VERSION, '| gl', renderer.version, '| game', Game ? 'ok' : 'gagal');
+  // Peta kode tombol -> aksi (dipakai game.js untuk aksi sekali tekan).
+  var ACTION_KEYS = {
+    KeyE: 'interact',       // curi mobil / masuk kendaraan
+    KeyF: 'enterExit',      // keluar kendaraan (alternatif E)
+    KeyR: 'radio',          // ganti stasiun radio
+    KeyM: 'missions',       // buka/tutup panel misi
+    KeyQ: 'weaponPrev',     // senjata sebelumnya
+    Digit1: 'weapon0', Digit2: 'weapon1', Digit3: 'weapon2', Digit4: 'weapon3',
+    KeyB: 'buyAmmo',        // beli amunisi $50/+24
+    KeyC: 'camera',         // ganti sudut kamera
+    KeyH: 'horn',           // klakson
+    KeyP: 'pause',          // pause (alternatif Esc)
+    KeyG: 'crewCommand',    // perintah crew (siklus)
+    KeyT: 'phone',          // ponsel / peta cepat
+    KeyL: 'lights'          // lampu mobil
+  };
 
-  // Integrasi v11: namespace mentah TIDAK cocok dengan kontrak duck-typing
-  // game.js (modul IIFE hanya mendaftar di globalThis.Sunset*). Adapter
-  // menerjemahkan tiap modul asli ke init/update/render/getState/... agar
-  // kota, air, player, kendaraan, misi, audio, HUD, dan shooting yang
-  // asli yang dipakai — bukan fallback prosedural.
-  setLoading('Menghubungkan modul game…');
-  const { buildAdapters } = await import('./adapters.js');
-  const allAdapters = buildAdapters(rawModules);
-  const registry = allAdapters.__registry;
-  delete allAdapters.__registry;
-  const modules = allAdapters;
+  var started = false;
+  var booted = false;
+  var lastTime = 0;
+  var fpsSamples = [];
+  var fps = 0;
+  var fpsBadgeEl = null;
+  var pausedByVisibility = false;
 
-  setLoading('Membangun Sunset Bay…');
-  const game = new Game({
-    renderer,
-    dom,
-    modules,
-    input,
-    onEvent: handleGameEvent,
-  });
-  game.init();
-
-  // ---- save / load ----
-  let saveData = loadSave();
-  if (saveData && dom.btnContinue) {
-    dom.btnContinue.style.display = 'inline-block';
-    const when = saveData.savedAt ? new Date(saveData.savedAt).toLocaleString('id-ID') : '';
-    if (dom.saveNote) {
-      dom.saveNote.textContent = `Save ditemukan${when ? ' (' + when + ')' : ''} — uang $${Math.floor(saveData.money || 0)}, hari ke-${saveData.day || 1}, ${saveData.missionsDone || 0} misi selesai.`;
-    }
-  }
-
-  function saveGame() {
-    if (!game) return;
-    writeSave(game.getSaveData());
+  // Alias tombol huruf kecil — modul Player/Vehicles/Water membaca
+  // input.keys dengan kunci 'w'/'a'/'s'/'d'/'space'/'shift'/'arrow*',
+  // sementara keydown menyimpan e.code ('KeyW', 'Space', ...).
+  // Tanpa alias ini WASD di keyboard nyata tidak menggerakkan apa pun.
+  var KEY_ALIASES = {
+    KeyW: 'w', KeyA: 'a', KeyS: 's', KeyD: 'd',
+    Space: 'space', ShiftLeft: 'shift', ShiftRight: 'shift',
+    ArrowUp: 'arrowup', ArrowDown: 'arrowdown',
+    ArrowLeft: 'arrowleft', ArrowRight: 'arrowright'
+  };
+  function setKeyAliases(code, down) {
+    var a = KEY_ALIASES[code];
+    if (a) input.keys[a] = down;
+    if (code === 'Space') input.keys[' '] = down;
   }
 
-  function handleGameEvent(type, data) {
-    switch (type) {
-      case 'autosave':
-        writeSave(data);
-        break;
-      case 'paused': {
-        if (dom.pauseStats && data) {
-          dom.pauseStats.innerHTML =
-            `Hari ke-${data.day} • ${data.clock} (${data.phase})<br>` +
-            `Uang: $${data.money.toLocaleString('en-US')} • Misi selesai: ${data.missionsDone}<br>` +
-            `Mobil dicuri: ${data.carsStolen} • Jarak mengemudi: ${data.distanceDrivenKm} km • Bermain: ${data.playMinutes} menit`;
-        }
-        if (dom.pauseOverlay) dom.pauseOverlay.classList.add('show');
-        break;
-      }
-      case 'resumed':
-        if (dom.pauseOverlay) dom.pauseOverlay.classList.remove('show');
-        break;
-      case 'started':
-        if (dom.startOverlay) dom.startOverlay.classList.remove('show');
-        if (dom.pauseOverlay) dom.pauseOverlay.classList.remove('show');
-        if (dom.hud) dom.hud.classList.add('visible');
-        break;
-      case 'quit-to-menu':
-        if (dom.hud) dom.hud.classList.remove('visible');
-        if (dom.pauseOverlay) dom.pauseOverlay.classList.remove('show');
-        if (dom.startOverlay) dom.startOverlay.classList.add('show');
-        // Refresh tombol Continue setelah kembali ke menu.
-        saveData = loadSave();
-        if (saveData && dom.btnContinue) dom.btnContinue.style.display = 'inline-block';
-        break;
-      default:
-        break;
-    }
-  }
+  // ------------------------------------------------------------------
+  // Boot
+  // ------------------------------------------------------------------
+  function boot() {
+    if (booted) return;
+    booted = true;
 
-  // ---- tombol overlay ----
-  if (dom.btnStart) {
-    dom.btnStart.addEventListener('click', () => {
-      saveData = null;
-      game.start(true);
-    });
-  }
-  if (dom.btnContinue) {
-    dom.btnContinue.addEventListener('click', () => {
-      const data = loadSave();
-      game.start(false, data);
-    });
-  }
-  if (dom.btnResume) dom.btnResume.addEventListener('click', () => game.resume());
-  if (dom.btnRestart) {
-    dom.btnRestart.addEventListener('click', () => {
-      if (dom.pauseOverlay) dom.pauseOverlay.classList.remove('show');
-      game.start(true);
-    });
-  }
-  if (dom.btnQuitToMenu) dom.btnQuitToMenu.addEventListener('click', () => game.quitToMenu());
-
-  // ---- keyboard ----
-  const GAME_KEYS = new Set([
-    'KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
-    'Space', 'ShiftLeft', 'ShiftRight',
-  ]);
-  window.addEventListener('keydown', (e) => {
-    if (e.repeat) {
-      if (GAME_KEYS.has(e.code)) e.preventDefault();
+    var canvas = document.getElementById('game-canvas');
+    if (!canvas) {
+      showFatal('Canvas #game-canvas tidak ditemukan.');
       return;
     }
-    if (GAME_KEYS.has(e.code)) {
+
+    // Cek modul wajib sudah termuat (urutan script di index.html).
+    var missing = [];
+    ['Math3', 'Rng', 'GL', 'Game'].forEach(function (name) {
+      if (!window.SB[name]) missing.push(name);
+    });
+    if (missing.length) {
+      showFatal('Modul belum termuat: ' + missing.join(', ') +
+        '. Periksa urutan <script> di index.html.');
+      return;
+    }
+
+    // Ekspos input ke namespace agar modul bisa membacanya.
+    window.SB.input = input;
+
+    // Init WebGL lewat SB.GL, lalu game lewat SB.Game.init.
+    var glOk = true;
+    try {
+      glOk = window.SB.GL.init(canvas);
+    } catch (err) {
+      glOk = false;
+      showFatal('WebGL gagal start: ' + (err && err.message ? err.message : err));
+      return;
+    }
+    if (glOk === false) {
+      showFatal('WebGL tidak tersedia di browser ini. Coba browser lain.');
+      return;
+    }
+
+    try {
+      window.SB.Game.init(canvas);
+    } catch (err) {
+      showFatal('Game.init gagal: ' + (err && err.message ? err.message : err));
+      return;
+    }
+
+    bindInput(canvas);
+    bindButtons();
+    bindResize();
+
+    fpsBadgeEl = document.getElementById('fps-badge');
+
+    // Muat save lama (kalau ada) supaya tombol CONTINUE bisa aktif.
+    var hasSave = false;
+    try {
+      hasSave = !!window.localStorage.getItem('sunset-bay-save-v12');
+    } catch (e) { hasSave = false; }
+    var contBtn = document.getElementById('continue-btn');
+    if (contBtn && !hasSave) {
+      contBtn.style.opacity = '0.45';
+      contBtn.title = 'Belum ada save v12 di browser ini';
+    }
+
+    // Loop mulai berjalan begitu tombol START ditekan; sebelum itu
+    // game.js menggambar adegan latar (attract mode) di belakang overlay.
+    lastTime = performance.now();
+    requestAnimationFrame(loop);
+  }
+
+  function showFatal(msg) {
+    var note = document.getElementById('loading-note');
+    if (note) {
+      note.textContent = msg;
+      note.style.color = '#ff8a96';
+    }
+    if (typeof console !== 'undefined' && console.error) {
+      console.error('[SB.main] ' + msg);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Game loop — dt di-clamp agar tab yang lama tidak aktif tidak
+  // melempar simulasi (maks 50 ms per frame).
+  // ------------------------------------------------------------------
+  function loop(now) {
+    requestAnimationFrame(loop);
+    var dt = (now - lastTime) / 1000;
+    lastTime = now;
+    if (!(dt > 0)) dt = 0.016;
+    if (dt > 0.05) dt = 0.05;      // clamp: maks 50 ms
+    if (dt < 0.001) dt = 0.001;
+
+    trackFps(now, dt);
+
+    // Update axes dari tombol yang sedang ditekan.
+    updateAxes();
+
+    // Klik kiri ditahan = tembak. Player.shoot() punya cooldown
+    // sendiri per senjata, jadi menahan klik = tembak otomatis.
+    // (Sebelumnya shootHeld tidak pernah dibaca siapa pun.)
+    if (input.shootHeld && window.SB.Player && window.SB.Player.shoot) {
+      try { window.SB.Player.shoot(); } catch (err) { /* abaikan */ }
+    }
+
+    try {
+      if (window.SB.Game && window.SB.Game.frame) {
+        window.SB.Game.frame(dt);
+      }
+    } catch (err) {
+      // Jangan matikan loop karena satu frame error; laporkan sekali.
+      if (!loop._reported) {
+        loop._reported = true;
+        if (typeof console !== 'undefined' && console.error) {
+          console.error('[SB.main] frame error:', err);
+        }
+      }
+    }
+
+    // Bersihkan edge-trigger per frame SETELAH game membacanya.
+    clearPressed();
+    input.mouse.dx = 0;
+    input.mouse.dy = 0;
+    input.mouse.moved = false;
+    input.wheel = 0;
+  }
+
+  function trackFps(now, dt) {
+    fpsSamples.push(1 / Math.max(dt, 0.001));
+    if (fpsSamples.length > 40) fpsSamples.shift();
+    if (fpsSamples.length === 40) {
+      var sum = 0;
+      for (var i = 0; i < fpsSamples.length; i++) sum += fpsSamples[i];
+      fps = Math.round(sum / fpsSamples.length);
+      if (fpsBadgeEl) {
+        fpsBadgeEl.textContent = fps + ' fps · v12';
+      }
+      fpsSamples.length = 0;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Input keyboard
+  // ------------------------------------------------------------------
+  function bindInput(canvas) {
+    window.addEventListener('keydown', function (e) {
+      // Tab dipakai untuk peta — cegah fokus pindah.
+      if (e.code === 'Tab') e.preventDefault();
+      // Space scroll halaman — cegah.
+      if (e.code === 'Space') e.preventDefault();
+      // F5 / Ctrl+R biarkan lewat (reload).
+      if (e.ctrlKey || e.metaKey) return;
+
+      var code = e.code;
+      if (!input.keys[code]) {
+        input.pressed[code] = true;
+        input.anyKey = true;
+        handleActionPress(code);
+      }
+      input.keys[code] = true;
+      setKeyAliases(code, true);
+
+      // Esc: pause toggle langsung di sini (game.js juga menanganinya).
+      // KeyP TIDAK di sini: sudah dipetakan di ACTION_KEYS -> queueAction
+      // ('pause') -> game.js togglePause. Dua jalur = toggle dua kali
+      // (pause langsung batal lagi), jadi P dulu tidak pernah pause.
+      if (code === 'Escape') {
+        if (started && window.SB.Game && window.SB.Game.togglePause) {
+          window.SB.Game.togglePause();
+        }
+      }
+    });
+
+    window.addEventListener('keyup', function (e) {
+      input.keys[e.code] = false;
+      setKeyAliases(e.code, false);
+    });
+
+    window.addEventListener('blur', function () {
+      // Lepas semua tombol saat jendela kehilangan fokus.
+      input.keys = {};
+      input.shootHeld = false;
+      input.mouse.down = false;
+    });
+
+    // ---- Mouse: arahkan kamera (drag) + tembak (klik kiri) ----
+    canvas.addEventListener('mousedown', function (e) {
+      input.mouse.down = true;
+      input.mouse.x = e.clientX;
+      input.mouse.y = e.clientY;
+      if (e.button === 0) {
+        input.shootHeld = true;
+        input.pressed.MouseLeft = true;
+      }
+      if (e.button === 2) input.pressed.MouseRight = true;
+    });
+    window.addEventListener('mouseup', function (e) {
+      if (e.button === 0) input.shootHeld = false;
+      input.mouse.down = false;
+    });
+    window.addEventListener('mousemove', function (e) {
+      var nx = e.clientX, ny = e.clientY;
+      input.mouse.dx = nx - input.mouse.x;
+      input.mouse.dy = ny - input.mouse.y;
+      input.mouse.x = nx;
+      input.mouse.y = ny;
+      input.mouse.moved = true;
+    });
+    canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    canvas.addEventListener('wheel', function (e) {
+      input.wheel += (e.deltaY > 0 ? 1 : -1);
       e.preventDefault();
-      input.keys.add(e.code);
-    }
-    switch (e.code) {
-      case 'KeyE':
-        if (game.mode === 'playing') input.actions.push({ type: 'interact' });
-        break;
-      case 'Space':
-        if (game.mode === 'playing') input.actions.push({ type: 'jump' });
-        break;
-      case 'KeyR':
-        if (game.mode === 'playing') input.actions.push({ type: 'radio' });
-        break;
-      case 'KeyQ':
-        if (game.mode === 'playing') input.actions.push({ type: 'mission' });
-        break;
-      case 'KeyM':
-        if (game.mode === 'playing') input.actions.push({ type: 'mute' });
-        break;
-      case 'KeyF':
-        if (game.mode === 'playing') input.actions.push({ type: 'headlights' });
-        break;
-      case 'KeyB':
-        if (game.mode === 'playing') input.actions.push({ type: 'buy-ammo' });
-        break;
-      case 'KeyG':
-        if (game.mode === 'playing') input.actions.push({ type: 'respray' });
-        break;
-      case 'Digit1':
-        if (game.mode === 'playing') input.actions.push({ type: 'weapon', data: 0 });
-        break;
-      case 'Digit2':
-        if (game.mode === 'playing') input.actions.push({ type: 'weapon', data: 1 });
-        break;
-      case 'Digit3':
-        if (game.mode === 'playing') input.actions.push({ type: 'weapon', data: 2 });
-        break;
-      case 'Escape':
-      case 'KeyP':
-        input.actions.push({ type: 'pause' });
-        break;
-      default:
-        break;
-    }
-  });
-  window.addEventListener('keyup', (e) => {
-    input.keys.delete(e.code);
-  });
-  window.addEventListener('blur', () => {
-    input.keys.clear();
-    if (game.mode === 'playing') game.pause();
-  });
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && game.mode === 'playing') game.pause();
-  });
+    }, { passive: false });
 
-  // ---- mouse: seret untuk orbit kamera ----
-  let dragging = false;
-  let lastX = 0, lastY = 0;
-  canvas.addEventListener('pointerdown', (e) => {
-    dragging = true;
-    lastX = e.clientX;
-    lastY = e.clientY;
-    canvas.setPointerCapture(e.pointerId);
-  });
-  canvas.addEventListener('pointermove', (e) => {
-    if (!dragging) return;
-    input.lookDX += e.clientX - lastX;
-    input.lookDY += e.clientY - lastY;
-    lastX = e.clientX;
-    lastY = e.clientY;
-  });
-  const endDrag = () => { dragging = false; };
-  canvas.addEventListener('pointerup', endDrag);
-  canvas.addEventListener('pointercancel', endDrag);
-
-  // Klik (tanpa seret) = tembak — ShootingSystem via game.fireWeapon().
-  let downX = 0, downY = 0, downT = 0;
-  canvas.addEventListener('pointerdown', (e) => {
-    downX = e.clientX; downY = e.clientY; downT = performance.now();
-  });
-  canvas.addEventListener('pointerup', (e) => {
-    const moved = Math.hypot(e.clientX - downX, e.clientY - downY);
-    if (moved < 6 && performance.now() - downT < 400 && game.mode === 'playing') {
-      game.fireWeapon();
-    }
-  });
-
-  // ---- tombol sentuh ----
-  const touchInteract = $('touch-interact');
-  const touchJump = $('touch-jump');
-  if (touchInteract) {
-    touchInteract.addEventListener('click', () => {
-      if (game.mode === 'playing') input.actions.push({ type: 'interact' });
+    // ---- Touch: joystick virtual kiri + drag kamera kanan ----
+    var touchStart = null;
+    canvas.addEventListener('touchstart', function (e) {
+      e.preventDefault();
+      for (var i = 0; i < e.changedTouches.length; i++) {
+        var t = e.changedTouches[i];
+        if (t.clientX < window.innerWidth * 0.45 && !input.touch.active) {
+          input.touch.active = true;
+          input.touch.sx = t.clientX; input.touch.sy = t.clientY;
+          input.touch.x = t.clientX; input.touch.y = t.clientY;
+        } else {
+          touchStart = { x: t.clientX, y: t.clientY, id: t.identifier };
+        }
+      }
+    }, { passive: false });
+    canvas.addEventListener('touchmove', function (e) {
+      e.preventDefault();
+      for (var i = 0; i < e.changedTouches.length; i++) {
+        var t = e.changedTouches[i];
+        if (input.touch.active && t.clientX < window.innerWidth * 0.5) {
+          input.touch.x = t.clientX; input.touch.y = t.clientY;
+        } else if (touchStart && t.identifier === touchStart.id) {
+          input.mouse.dx += t.clientX - touchStart.x;
+          input.mouse.dy += t.clientY - touchStart.y;
+          input.mouse.moved = true;
+          touchStart.x = t.clientX; touchStart.y = t.clientY;
+        }
+      }
+    }, { passive: false });
+    canvas.addEventListener('touchend', function (e) {
+      for (var i = 0; i < e.changedTouches.length; i++) {
+        var t = e.changedTouches[i];
+        if (touchStart && t.identifier === touchStart.id) touchStart = null;
+      }
+      if (e.touches.length === 0) {
+        input.touch.active = false;
+        input.touch.x = input.touch.sx; input.touch.y = input.touch.sy;
+      }
     });
-  }
-  if (touchJump) {
-    touchJump.addEventListener('click', () => {
-      if (game.mode === 'playing') input.actions.push({ type: 'jump' });
+
+    // Pause otomatis saat tab disembunyikan (hemat baterai & adil).
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden && started && window.SB.Game) {
+        if (window.SB.Game.pause && !window.SB.Game.isPaused()) {
+          window.SB.Game.pause();
+          pausedByVisibility = true;
+        }
+      } else if (!document.hidden && pausedByVisibility && window.SB.Game) {
+        pausedByVisibility = false;
+        // Jangan auto-resume: biarkan pemain menekan RESUME sendiri.
+      }
     });
   }
 
-  // ---- resize ----
-  let aspect = 16 / 9;
-  function onResize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const w = Math.floor(window.innerWidth * dpr);
-    const h = Math.floor(window.innerHeight * dpr);
-    renderer.resize(w, h);
-    aspect = w / Math.max(1, h);
+  // Aksi sekali tekan: teruskan ke game.js lewat antrian aksi.
+  function handleActionPress(code) {
+    var action = ACTION_KEYS[code];
+    if (!action) return;
+    if (window.SB.Game && window.SB.Game.queueAction) {
+      window.SB.Game.queueAction(action);
+    }
+    if (action === 'interact') input.interact = true;
   }
-  window.addEventListener('resize', onResize);
-  onResize();
 
-  // ---- save saat tab ditutup ----
-  window.addEventListener('beforeunload', () => {
-    if (game.mode === 'playing' || game.mode === 'paused') saveGame();
-  });
+  // Hitung axes gerak dari tombol yang sedang ditekan.
+  function updateAxes() {
+    var k = input.keys;
+    var x = 0, y = 0;
+    if (k.KeyW || k.ArrowUp) y += 1;
+    if (k.KeyS || k.ArrowDown) y -= 1;
+    if (k.KeyA || k.ArrowLeft) x -= 1;
+    if (k.KeyD || k.ArrowRight) x += 1;
+    // Joystick sentuh menimpa keyboard bila aktif.
+    if (input.touch.active) {
+      var dx = input.touch.x - input.touch.sx;
+      var dy = input.touch.y - input.touch.sy;
+      var dead = 14;
+      if (Math.abs(dx) > dead || Math.abs(dy) > dead) {
+        x = Math.max(-1, Math.min(1, dx / 60));
+        y = Math.max(-1, Math.min(1, -dy / 60));
+      }
+    }
+    input.axes.x = x;
+    input.axes.y = y;
+    input.sprint = !!(k.ShiftLeft || k.ShiftRight);
+    input.brake = !!(k.Space);
+  }
 
-  // ---- handle untuk harness / modul lain (mis. shots.js) ----
-  window.__sunsetBay = {
-    game,
-    renderer,
-    modules,
-    rawModules,
-    registry,
-    math3,
-    version: VERSION,
-    save: saveGame,
-    loadSave,
-    // Helper QA (dipakai skrip uji otomatis, bukan gameplay):
-    qa: {
-      // Teleport pemain (sinkronkan modul player + state game).
-      teleport(x, z) {
-        game.player.pos.x = x;
-        game.player.pos.z = z;
-        const p = registry.player && registry.player.player;
-        if (p) { p.x = x; p.z = z; }
-        game.camera.lookAt = { x, y: 1.7, z };
-        game.camera.pos = { x: x + Math.sin(game.camera.yaw) * 7, y: 4, z: z + Math.cos(game.camera.yaw) * 7 };
-      },
-      setWanted(n) { game.player.wanted = n; },
-      // Polisi di depan kamera (untuk uji tembak): wanted >= 3 agar heli ikut.
-      spawnCopNear(dist) {
-        return registry.jobs ? registry.jobs.spawnCopNear(dist || 12) : null;
-      },
-      // Paksa waktu game (jam 0-24) — untuk uji siang/malam.
-      setTime(hour) { game.timeOfDay = hour; },
-      state() {
-        return {
-          mode: game.mode,
-          pos: { ...game.player.pos },
-          money: game.player.money,
-          wanted: game.player.wanted,
-          health: game.player.health,
-          missionsDone: game.missionsDone,
-          mission: game.mission ? { title: game.mission.def.title, stage: game.mission.stageIndex, stages: (game.mission.def.stages || []).length } : null,
-          rep: game.rep || 0,
-          inVehicle: game.player.inVehicle,
-          inBoat: !!game.player.inBoat,
-          waterDrawCalls: registry.water ? registry.water.drawCalls : 0,
-          ambient: registry.water ? registry.water.getAmbientStatus() : null,
-          buildings: registry.city ? registry.city.buildingCount() : 0,
-          shots: registry.shots ? registry.shots.getState() : null,
-          jobs: registry.jobs ? registry.jobs.getState() : null,
-          heliActive: registry.jobs && registry.jobs.cops ? registry.jobs.cops.heliActive : false,
-          cops: registry.jobs && registry.jobs.cops ? registry.jobs.cops.cops.length : 0,
-          radio: registry.audio ? registry.audio.getStation() : null,
-        };
-      },
-    },
+  function clearPressed() {
+    input.pressed = {};
+    input.interact = false;
+    input.anyKey = false;
+  }
+
+  // ------------------------------------------------------------------
+  // Tombol overlay (START / CONTINUE / RESUME / SAVE)
+  // ------------------------------------------------------------------
+  function bindButtons() {
+    var startBtn = document.getElementById('start-btn');
+    if (startBtn) {
+      startBtn.addEventListener('click', function () {
+        startGame(false);
+      });
+    }
+    var contBtn = document.getElementById('continue-btn');
+    if (contBtn) {
+      contBtn.addEventListener('click', function () {
+        startGame(true);
+      });
+    }
+    var resumeBtn = document.getElementById('resume-btn');
+    if (resumeBtn) {
+      resumeBtn.addEventListener('click', function () {
+        if (window.SB.Game && window.SB.Game.resume) window.SB.Game.resume();
+      });
+    }
+    var saveBtn = document.getElementById('save-btn');
+    if (saveBtn) {
+      saveBtn.addEventListener('click', function () {
+        if (window.SB.Game && window.SB.Game.save) {
+          var ok = window.SB.Game.save();
+          saveBtn.textContent = ok ? 'SAVED ✓' : 'SAVE FAILED';
+          setTimeout(function () { saveBtn.textContent = 'SAVE GAME'; }, 1600);
+        }
+      });
+    }
+    // Enter di layar start = mulai.
+    window.addEventListener('keydown', function (e) {
+      if (!started && e.code === 'Enter') startGame(false);
+    });
+  }
+
+  function startGame(continueSave) {
+    var overlay = document.getElementById('start-overlay');
+    if (overlay) overlay.classList.add('hidden');
+    started = true;
+    window.SB.started = true;
+    if (continueSave && window.SB.Game && window.SB.Game.load) {
+      window.SB.Game.load();
+    }
+    if (window.SB.Game && window.SB.Game.resume) {
+      window.SB.Game.resume();
+    }
+    // Audio butuh gestur pengguna: init/resume konteks audio di sini.
+    if (window.SB.Audio && window.SB.Audio.unlock) {
+      try { window.SB.Audio.unlock(); } catch (e) { /* abaikan */ }
+    }
+    var canvas = document.getElementById('game-canvas');
+    if (canvas) canvas.focus();
+  }
+
+  // ------------------------------------------------------------------
+  // Resize: canvas fullscreen mengikuti jendela
+  // ------------------------------------------------------------------
+  function bindResize() {
+    var t = null;
+    window.addEventListener('resize', function () {
+      if (t) clearTimeout(t);
+      t = setTimeout(function () {
+        if (window.SB.GL && window.SB.GL.resize) window.SB.GL.resize();
+        if (window.SB.Game && window.SB.Game.onResize) window.SB.Game.onResize();
+      }, 80);
+    });
+    window.addEventListener('orientationchange', function () {
+      setTimeout(function () {
+        if (window.SB.GL && window.SB.GL.resize) window.SB.GL.resize();
+      }, 200);
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Ekspor kecil (debug / game.js)
+  // ------------------------------------------------------------------
+  window.SB.Main = {
+    boot: boot,
+    get input() { return input; },
+    get fps() { return fps; },
+    get started() { return started; },
+    startGame: startGame
   };
 
-  // ---- game loop ----
-  const fpsMeter = dom.fpsMeter;
-  if (fpsMeter) fpsMeter.classList.add('show');
-  let lastT = performance.now();
-  let fpsAccum = 0, fpsFrames = 0, fpsTimer = 0;
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    const dt = Math.min((now - lastT) / 1000, 0.05);
-    lastT = now;
-
-    game.update(dt);
-    game.render(aspect);
-
-    fpsAccum += dt;
-    fpsFrames += 1;
-    fpsTimer += dt;
-    if (fpsTimer >= 0.5 && fpsMeter) {
-      const fps = Math.round(fpsFrames / Math.max(0.001, fpsAccum));
-      fpsMeter.textContent = fps + ' FPS';
-      fpsAccum = 0;
-      fpsFrames = 0;
-      fpsTimer = 0;
-    }
+  // Boot saat DOM siap (script dimuat di akhir body, jadi biasanya
+  // DOM sudah siap; tetap jaga jalur readyState).
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
   }
-
-  // ---- tampilkan menu utama ----
-  if (dom.loading) dom.loading.classList.add('hide');
-  if (dom.startOverlay) dom.startOverlay.classList.add('show');
-  setLoading('');
-  requestAnimationFrame(frame);
-}
-
-// Boot dengan penanganan error agar overlay loading tidak menggantung.
-boot().catch((err) => {
-  console.error('[main] boot gagal:', err);
-  const loadingText = $('loading-text');
-  if (loadingText) loadingText.textContent = 'Gagal memuat game: ' + err.message;
-  const errBox = $('webgl-error');
-  if (errBox) {
-    errBox.style.display = 'block';
-    errBox.textContent = 'Error: ' + err.message + ' — coba muat ulang halaman.';
-  }
-  const spinner = document.querySelector('#loading .spinner');
-  if (spinner) spinner.style.display = 'none';
-});
+})();

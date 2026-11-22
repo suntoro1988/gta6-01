@@ -1,1 +1,176 @@
-{"game":"Sunset Bay","shots":[{"file":"screenshots/1-start.jpg","id":"1-start","label":"Title screen — Sunset Bay at dawn, the city waking up"},{"file":"screenshots/2-play.jpg","id":"2-play","label":"Driving through downtown — traffic, neon, and the bay bridge"},{"file":"screenshots/3-foot.jpg","id":"3-foot","label":"On foot in the marina district — a mission pickup on the pier"},{"file":"screenshots/4-end.jpg","id":"4-end","label":"Sunset finale — helicopter over the bay as the day closes"}],"version":1}
+{
+  "format": "jpg",
+  "game": "Sunset Bay v12",
+  "height": 719,
+  "maxBytes": 262144,
+  "shots": [
+    {
+      "camera": {
+        "fov": 60,
+        "lookAt": {
+          "x": 0,
+          "y": 4,
+          "z": 0
+        },
+        "mode": "wide",
+        "position": {
+          "x": 0,
+          "y": 26,
+          "z": 95
+        }
+      },
+      "description": "Layar start + kota golden hour + pantai ramai.",
+      "file": "1-start.jpg",
+      "game": {
+        "heat": 0,
+        "hud": "titleOnly",
+        "mission": null,
+        "npc": "beachCrowd",
+        "player": "onFoot",
+        "screen": "start",
+        "timeOfDay": 18.33,
+        "wanted": 0,
+        "weather": "clear"
+      },
+      "name": "1-start",
+      "scene": "Start screen over the city at golden hour: title menu in front of the bay skyline, crowded beach below, sun low on the horizon.",
+      "systems": [
+        "city",
+        "water",
+        "npc",
+        "weather",
+        "hud"
+      ]
+    },
+    {
+      "camera": {
+        "fov": 65,
+        "lookAt": {
+          "x": 0,
+          "y": 1,
+          "z": -20
+        },
+        "mode": "chase",
+        "position": {
+          "x": -6,
+          "y": 5,
+          "z": 14
+        }
+      },
+      "description": "Kejar-kejaran mobil + heli AIR-1 + wanted 3 bintang + HUD lengkap + minimap zona merah.",
+      "file": "2-play.jpg",
+      "game": {
+        "heat": 62,
+        "heli": "AIR-1",
+        "hud": "full",
+        "minimap": "redZone",
+        "mission": null,
+        "player": "driving",
+        "police": "pursuit",
+        "radio": 2,
+        "screen": "play",
+        "timeOfDay": 18.5,
+        "vehicle": "sportsCar",
+        "wanted": 3,
+        "weather": "clear"
+      },
+      "name": "2-play",
+      "scene": "High-speed car chase across the bay bridge at sunset: player car weaving through dense traffic while police cruisers pursue and the AIR-1 helicopter hangs overhead.",
+      "systems": [
+        "vehicles",
+        "police",
+        "hud",
+        "audio",
+        "city",
+        "weather"
+      ]
+    },
+    {
+      "camera": {
+        "fov": 60,
+        "lookAt": {
+          "x": 0,
+          "y": 1.5,
+          "z": -12
+        },
+        "mode": "thirdPerson",
+        "position": {
+          "x": 3,
+          "y": 3,
+          "z": 8
+        }
+      },
+      "description": "Jalan kaki di jalan pantai sunset + palma + jendela menyala + misi aktif + NPC.",
+      "file": "3-foot.jpg",
+      "game": {
+        "heat": 18,
+        "hud": "full",
+        "mission": "active",
+        "missionId": "mission-01",
+        "npc": "promenade",
+        "player": "onFoot",
+        "screen": "play",
+        "timeOfDay": 18.75,
+        "wanted": 1,
+        "weapon": "pistol",
+        "weather": "clear"
+      },
+      "name": "3-foot",
+      "scene": "On foot along the beachfront promenade at sunset: palm trees, shop windows glowing neon, pedestrians and tourists around, mission marker ahead.",
+      "systems": [
+        "player",
+        "npc",
+        "jobs",
+        "city",
+        "weather",
+        "hud"
+      ]
+    },
+    {
+      "camera": {
+        "fov": 60,
+        "lookAt": {
+          "x": 0,
+          "y": 3,
+          "z": -10
+        },
+        "mode": "wide",
+        "position": {
+          "x": -18,
+          "y": 12,
+          "z": 30
+        }
+      },
+      "description": "Heli AIR-1 + spotlight menyapu jalan + wanted 4 bintang + ledakan/asap.",
+      "file": "4-end.jpg",
+      "game": {
+        "fx": [
+          "explosion",
+          "smoke",
+          "fire"
+        ],
+        "heat": 88,
+        "heli": "AIR-1",
+        "hud": "full",
+        "minimap": "redZone",
+        "player": "onFoot",
+        "police": "roadblock",
+        "screen": "play",
+        "timeOfDay": 21.5,
+        "wanted": 4,
+        "weather": "clear"
+      },
+      "name": "4-end",
+      "scene": "Night finale on the harbour road: the AIR-1 helicopter sweeps its spotlight across the street under a four-star wanted level while an explosion blooms behind a roadblock, smoke drifting through the neon.",
+      "systems": [
+        "police",
+        "fx",
+        "hud",
+        "city",
+        "weather"
+      ]
+    }
+  ],
+  "version": 12,
+  "width": 1280
+}
