@@ -1,347 +1,425 @@
+// fx.js — Sunset Bay v14, Builder F.
+// Particle effects: sparks, smoke, foam, fire, muzzle flash, explosions.
+// Everything is drawn procedurally through SB.GL; no textures, no files.
+// Particles are plain data: position, velocity, age, life, size, color.
+// SB.FX.update(dt) advances them and draws them every frame, so the
+// render loop only has to call update once per frame.
+
 window.SB = window.SB || {};
-(function(){ 'use strict';
 
-  // ---------------------------------------------------------------------------
-  // SB.FX — efek partikel Sunset Bay (v13, fresh).
-  // Ledakan, asap, api, percikan, partikel atmosfer (debu/kunang/ember),
-  // wake perahu, ombak, dan cipratan hujan.
-  //
-  // ATURAN ARRAY (pelajaran v12): array partikel TIDAK PERNAH diganti dengan
-  // array baru setelah init. init() memakai kembali array yang sama bila
-  // sudah ada (hanya dikosongkan), dan update() menghapus partikel mati
-  // secara in-place (swap-remove). Referensi SB.FX.particles selalu valid.
-  // ---------------------------------------------------------------------------
+(function () {
+  "use strict";
 
-  var MAX_PARTICLES = 600;      // batas keras — buang yang tertua bila penuh
-  var MAX_WAKES = 40;           // jejak wake perahu
-  var MAX_WAVES = 24;           // puncak ombak di pantai
+  var MAX_PARTICLES = 900;
+  var MAX_FLASHES = 24;
 
-  var _state = null;
-  var _t = 0;
-  var _unitMesh = null;         // mesh kubus kecil (dibuat malas via SB.Meshes)
-  var _ambientTimer = 0;        // penghitung spawn partikel atmosfer
-  var _rainSplashTimer = 0;     // penghitung cipratan hujan
+  // Small unit quad in the XZ plane, reused for every particle billboard.
+  // Vertices are (x, y, z); the render path scales it by particle size.
+  var QUAD_MESH = {
+    positions: [
+      -0.5, 0.0, -0.5,
+       0.5, 0.0, -0.5,
+       0.5, 0.0,  0.5,
+      -0.5, 0.0, -0.5,
+       0.5, 0.0,  0.5,
+      -0.5, 0.0,  0.5
+    ],
+    colors: [
+      1, 1, 1,
+      1, 1, 1,
+      1, 1, 1,
+      1, 1, 1,
+      1, 1, 1,
+      1, 1, 1
+    ],
+    indices: [0, 1, 2, 3, 4, 5]
+  };
 
-  // Tipe partikel: 'fire' | 'smoke' | 'spark' | 'ember' | 'dust' |
-  // 'splash' | 'wake' | 'foam' | 'debris' | 'mote'.
-  // Satu partikel: {x,y,z, vx,vy,vz, life,maxLife, size, r,g,b, a,
-  //                type, grav, drag, grow, spin}
-  var particles = [];
-
-  // Jejak wake: {x, z, life, maxLife, size, strength}
-  var wakes = [];
-  // Puncak ombak: {x, z, phase, speed, size}
-  var waves = [];
-
-  // -- util lokal ------------------------------------------------------------
-  function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
-  function lerp(a, b, t){ return a + (b - a) * t; }
-  function rand(a, b){ return a + Math.random() * (b - a); }
-
-  // Tambah satu partikel. Bila penuh, timpa partikel tertua (index 0).
-  // TIDAK PERNAH mengganti array `particles` — hanya push / tulis ulang slot.
-  function spawn(p){
-    if (particles.length >= MAX_PARTICLES){
-      particles[0] = p;         // daur ulang slot tertua, array tetap sama
-      return p;
-    }
-    particles.push(p);
-    return p;
+  // A single shared mesh object with a mutable color slot is not enough
+  // when particles have individual colors, so drawMesh is given a fresh
+  // color array per particle through the transform color argument where
+  // the GL module supports it; the fallback below uses the raw context.
+  function clonePos(p) {
+    if (!p) return { x: 0, y: 0, z: 0 };
+    return { x: p.x || 0, y: (p.y === undefined ? 0 : p.y), z: p.z || 0 };
   }
 
-  function makeParticle(type, x, y, z, vx, vy, vz, life, size, r, g, b, grav, drag, grow){
+  function cloneColor(c) {
+    if (!c) return [1, 1, 1];
+    if (Array.isArray(c)) return [c[0] || 0, c[1] || 0, c[2] || 0];
+    if (typeof c === "object") return [c.r || 0, c.g || 0, c.b || 0];
+    return [1, 1, 1];
+  }
+
+  function hexToRgb(hex) {
+    if (Array.isArray(hex)) return cloneColor(hex);
+    if (typeof hex !== "string") return [1, 1, 1];
+    var h = hex.replace("#", "");
+    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    if (h.length !== 6) return [1, 1, 1];
+    return [
+      parseInt(h.slice(0, 2), 16) / 255,
+      parseInt(h.slice(2, 4), 16) / 255,
+      parseInt(h.slice(4, 6), 16) / 255
+    ];
+  }
+
+  function randRange(a, b) {
+    return a + Math.random() * (b - a);
+  }
+
+  function makeParticle(pos, vel, color, life, size, gravity, drag, kind) {
     return {
-      x: x, y: y, z: z,
-      vx: vx, vy: vy, vz: vz,
-      life: life, maxLife: life,
-      size: size, r: r, g: g, b: b, a: 1,
-      type: type,
-      grav: (typeof grav === 'number' ? grav : 0),
-      drag: (typeof drag === 'number' ? drag : 0),
-      grow: (typeof grow === 'number' ? grow : 0),
-      spin: rand(0, Math.PI * 2)
+      pos: clonePos(pos),
+      vel: { x: vel.x || 0, y: vel.y || 0, z: vel.z || 0 },
+      color: cloneColor(color),
+      baseColor: cloneColor(color),
+      life: life,
+      maxLife: life,
+      age: 0,
+      size: size,
+      gravity: gravity,
+      drag: drag,
+      kind: kind || "spark"
     };
   }
 
-  // -- API -------------------------------------------------------------------
+  var FX = {
+    // Live particle list. Other modules read length only for diagnostics.
+    particles: [],
+    // Short-lived light flashes (explosions, muzzle). Render reads these
+    // to brighten the scene briefly; each entry decays in update().
+    flashes: [],
+    maxParticles: MAX_PARTICLES,
+    // True while at least one particle is alive.
+    active: false,
 
-  function init(state){
-    _state = state || null;
-    _t = 0;
-    _ambientTimer = 0;
-    _rainSplashTimer = 0;
-    // PENTING: kelola array yang sama — jangan `particles = []`.
-    particles.length = 0;
-    wakes.length = 0;
-    waves.length = 0;
-    _unitMesh = null;
-    // Ombak pantai: deretan puncak di garis pantai (z ~ -170).
-    for (var i = 0; i < MAX_WAVES; i++){
-      waves.push({
-        x: -260 + i * 22 + rand(-6, 6),
-        z: -170 + rand(-14, 14),
-        phase: rand(0, Math.PI * 2),
-        speed: rand(0.5, 1.1),
-        size: rand(2.5, 6)
+    count: function () {
+      return FX.particles.length;
+    },
+
+    clear: function () {
+      FX.particles.length = 0;
+      FX.flashes.length = 0;
+      FX.active = false;
+    },
+
+    // Generic burst. pos is a Vec3, color is [r,g,b] or "#rrggbb",
+    // n is the particle count. Velocities fan out in a sphere with an
+    // upward bias so bursts read as fire, spray or debris.
+    spawnParticles: function (pos, color, n) {
+      var origin = clonePos(pos);
+      var rgb = hexToRgb(color);
+      var count = Math.max(1, Math.min(200, Math.floor(n || 12)));
+      for (var i = 0; i < count; i++) {
+        if (FX.particles.length >= MAX_PARTICLES) FX.particles.shift();
+        var angle = Math.random() * Math.PI * 2;
+        var up = randRange(0.2, 1.0);
+        var speed = randRange(1.5, 7.0);
+        var vel = {
+          x: Math.cos(angle) * speed * randRange(0.4, 1.0),
+          y: up * speed,
+          z: Math.sin(angle) * speed * randRange(0.4, 1.0)
+        };
+        var life = randRange(0.35, 1.1);
+        var size = randRange(0.08, 0.28);
+        // Slight per-particle color jitter so bursts do not look flat.
+        var jitter = randRange(0.85, 1.1);
+        var varied = [
+          Math.min(1, rgb[0] * jitter),
+          Math.min(1, rgb[1] * jitter),
+          Math.min(1, rgb[2] * jitter)
+        ];
+        FX.particles.push(makeParticle(origin, vel, varied, life, size, -6.0, 0.6, "spark"));
+      }
+      FX.active = FX.particles.length > 0;
+      return FX.particles.length;
+    },
+
+    // Boat wake: white foam churned up at the stern plus a fan of spray.
+    // Called by SB.Water.wake(pos) — this is the single implementation.
+    // pos is the stern position at water level.
+    wake: function (pos) {
+      var origin = clonePos(pos);
+      origin.y = 0.15;
+      // Foam: slow, wide, long-lived, almost no gravity, heavy drag.
+      for (var i = 0; i < 7; i++) {
+        if (FX.particles.length >= MAX_PARTICLES) FX.particles.shift();
+        var angle = Math.random() * Math.PI * 2;
+        var speed = randRange(0.4, 1.8);
+        var vel = {
+          x: Math.cos(angle) * speed,
+          y: randRange(0.05, 0.5),
+          z: Math.sin(angle) * speed
+        };
+        var life = randRange(0.9, 1.8);
+        var size = randRange(0.35, 0.9);
+        var shade = randRange(0.82, 1.0);
+        FX.particles.push(makeParticle(
+          { x: origin.x + randRange(-0.4, 0.4), y: origin.y, z: origin.z + randRange(-0.4, 0.4) },
+          vel, [shade, shade, shade * 0.98], life, size, 0.4, 2.2, "foam"
+        ));
+      }
+      // Spray: fast droplets thrown up and out, then falling back.
+      for (var j = 0; j < 4; j++) {
+        if (FX.particles.length >= MAX_PARTICLES) FX.particles.shift();
+        var a2 = Math.random() * Math.PI * 2;
+        var s2 = randRange(2.0, 4.5);
+        FX.particles.push(makeParticle(
+          origin,
+          { x: Math.cos(a2) * s2, y: randRange(1.5, 3.5), z: Math.sin(a2) * s2 },
+          [0.92, 0.97, 1.0], randRange(0.4, 0.8), randRange(0.06, 0.14), -9.0, 0.3, "spray"
+        ));
+      }
+      FX.active = true;
+      return FX.particles.length;
+    },
+
+    // Explosion: orange fireball particles, dark smoke rising, and a
+    // bright flash that fades over a fraction of a second. Also plays
+    // the crash sound when audio is ready.
+    explosion: function (pos) {
+      var origin = clonePos(pos);
+      origin.y = Math.max(0.4, origin.y);
+      // Fire: fast orange/yellow core.
+      for (var i = 0; i < 42; i++) {
+        if (FX.particles.length >= MAX_PARTICLES) FX.particles.shift();
+        var angle = Math.random() * Math.PI * 2;
+        var tilt = randRange(-0.4, 1.0);
+        var speed = randRange(3.0, 11.0);
+        var hot = Math.random();
+        var fireColor = hot < 0.45
+          ? [1.0, randRange(0.75, 0.95), 0.15]
+          : [1.0, randRange(0.35, 0.6), 0.05];
+        FX.particles.push(makeParticle(
+          { x: origin.x + randRange(-0.3, 0.3), y: origin.y + randRange(0, 0.5), z: origin.z + randRange(-0.3, 0.3) },
+          { x: Math.cos(angle) * speed, y: tilt * speed, z: Math.sin(angle) * speed },
+          fireColor, randRange(0.5, 1.2), randRange(0.25, 0.7), -2.0, 1.4, "fire"
+        ));
+      }
+      // Smoke: slow, large, dark grey, rising and expanding.
+      for (var j = 0; j < 16; j++) {
+        if (FX.particles.length >= MAX_PARTICLES) FX.particles.shift();
+        var a2 = Math.random() * Math.PI * 2;
+        var s2 = randRange(0.5, 2.0);
+        var grey = randRange(0.12, 0.3);
+        FX.particles.push(makeParticle(
+          { x: origin.x + randRange(-0.5, 0.5), y: origin.y + randRange(0.5, 1.5), z: origin.z + randRange(-0.5, 0.5) },
+          { x: Math.cos(a2) * s2, y: randRange(1.5, 3.5), z: Math.sin(a2) * s2 },
+          [grey, grey, grey], randRange(1.6, 3.0), randRange(0.8, 1.6), 1.2, 0.8, "smoke"
+        ));
+      }
+      // Debris sparks thrown far and fast.
+      for (var k = 0; k < 14; k++) {
+        if (FX.particles.length >= MAX_PARTICLES) FX.particles.shift();
+        var a3 = Math.random() * Math.PI * 2;
+        var s3 = randRange(8.0, 16.0);
+        FX.particles.push(makeParticle(
+          origin,
+          { x: Math.cos(a3) * s3, y: randRange(4.0, 10.0), z: Math.sin(a3) * s3 },
+          [1.0, 0.8, 0.3], randRange(0.6, 1.4), randRange(0.05, 0.12), -12.0, 0.15, "spark"
+        ));
+      }
+      FX.addFlash(origin, 1.0, 26.0, [1.0, 0.62, 0.18]);
+      FX.active = true;
+      if (window.SB && SB.Audio && typeof SB.Audio.sfx === "function") {
+        try { SB.Audio.sfx("crash"); } catch (e) { /* audio is best-effort */ }
+      }
+      return FX.particles.length;
+    },
+
+    // Muzzle flash: a bright yellow-white flash at the barrel plus a
+    // short fan of hot sparks and one small smoke puff.
+    muzzle: function (pos) {
+      var origin = clonePos(pos);
+      for (var i = 0; i < 8; i++) {
+        if (FX.particles.length >= MAX_PARTICLES) FX.particles.shift();
+        var angle = Math.random() * Math.PI * 2;
+        var speed = randRange(4.0, 9.0);
+        FX.particles.push(makeParticle(
+          origin,
+          { x: Math.cos(angle) * speed, y: randRange(0.5, 2.5), z: Math.sin(angle) * speed },
+          [1.0, randRange(0.8, 0.95), 0.35], randRange(0.12, 0.3), randRange(0.06, 0.14), -4.0, 0.4, "spark"
+        ));
+      }
+      // One grey puff drifting up from the barrel.
+      if (FX.particles.length < MAX_PARTICLES) {
+        FX.particles.push(makeParticle(
+          { x: origin.x, y: origin.y + 0.15, z: origin.z },
+          { x: randRange(-0.3, 0.3), y: randRange(0.8, 1.4), z: randRange(-0.3, 0.3) },
+          [0.55, 0.55, 0.55], randRange(0.7, 1.1), randRange(0.25, 0.4), 0.8, 1.0, "smoke"
+        ));
+      }
+      FX.addFlash(origin, 0.55, 7.0, [1.0, 0.9, 0.45]);
+      FX.active = true;
+      return FX.particles.length;
+    },
+
+    // A short-lived point light. Render can read FX.flashes and add the
+    // brightest one to its lighting; the flash decays in update().
+    addFlash: function (pos, intensity, radius, color) {
+      if (FX.flashes.length >= MAX_FLASHES) FX.flashes.shift();
+      FX.flashes.push({
+        pos: clonePos(pos),
+        intensity: intensity,
+        maxIntensity: intensity,
+        radius: radius,
+        color: cloneColor(color),
+        life: 0.22,
+        maxLife: 0.22
       });
-    }
-    return true;
-  }
+      return FX.flashes.length;
+    },
 
-  // Ledakan: bola api + asap tebal + percikan + puing.
-  function explosion(x, y, z){
-    var i;
-    for (i = 0; i < 26; i++){
-      var a = rand(0, Math.PI * 2), e = rand(-0.4, 1);
-      var sp = rand(4, 14);
-      spawn(makeParticle('fire', x, y, z,
-        Math.cos(a) * sp, e * sp * 0.7 + 3, Math.sin(a) * sp,
-        rand(0.4, 0.9), rand(1.2, 2.6), 1.0, rand(0.45, 0.75), 0.10,
-        -6, 1.2, 1.5));
-    }
-    for (i = 0; i < 14; i++){
-      spawn(makeParticle('smoke', x + rand(-1, 1), y + rand(0, 2), z + rand(-1, 1),
-        rand(-1.5, 1.5), rand(2, 5), rand(-1.5, 1.5),
-        rand(1.6, 3.2), rand(2.0, 3.5), 0.16, 0.16, 0.18,
-        1.5, 0.6, 2.2));
-    }
-    for (i = 0; i < 30; i++){
-      a = rand(0, Math.PI * 2); e = rand(0, 1);
-      sp = rand(10, 26);
-      spawn(makeParticle('spark', x, y + 0.5, z,
-        Math.cos(a) * sp, e * sp, Math.sin(a) * sp,
-        rand(0.3, 0.8), rand(0.12, 0.3), 1.0, rand(0.7, 0.9), 0.25,
-        -18, 0.4, 0));
-    }
-    for (i = 0; i < 8; i++){
-      spawn(makeParticle('debris', x, y + 1, z,
-        rand(-9, 9), rand(6, 14), rand(-9, 9),
-        rand(0.8, 1.6), rand(0.3, 0.7), 0.25, 0.22, 0.20,
-        -22, 0.2, 0));
-    }
-    return true;
-  }
-
-  // Asap: gumpalan naik pelan, membesar, memudar.
-  function smoke(x, y, z){
-    for (var i = 0; i < 6; i++){
-      spawn(makeParticle('smoke', x + rand(-0.6, 0.6), y + rand(0, 0.8), z + rand(-0.6, 0.6),
-        rand(-0.6, 0.6), rand(1.2, 2.4), rand(-0.6, 0.6),
-        rand(1.8, 3.4), rand(1.2, 2.2), 0.20, 0.20, 0.22,
-        0.8, 0.5, 1.8));
-    }
-    return true;
-  }
-
-  // Api: lidah api naik cepat, oranye -> merah, hidup singkat.
-  function fire(x, y, z){
-    for (var i = 0; i < 8; i++){
-      spawn(makeParticle('fire', x + rand(-0.7, 0.7), y + rand(0, 0.6), z + rand(-0.7, 0.7),
-        rand(-0.8, 0.8), rand(2.5, 5), rand(-0.8, 0.8),
-        rand(0.35, 0.8), rand(0.9, 1.8), 1.0, rand(0.35, 0.6), 0.08,
-        2, 1.0, 1.2));
-    }
-    return true;
-  }
-
-  // Percikan: titik terang cepat, gravitasi kuat, memantul di tanah (y=0).
-  function sparks(x, y, z){
-    for (var i = 0; i < 16; i++){
-      var a = rand(0, Math.PI * 2);
-      var sp = rand(4, 14);
-      spawn(makeParticle('spark', x, y, z,
-        Math.cos(a) * sp, rand(2, 9), Math.sin(a) * sp,
-        rand(0.25, 0.7), rand(0.1, 0.25), 1.0, rand(0.75, 0.95), 0.3,
-        -20, 0.3, 0));
-    }
-    return true;
-  }
-
-  // Wake perahu: jejak buih di permukaan air (dipanggil SB.Water / game).
-  function wake(x, z){
-    if (wakes.length >= MAX_WAKES) wakes.shift();
-    wakes.push({ x: x, z: z, life: 2.2, maxLife: 2.2, size: 1.6, strength: 1 });
-    // Buih putih kecil di sekitar wake.
-    for (var i = 0; i < 3; i++){
-      spawn(makeParticle('foam', x + rand(-1.2, 1.2), 0.15, z + rand(-1.2, 1.2),
-        rand(-0.5, 0.5), rand(0.1, 0.4), rand(-0.5, 0.5),
-        rand(0.6, 1.2), rand(0.4, 0.9), 0.95, 0.97, 1.0,
-        0, 1.5, 1.0));
-    }
-    return true;
-  }
-
-  // Ombak: dorong satu puncak ombak (untuk pantai / tabrakan perahu).
-  function splash(x, y, z, strength){
-    var n = Math.round(clamp(strength || 1, 0.2, 3) * 10);
-    for (var i = 0; i < n; i++){
-      var a = rand(0, Math.PI * 2);
-      var sp = rand(1, 4) * (strength || 1);
-      spawn(makeParticle('splash', x + rand(-0.5, 0.5), y, z + rand(-0.5, 0.5),
-        Math.cos(a) * sp, rand(2, 6), Math.sin(a) * sp,
-        rand(0.4, 0.9), rand(0.3, 0.7), 0.85, 0.92, 1.0,
-        -14, 0.6, 0));
-    }
-    return true;
-  }
-
-  function update(dt, state){
-    if (state) _state = state;
-    dt = Math.min(typeof dt === 'number' ? dt : 0.016, 0.1);
-    _t += dt;
-
-    var w = _state && _state.weather ? _state.weather : null;
-    var wind = w ? (w.wind || 0) : 0.2;
-    var windDir = w ? (w.windDir || 0) : 0;
-    var rain = w ? (w.rain || 0) : 0;
-    var night = w ? !!w.isNight : false;
-    var px = _state && _state.player ? _state.player.x : 0;
-    var pz = _state && _state.player ? _state.player.z : 0;
-
-    // 1) Partikel: integrasi in-place, hapus mati dengan swap-remove.
-    //    Array `particles` TIDAK PERNAH diganti — hanya isinya yang berubah.
-    var i = 0;
-    while (i < particles.length){
-      var p = particles[i];
-      p.life -= dt;
-      if (p.life <= 0){
-        particles[i] = particles[particles.length - 1];
-        particles.pop();
-        continue;
+    // Brightest currently alive flash, or null when there is none.
+    brightestFlash: function () {
+      var best = null;
+      for (var i = 0; i < FX.flashes.length; i++) {
+        if (!best || FX.flashes[i].intensity > best.intensity) best = FX.flashes[i];
       }
-      var k = 1 - Math.min(1, p.drag * dt);
-      p.vx = p.vx * k + Math.cos(windDir) * wind * dt * 2;
-      p.vz = p.vz * k + Math.sin(windDir) * wind * dt * 2;
-      p.vy += p.grav * dt;
-      p.x += p.vx * dt;
-      p.y += p.vy * dt;
-      p.z += p.vz * dt;
-      p.size += p.grow * dt;
-      p.spin += dt * 2;
-      // Percikan & puing memantul sekali di tanah.
-      if ((p.type === 'spark' || p.type === 'debris') && p.y < 0.05 && p.vy < 0){
-        p.y = 0.05;
-        p.vy = -p.vy * 0.35;
-        p.vx *= 0.6; p.vz *= 0.6;
+      return best;
+    },
+
+    // Advance every particle by dt seconds: integrate velocity, apply
+    // gravity and drag, grow smoke/foam, fade color with age, and drop
+    // dead particles. Then draw everything that is still alive.
+    update: function (dt) {
+      var step = Math.max(0, Math.min(0.1, dt || 0.016));
+      var i;
+      for (i = FX.particles.length - 1; i >= 0; i--) {
+        var p = FX.particles[i];
+        p.age += step;
+        if (p.age >= p.life) {
+          FX.particles.splice(i, 1);
+          continue;
+        }
+        var dragFactor = Math.max(0, 1 - p.drag * step);
+        p.vel.x *= dragFactor;
+        p.vel.z *= dragFactor;
+        p.vel.y = p.vel.y * dragFactor + p.gravity * step;
+        p.pos.x += p.vel.x * step;
+        p.pos.y += p.vel.y * step;
+        p.pos.z += p.vel.z * step;
+        // Foam and spray die at the water surface instead of sinking.
+        if ((p.kind === "foam" || p.kind === "spray") && p.pos.y < 0.05) {
+          p.pos.y = 0.05;
+          p.vel.y = Math.abs(p.vel.y) * 0.2;
+        }
+        // Smoke and foam grow as they age; sparks and fire shrink.
+        var t = p.age / p.maxLife;
+        if (p.kind === "smoke" || p.kind === "foam") {
+          p.size = p.size * (1 + step * 0.9);
+        } else {
+          p.size = Math.max(0.03, p.size * (1 - step * 0.6));
+        }
+        // Fade toward the sky/water tone as the particle dies.
+        var fade = 1 - t;
+        p.color = [
+          p.baseColor[0] * fade + 0.05 * t,
+          p.baseColor[1] * fade + 0.05 * t,
+          p.baseColor[2] * fade + 0.08 * t
+        ];
       }
-      if (p.y < -0.5){ p.life = 0; continue; }
-      // Alpha memudar di akhir hidup; api berubah oranye -> merah gelap.
-      var frac = p.life / p.maxLife;
-      p.a = frac < 0.4 ? frac / 0.4 : 1;
-      if (p.type === 'fire'){
-        p.r = 1.0;
-        p.g = 0.15 + 0.55 * frac;
-        p.b = 0.05 + 0.10 * frac;
+      for (i = FX.flashes.length - 1; i >= 0; i--) {
+        var f = FX.flashes[i];
+        f.life -= step;
+        if (f.life <= 0) {
+          FX.flashes.splice(i, 1);
+          continue;
+        }
+        f.intensity = f.maxIntensity * (f.life / f.maxLife);
       }
-      if (p.type === 'smoke') p.a = 0.55 * (1 - frac * 0.6);
-      i++;
-    }
+      FX.active = FX.particles.length > 0 || FX.flashes.length > 0;
+      FX.draw();
+      return FX.particles.length;
+    },
 
-    // 2) Wake: memudar & membesar pelan.
-    for (i = wakes.length - 1; i >= 0; i--){
-      var wk = wakes[i];
-      wk.life -= dt;
-      wk.size += dt * 1.4;
-      wk.strength = Math.max(0, wk.life / wk.maxLife);
-      if (wk.life <= 0) wakes.splice(i, 1);
-    }
-
-    // 3) Ombak: puncak bergerak ke pantai, fase berjalan.
-    for (i = 0; i < waves.length; i++){
-      var wv = waves[i];
-      wv.phase += dt * wv.speed;
-      wv.x += Math.sin(wv.phase * 0.5) * dt * 0.6;
-    }
-
-    // 4) Partikel atmosfer di sekitar pemain (selalu ada, murah).
-    _ambientTimer -= dt;
-    if (_ambientTimer <= 0){
-      _ambientTimer = night ? 0.25 : 0.4;
-      if (night){
-        // Kunang-kunang / ember melayang di malam hari (hangat, pelan).
-        spawn(makeParticle('mote', px + rand(-14, 14), rand(0.5, 4), pz + rand(-14, 14),
-          rand(-0.3, 0.3), rand(0.1, 0.5), rand(-0.3, 0.3),
-          rand(2, 4), rand(0.12, 0.25), 1.0, rand(0.7, 0.85), 0.3,
-          0.2, 0.2, 0));
-      } else {
-        // Debu beterbangan di udara golden hour / siang.
-        spawn(makeParticle('dust', px + rand(-12, 12), rand(0.5, 5), pz + rand(-12, 12),
-          rand(-0.4, 0.4), rand(-0.1, 0.2), rand(-0.4, 0.4),
-          rand(2, 4), rand(0.1, 0.22), 0.95, 0.85, 0.65,
-          -0.1, 0.3, 0));
+    // Draw all live particles. Prefers the raw WebGL context when it is
+    // available (points are cheapest for hundreds of particles); falls
+    // back to SB.GL.drawMesh quads when only that path exists.
+    draw: function () {
+      if (FX.particles.length === 0 && FX.flashes.length === 0) return;
+      var gl = null;
+      if (window.SB && SB.GL) {
+        gl = SB.GL.ctx || null;
       }
-    }
-
-    // 5) Cipratan hujan di sekitar pemain bila sedang hujan.
-    if (rain > 0.15){
-      _rainSplashTimer -= dt;
-      if (_rainSplashTimer <= 0){
-        _rainSplashTimer = 0.12 / rain;
-        spawn(makeParticle('splash', px + rand(-10, 10), 0.1, pz + rand(-10, 10),
-          rand(-0.4, 0.4), rand(1.5, 3), rand(-0.4, 0.4),
-          rand(0.25, 0.5), rand(0.15, 0.35), 0.85, 0.92, 1.0,
-          -12, 0.4, 0));
+      if (gl && typeof gl.drawArrays === "function") {
+        FX.drawWithContext(gl);
+        return;
       }
-    }
-  }
-
-  function draw(gl, state){
-    if (state) _state = state;
-    if (!gl || typeof gl.drawMesh !== 'function') return;
-    // Mesh kubus kecil — dibuat malas dari SB.Meshes bila tersedia.
-    if (!_unitMesh){
-      if (window.SB.Meshes && typeof window.SB.Meshes.box === 'function'){
-        try { _unitMesh = window.SB.Meshes.box(1, 1, 1); } catch (e){ _unitMesh = null; }
+      if (window.SB && SB.GL && typeof SB.GL.drawMesh === "function") {
+        FX.drawWithMeshes();
       }
-      if (!_unitMesh) return;
-    }
-    var i, p;
-    var M = window.SB.Math3;
-    if (!M) return;
-    // Partikel: gambar sebagai kubus kecil berwarna di posisinya.
-    // Ukuran partikel diwakili lewat alpha + warna (shader titik);
-    // matriks hanya membawa posisi agar drawMesh tetap generik.
-    for (i = 0; i < particles.length; i++){
-      p = particles[i];
-      if (p.a <= 0.02) continue;
-      var m = M.mat4Identity();
-      m = M.mat4Translate(m, p.x, p.y, p.z);
-      gl.drawMesh(_unitMesh, m, [p.r, p.g, p.b, p.a]);
-    }
-    // Wake: buih datar di permukaan air.
-    for (i = 0; i < wakes.length; i++){
-      var wk = wakes[i];
-      if (wk.strength <= 0.02) continue;
-      var wm = M ? M.mat4Identity() : null;
-      if (!wm) break;
-      wm = M.mat4Translate(wm, wk.x, 0.12, wk.z);
-      gl.drawMesh(_unitMesh, wm, [0.95, 0.97, 1.0, wk.strength * 0.5]);
-    }
-    // Ombak: puncak putih bergerak di garis pantai.
-    for (i = 0; i < waves.length; i++){
-      var wv = waves[i];
-      var bob = Math.sin(wv.phase) * 0.5;
-      var om = M ? M.mat4Identity() : null;
-      if (!om) break;
-      om = M.mat4Translate(om, wv.x, 0.15 + bob * 0.2, wv.z);
-      var bright = 0.75 + 0.25 * Math.max(0, Math.sin(wv.phase));
-      gl.drawMesh(_unitMesh, om, [bright, bright, 1.0, 0.45]);
-    }
-  }
+    },
 
-  window.SB.FX = {
-    init: init,
-    update: update,
-    draw: draw,
-    explosion: explosion,
-    smoke: smoke,
-    fire: fire,
-    sparks: sparks,
-    wake: wake,
-    splash: splash,
-    particles: particles,
-    wakes: wakes,
-    waves: waves
+    drawWithContext: function (gl) {
+      // The GL module owns the shader program and its attribute layout;
+      // drawing points here would need that program's attribute locations,
+      // which FX does not own. Instead, hand each particle to drawMesh as
+      // a small quad so the shader path stays single-sourced.
+      FX.drawWithMeshes();
+    },
+
+    drawWithMeshes: function () {
+      if (!window.SB || !SB.GL || typeof SB.GL.drawMesh !== "function") return;
+      for (var i = 0; i < FX.particles.length; i++) {
+        var p = FX.particles[i];
+        var s = Math.max(0.03, p.size);
+        var transform = {
+          pos: { x: p.pos.x, y: p.pos.y, z: p.pos.z },
+          rotY: 0,
+          scale: { x: s, y: s, z: s }
+        };
+        try {
+          SB.GL.drawMesh(QUAD_MESH, transform, p.color);
+        } catch (e) {
+          // One bad particle must never break the frame.
+          return;
+        }
+      }
+    },
+
+    // Convenience bursts used by gameplay code.
+    impact: function (pos, color) {
+      return FX.spawnParticles(pos, color || [0.9, 0.85, 0.7], 10);
+    },
+    smoke: function (pos, n) {
+      var origin = clonePos(pos);
+      var count = Math.max(1, Math.min(40, Math.floor(n || 8)));
+      for (var i = 0; i < count; i++) {
+        if (FX.particles.length >= MAX_PARTICLES) FX.particles.shift();
+        var grey = randRange(0.2, 0.4);
+        FX.particles.push(makeParticle(
+          { x: origin.x + randRange(-0.3, 0.3), y: origin.y + randRange(0, 0.4), z: origin.z + randRange(-0.3, 0.3) },
+          { x: randRange(-0.5, 0.5), y: randRange(1.0, 2.2), z: randRange(-0.5, 0.5) },
+          [grey, grey, grey], randRange(1.2, 2.4), randRange(0.4, 0.8), 1.0, 0.9, "smoke"
+        ));
+      }
+      FX.active = true;
+      return FX.particles.length;
+    },
+    blood: function (pos) {
+      return FX.spawnParticles(pos, [0.55, 0.05, 0.05], 14);
+    },
+    pickupSparkle: function (pos) {
+      return FX.spawnParticles(pos, [1.0, 0.85, 0.25], 18);
+    },
+    rainSplash: function (pos) {
+      var origin = clonePos(pos);
+      origin.y = 0.06;
+      for (var i = 0; i < 3; i++) {
+        if (FX.particles.length >= MAX_PARTICLES) FX.particles.shift();
+        var a = Math.random() * Math.PI * 2;
+        FX.particles.push(makeParticle(
+          origin,
+          { x: Math.cos(a) * randRange(0.5, 1.2), y: randRange(0.8, 1.6), z: Math.sin(a) * randRange(0.5, 1.2) },
+          [0.85, 0.92, 1.0], randRange(0.25, 0.5), randRange(0.05, 0.1), -8.0, 0.3, "spray"
+        ));
+      }
+      FX.active = true;
+      return FX.particles.length;
+    }
   };
 
+  SB.FX = FX;
 })();

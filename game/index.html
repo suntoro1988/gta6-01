@@ -1,238 +1,296 @@
 <!DOCTYPE html>
-<html lang="id">
+<html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<meta name="description" content="Sunset Bay — game open-world GTA-like di browser. Golden hour, kejar-kejaran helikopter, 20+ misi, 5+ balapan jalanan.">
-<meta name="theme-color" content="#1a0f2e">
-<title>Sunset Bay — GTA-like Open World</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23ff9a3c'/%3E%3Ccircle cx='32' cy='36' r='14' fill='%23fff3d6'/%3E%3Crect y='44' width='64' height='20' rx='6' fill='%232e6f8e'/%3E%3C/svg%3E">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sunset Bay — GTA 6 style open world</title>
+<link rel="icon" href="favicon.ico">
 <style>
+  :root {
+    --gold: #ffb020;
+    --orange: #ff9a3c;
+    --pink: #ff4d8d;
+    --ink: #0c0f16;
+    --panel: rgba(10, 14, 24, 0.78);
+    --line: rgba(255, 255, 255, 0.18);
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { width: 100%; height: 100%; overflow: hidden; background: #1a0f2e; }
-  body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; color: #fff; }
-  #game-canvas {
-    position: fixed; inset: 0; width: 100%; height: 100%;
-    display: block; touch-action: none; cursor: crosshair;
-    background: linear-gradient(180deg, #5b2a6e 0%, #ff9a3c 55%, #2e6f8e 100%);
+  html, body { height: 100%; }
+  body {
+    background: #05070d;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    color: #f2f2f2;
+    overflow: hidden;
   }
-  .hud { position: fixed; z-index: 10; pointer-events: none; user-select: none; }
-  /* HUD statis diduplikasi HUD dinamis (#sb-hud): sembunyikan yang rangkap
-     supaya tidak ada teks ganda di layar. Kanvas minimap (#hud-minimap),
-     zona (#hud-zone) dan objective (#hud-objective) tetap tampil. */
-  .hud-top-left, .hud-bottom-left { display: none; }
-  .hud-top-right > .pill { display: none; }
-  /* Minimap turun di bawah panel jam dinamis (#sb-hud) yang juga di kanan atas. */
-  .hud-top-right { top: 132px; }
-  #hud-speed { display: none; }
-  .hud-top-left { top: 14px; left: 14px; }
-  .hud-top-right { top: 14px; right: 14px; text-align: right; }
-  .hud-bottom-left { bottom: 14px; left: 14px; }
-  .hud-bottom-right { bottom: 14px; right: 14px; text-align: right; }
-  .pill {
-    display: inline-block; background: rgba(10, 8, 24, 0.62);
-    border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 10px;
-    padding: 8px 12px; margin-bottom: 8px; backdrop-filter: blur(4px);
+  #wrap {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(180deg, #2a4a7a 0%, #e8804a 55%, #57203a 100%);
   }
-  #hud-money { font-size: 26px; font-weight: 800; color: #7dff9a; letter-spacing: 0.5px; }
-  #hud-money small { font-size: 13px; color: #cfe8d4; font-weight: 600; }
-  #hud-wanted { font-size: 22px; letter-spacing: 3px; color: #ffd23f; }
-  #hud-wanted .star-off { color: rgba(255, 255, 255, 0.28); }
-  #hud-heat { font-size: 12px; color: #ffb3a0; }
-  #hud-heat-bar { width: 150px; height: 7px; background: rgba(255,255,255,0.18); border-radius: 4px; overflow: hidden; margin-top: 4px; }
-  #hud-heat-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #ffd23f, #ff5a3c); }
-  #hud-time { font-size: 15px; font-weight: 700; }
-  #hud-day { font-size: 12px; color: #ffd9a8; }
-  #hud-weather { font-size: 12px; color: #bfe3ff; }
-  #hud-radio { font-size: 12px; color: #e8c8ff; }
-  #hud-mission { max-width: 340px; font-size: 15px; line-height: 1.45; }
-  #hud-mission b { color: #ffd23f; }
-  #hud-toast {
-    position: fixed; top: 78px; left: 50%; transform: translateX(-50%);
-    z-index: 11; pointer-events: none; text-align: center;
-    background: rgba(10, 8, 24, 0.72); border: 1px solid rgba(255, 210, 63, 0.5);
-    border-radius: 10px; padding: 10px 18px; font-size: 15px; font-weight: 600;
-    display: none; max-width: 86vw;
+  #game {
+    width: min(100vw, 177.78vh);
+    height: min(100vh, 56.25vw);
+    display: block;
+    background: #1a2c4a;
+    cursor: crosshair;
+    outline: none;
   }
-  #hud-health { font-size: 14px; font-weight: 700; }
-  #hud-health .bar { width: 170px; height: 9px; background: rgba(255,255,255,0.18); border-radius: 5px; overflow: hidden; margin-top: 4px; }
-  #hud-health-fill { height: 100%; width: 100%; background: linear-gradient(90deg, #37e07a, #a5ff6e); }
-  #hud-armor-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #4aa8ff, #9fd8ff); }
-  #hud-weapon { font-size: 13px; color: #ffe9b0; margin-top: 6px; }
-  #hud-speed { font-size: 30px; font-weight: 800; }
-  #hud-speed small { font-size: 13px; color: #ffd9a8; }
-  #hud-minimap {
-    width: 168px; height: 168px; border-radius: 50%;
-    border: 3px solid rgba(255, 255, 255, 0.35);
-    background: rgba(12, 20, 40, 0.72); overflow: hidden;
+  .hidden { display: none !important; }
+
+  /* ---------- HUD ---------- */
+  #hud {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    font-size: 15px;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
   }
-  #hud-minimap canvas { width: 100%; height: 100%; display: block; }
-  #hud-controls { font-size: 11px; color: rgba(255,255,255,0.65); line-height: 1.6; }
-  #screen-start, #screen-pause, #screen-end {
-    position: fixed; inset: 0; z-index: 20; display: flex;
-    flex-direction: column; align-items: center; justify-content: center;
-    text-align: center; padding: 24px;
-    background: linear-gradient(180deg, rgba(26,15,46,0.55) 0%, rgba(26,15,46,0.82) 100%);
+  #hud-top-left {
+    position: absolute; top: 14px; left: 16px;
+    display: flex; flex-direction: column; gap: 6px;
   }
-  #screen-pause, #screen-end { display: none; }
-  .game-title {
-    font-size: clamp(44px, 9vw, 96px); font-weight: 900; letter-spacing: 2px;
-    background: linear-gradient(180deg, #fff3d6 20%, #ff9a3c 60%, #ff5a8a 100%);
-    -webkit-background-clip: text; background-clip: text; color: transparent;
-    text-shadow: 0 6px 30px rgba(255, 154, 60, 0.35);
+  #hud-cash { font-size: 26px; font-weight: 800; color: #7dff9b; letter-spacing: 0.5px; }
+  #hud-wanted { font-size: 22px; letter-spacing: 3px; color: #ffd23c; }
+  #hud-health-row { display: flex; align-items: center; gap: 8px; }
+  #hud-health-label { font-weight: 700; font-size: 13px; color: #ffd9d9; }
+  #hud-health-track {
+    width: 150px; height: 10px; border-radius: 5px;
+    background: rgba(0, 0, 0, 0.55); border: 1px solid var(--line);
+    overflow: hidden;
   }
-  .game-sub { font-size: clamp(15px, 2.4vw, 21px); color: #ffe9c8; margin-top: 6px; }
-  .game-tag { font-size: 13px; color: #c9b8ff; margin-top: 10px; letter-spacing: 1px; }
+  #hud-health-bar { height: 100%; width: 100%; background: #37d67a; }
+  #hud-top-right {
+    position: absolute; top: 14px; right: 16px;
+    text-align: right; display: flex; flex-direction: column; gap: 4px;
+    font-weight: 600;
+  }
+  #hud-time { font-size: 22px; }
+  #hud-weather { font-size: 14px; text-transform: capitalize; color: #ffe1b0; }
+  #hud-respect { font-size: 14px; color: #8fd8ff; }
+  #hud-fps { font-size: 12px; color: #9aa7b8; }
+  #hud-bottom-left {
+    position: absolute; left: 16px; bottom: 14px;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  #hud-mission {
+    max-width: 460px; font-size: 15px; font-weight: 600;
+    background: var(--panel); border: 1px solid var(--line);
+    border-left: 4px solid var(--gold);
+    padding: 8px 12px; border-radius: 6px;
+  }
+  #hud-speed { font-size: 20px; font-weight: 800; }
+  #hud-radio { font-size: 13px; color: #ffb3d1; }
+  #minimap {
+    position: absolute; right: 16px; bottom: 14px;
+    width: 180px; height: 180px;
+    border: 2px solid rgba(255, 255, 255, 0.55);
+    border-radius: 8px;
+    background: #0a2036;
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.55);
+  }
+  #toast {
+    position: absolute; left: 50%; bottom: 90px;
+    transform: translateX(-50%);
+    background: var(--panel); border: 1px solid var(--line);
+    padding: 10px 18px; border-radius: 8px;
+    font-size: 15px; font-weight: 600; white-space: nowrap;
+  }
+  #fatal {
+    position: absolute; left: 50%; top: 40%;
+    transform: translate(-50%, -50%);
+    background: #5a1010; border: 1px solid #ff7070;
+    padding: 16px 22px; border-radius: 8px; max-width: 520px;
+    font-size: 15px; line-height: 1.5;
+  }
+
+  /* ---------- Overlay layar penuh (menu / pause / akhir) ---------- */
+  .overlay {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    background:
+      radial-gradient(ellipse at 50% 120%, rgba(255, 154, 60, 0.45), transparent 60%),
+      linear-gradient(180deg, rgba(8, 12, 26, 0.82), rgba(20, 8, 22, 0.88));
+    text-align: center;
+    padding: 24px;
+    z-index: 10;
+  }
+  .overlay h1 {
+    font-size: 64px; font-weight: 900; letter-spacing: 4px;
+    background: linear-gradient(180deg, #ffe9a8, #ff9a3c 55%, #ff4d8d);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+  .overlay h2 { font-size: 30px; font-weight: 800; margin-bottom: 8px; }
+  .overlay .tagline {
+    font-size: 17px; color: #ffd9a8; margin-bottom: 28px;
+    max-width: 560px; line-height: 1.5;
+  }
+  .overlay p.body { font-size: 15px; color: #d8dee9; max-width: 560px; line-height: 1.6; margin-bottom: 18px; }
   .btn {
-    pointer-events: auto; cursor: pointer; margin-top: 26px;
-    font-size: 19px; font-weight: 800; letter-spacing: 1px; color: #231303;
-    background: linear-gradient(180deg, #ffd23f, #ff9a3c);
-    border: none; border-radius: 14px; padding: 15px 42px;
-    box-shadow: 0 8px 24px rgba(255, 154, 60, 0.45);
+    pointer-events: auto;
+    display: inline-block;
+    min-width: 260px;
+    margin: 6px 0; padding: 13px 26px;
+    font-size: 17px; font-weight: 700;
+    color: #1a1206; background: linear-gradient(180deg, #ffd23c, #ff9a3c);
+    border: none; border-radius: 10px; cursor: pointer;
+    box-shadow: 0 4px 0 #a34d00, 0 8px 20px rgba(0, 0, 0, 0.45);
   }
   .btn:hover { filter: brightness(1.08); }
-  .btn-secondary { background: rgba(255,255,255,0.14); color: #fff; border: 1px solid rgba(255,255,255,0.35); box-shadow: none; font-size: 15px; padding: 11px 26px; }
-  .keys { margin-top: 22px; font-size: 13px; color: rgba(255,255,255,0.78); line-height: 1.9; }
-  .keys b { color: #ffd23f; }
-  #hud-loading {
-    position: fixed; inset: 0; z-index: 30; display: flex;
-    align-items: center; justify-content: center; flex-direction: column;
-    background: #1a0f2e; font-size: 15px; color: #ffd9a8;
+  .btn:active { transform: translateY(3px); box-shadow: 0 1px 0 #a34d00; }
+  .btn.secondary {
+    background: rgba(255, 255, 255, 0.12); color: #fff;
+    box-shadow: 0 4px 0 rgba(0, 0, 0, 0.5);
+    border: 1px solid var(--line);
   }
-  #hud-loading .spin { font-size: 40px; margin-bottom: 12px; }
-  #hud-fps { position: fixed; left: 14px; bottom: 150px; z-index: 10; font-size: 11px; color: rgba(255,255,255,0.5); pointer-events: none; }
-  #hud-crosshair {
-    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
-    z-index: 9; font-size: 20px; color: rgba(255,255,255,0.85);
-    text-shadow: 0 0 6px rgba(0,0,0,0.8); pointer-events: none; display: none;
+  .btn:disabled { opacity: 0.45; cursor: not-allowed; filter: grayscale(0.6); }
+  #howto {
+    position: absolute; inset: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(4, 6, 12, 0.86);
   }
-  #hud-objective {
-    position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
-    z-index: 10; pointer-events: none; text-align: center;
-    font-size: 13px; color: #ffe9c8; background: rgba(10, 8, 24, 0.55);
-    border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 999px;
-    padding: 6px 16px; max-width: 90vw; white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis;
+  #howto .card {
+    background: #10182a; border: 1px solid var(--line);
+    border-radius: 12px; padding: 28px 32px; max-width: 620px;
+    text-align: left; line-height: 1.7; font-size: 15px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
   }
-  #hud-wanted-flash {
-    position: fixed; inset: 0; z-index: 8; pointer-events: none; display: none;
-    box-shadow: inset 0 0 120px rgba(255, 40, 40, 0.55);
+  #howto .card h2 { text-align: center; color: var(--gold); margin-bottom: 12px; }
+  #howto .card kbd {
+    background: #26314a; border: 1px solid #556; border-bottom-width: 3px;
+    border-radius: 5px; padding: 1px 7px; font-family: inherit; font-weight: 700;
   }
-  #touch-controls { position: fixed; inset: 0; z-index: 12; pointer-events: none; display: none; }
-  #touch-controls .tbtn {
-    position: absolute; pointer-events: auto; width: 58px; height: 58px;
-    border-radius: 50%; border: 1px solid rgba(255,255,255,0.4);
-    background: rgba(10, 8, 24, 0.5); color: #fff; font-size: 20px;
-    display: flex; align-items: center; justify-content: center; font-weight: 800;
-  }
-  #touch-controls .tbtn:active { background: rgba(255, 154, 60, 0.65); }
-  #tbtn-up { left: 26px; bottom: 150px; }
-  #tbtn-down { left: 26px; bottom: 78px; }
-  #tbtn-left { left: 90px; bottom: 114px; }
-  #tbtn-right { left: 154px; bottom: 114px; }
-  #tbtn-action { right: 26px; bottom: 96px; background: rgba(255, 154, 60, 0.6); }
-  #tbtn-fire { right: 96px; bottom: 150px; background: rgba(255, 60, 60, 0.55); }
-  #tbtn-jump { right: 26px; bottom: 168px; }
-  @media (pointer: coarse) { #touch-controls { display: block; } }
-  @media (max-width: 640px) {
-    #hud-minimap { width: 110px; height: 110px; }
-    #hud-money { font-size: 20px; }
-    #hud-mission { max-width: 230px; font-size: 13px; }
-    #hud-controls { display: none; }
-  }
+  #howto .card .btn { display: block; margin: 18px auto 0; }
+  .fineprint { margin-top: 22px; font-size: 12px; color: #8b96a8; }
 </style>
 </head>
 <body>
-<canvas id="game-canvas" width="1280" height="719"></canvas>
-<div id="hud-crosshair">+</div>
-<div id="hud-wanted-flash"></div>
-<div id="hud-objective">Misi 1: First Light — temui Rico di kantor marina.</div>
-<div id="touch-controls">
-  <div class="tbtn" id="tbtn-up" data-key="KeyW">&#8593;</div>
-  <div class="tbtn" id="tbtn-down" data-key="KeyS">&#8595;</div>
-  <div class="tbtn" id="tbtn-left" data-key="KeyA">&#8592;</div>
-  <div class="tbtn" id="tbtn-right" data-key="KeyD">&#8594;</div>
-  <div class="tbtn" id="tbtn-action" data-key="KeyE">E</div>
-  <div class="tbtn" id="tbtn-fire" data-key="KeyF">F</div>
-  <div class="tbtn" id="tbtn-jump" data-key="Space">&#8593;&#8593;</div>
-</div>
-<div id="hud-toast" role="status"></div>
+<div id="wrap">
+  <canvas id="game" width="1280" height="720" tabindex="0"></canvas>
 
-<div class="hud hud-top-left">
-  <div class="pill"><div id="hud-money">$500 <small>REP 0 &middot; Rookie</small></div>
-  <div id="hud-wanted"><span class="star-off">&#9733;&#9733;&#9733;&#9733;&#9733;</span></div>
-  <div id="hud-heat">HEAT <span id="hud-heat-num">0</span></div>
-  <div id="hud-heat-bar"><div id="hud-heat-fill"></div></div></div>
-  <div class="pill" id="hud-mission"><b>MISI</b><br><span id="hud-mission-text">Jelajahi Sunset Bay. Cari ikon misi di peta.</span></div>
-</div>
+  <!-- HUD -->
+  <div id="hud" class="hidden">
+    <div id="hud-top-left">
+      <div id="hud-cash">$250</div>
+      <div id="hud-wanted">☆☆☆☆☆</div>
+      <div id="hud-health-row">
+        <span id="hud-health-label">HP <span id="hud-health">100</span></span>
+        <div id="hud-health-track"><div id="hud-health-bar"></div></div>
+      </div>
+    </div>
+    <div id="hud-top-right">
+      <div id="hud-time">5:30 PM</div>
+      <div id="hud-weather">sunny</div>
+      <div id="hud-respect">Rookie</div>
+      <div id="hud-fps"></div>
+    </div>
+    <div id="hud-bottom-left">
+      <div id="hud-mission">No active mission.</div>
+      <div id="hud-speed">0 km/h</div>
+      <div id="hud-radio"></div>
+    </div>
+    <canvas id="minimap" width="180" height="180"></canvas>
+    <div id="toast" class="hidden"></div>
+  </div>
+  <div id="fatal" class="hidden"></div>
 
-<div class="hud hud-top-right">
-  <div class="pill"><div id="hud-time">18:20</div><div id="hud-day">Hari 1 &middot; Golden Hour</div><div id="hud-weather">Cerah &middot; Angin sepoi</div><div id="hud-radio">&#9834; Sunset FM</div></div>
-  <div id="hud-minimap"><canvas id="minimap-canvas" width="168" height="168"></canvas></div>
-</div>
+  <!-- Menu utama -->
+  <div id="menu" class="overlay">
+    <h1>Sunset Bay</h1>
+    <p class="tagline">A GTA 6 style open world. Fourteen districts, one golden hour,
+      and a crew waiting for its next big score.</p>
+    <button id="btn-start" class="btn" type="button">Start New Game</button>
+    <button id="btn-continue" class="btn secondary" type="button">Continue</button>
+    <button id="btn-howto" class="btn secondary" type="button">How to Play</button>
+    <p class="fineprint">Best on desktop Chrome / Edge with WebGL. Your progress saves
+      automatically to this browser.</p>
+  </div>
 
-<div class="hud hud-bottom-left">
-  <div class="pill"><div id="hud-health">HP <span id="hud-hp-num">100</span> &middot; ARMOR <span id="hud-armor-num">0</span></div>
-  <div class="bar"><div id="hud-health-fill"></div></div>
-  <div class="bar" style="margin-top:3px"><div id="hud-armor-fill"></div></div>
-  <div id="hud-weapon">PISTOL &middot; Ammo 24 &middot; [1-4] ganti senjata &middot; [R] isi ulang</div></div>
-  <div id="hud-controls">WASD gerak &middot; Shift lari &middot; Spasi lompat &middot; E masuk/keluar mobil &middot; F tembak &middot; C kamera &middot; M radio &middot; P pause &middot; H klakson</div>
-</div>
+  <!-- Cara main -->
+  <div id="howto" class="hidden">
+    <div class="card">
+      <h2>How to Play</h2>
+      <p><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> walk / drive &nbsp;·&nbsp;
+         <kbd>Shift</kbd> sprint &nbsp;·&nbsp; Mouse: look around (click the game to lock the mouse)</p>
+      <p><kbd>E</kbd> steal the nearest car / get out &nbsp;·&nbsp;
+         <kbd>Space</kbd> brake &nbsp;·&nbsp; <kbd>R</kbd> respray your car ($150) &nbsp;·&nbsp;
+         <kbd>F</kbd> interact</p>
+      <p><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> switch weapon &nbsp;·&nbsp; Left click: shoot &nbsp;·&nbsp;
+         <kbd>Q</kbd> next radio station &nbsp;·&nbsp; <kbd>M</kbd> mute &nbsp;·&nbsp;
+         <kbd>H</kbd> horn</p>
+      <p><kbd>Esc</kbd> / <kbd>P</kbd> pause. Follow the yellow marker on the minimap to
+         reach your mission. Stealing cars and shooting raise your wanted level — hide
+         from the police to cool down. Earn cash from missions, taxi and courier jobs,
+         street races, and the big three-phase heist. Build respect in all 14 districts
+         to unlock better prices and missions.</p>
+      <button id="btn-howto-close" class="btn" type="button">Got it</button>
+    </div>
+  </div>
 
-<div class="hud hud-bottom-right">
-  <div class="pill"><div id="hud-speed">0 <small>km/j</small></div><div id="hud-zone" style="font-size:12px;color:#ffd9a8">Sunset Beach</div></div>
-</div>
-<div id="hud-fps"></div>
+  <!-- Pause -->
+  <div id="pause" class="overlay hidden">
+    <h2>Paused</h2>
+    <p class="body">Sunset Bay is waiting. The sun is not — it sets at 6 PM.</p>
+    <button id="btn-resume" class="btn" type="button">Resume</button>
+    <button id="btn-menu" class="btn secondary" type="button">Back to Menu</button>
+  </div>
 
-<div id="screen-start">
-  <div class="game-title">SUNSET BAY</div>
-  <div class="game-sub">Kota pantai, matahari terbenam, dan satu malam yang mengubah segalanya.</div>
-  <div class="game-tag">OPEN WORLD &middot; 20+ MISI &middot; 5 BALAPAN &middot; 6 RADIO &middot; CREW &middot; HEIST</div>
-  <button class="btn" id="btn-start" type="button">MULAI PETUALANGAN</button>
-  <button class="btn btn-secondary" id="btn-continue" type="button">LANJUTKAN (SAVE)</button>
-  <div class="keys">
-    <b>WASD</b> gerak / mengemudi &nbsp;&middot;&nbsp; <b>E</b> masuk mobil / perahu &nbsp;&middot;&nbsp; <b>F</b> tembak<br>
-    <b>Shift</b> lari &nbsp;&middot;&nbsp; <b>Spasi</b> lompat &nbsp;&middot;&nbsp; <b>1-4</b> senjata &nbsp;&middot;&nbsp; <b>M</b> radio &nbsp;&middot;&nbsp; <b>P</b> pause
+  <!-- Game over -->
+  <div id="gameover" class="overlay hidden">
+    <h2>Busted / Wasted</h2>
+    <p class="body" id="gameover-reason">Busted.</p>
+    <button id="btn-restart" class="btn" type="button">Try Again</button>
+    <button id="btn-menu-2" class="btn secondary" type="button">Back to Menu</button>
+  </div>
+
+  <!-- Menang -->
+  <div id="win" class="overlay hidden">
+    <h2>Sunset Bay is Yours</h2>
+    <p class="body">The heist is done, the crew is rich, and every district in the city
+      knows your name. You beat Sunset Bay — now go for a faster time, a bigger
+      payout, and five stars of trouble.</p>
+    <button id="btn-restart-2" class="btn" type="button">Play Again</button>
   </div>
 </div>
 
-<div id="screen-pause">
-  <div class="game-title" style="font-size:52px">JEDA</div>
-  <div class="game-sub">Sunset Bay menunggumu. Matahari belum tenggelam.</div>
-  <button class="btn" id="btn-resume" type="button">LANJUTKAN</button>
-  <button class="btn btn-secondary" id="btn-save-quit" type="button">SIMPAN &amp; KE MENU</button>
-</div>
-
-<div id="screen-end">
-  <div class="game-title" style="font-size:52px">MALAM TIBA</div>
-  <div class="game-sub" id="screen-end-text">Hari pertama selesai. Kota ini milikmu besok.</div>
-  <button class="btn" id="btn-again" type="button">MAIN LAGI</button>
-</div>
-
-<div id="hud-loading"><div class="spin">&#9728;</div><div>Memuat Sunset Bay&hellip;</div></div>
-<noscript><p style="position:fixed;inset:0;background:#1a0f2e;color:#fff;display:flex;align-items:center;justify-content:center;z-index:99">Sunset Bay butuh JavaScript aktif.</p></noscript>
-
-<!-- URUTAN LOAD WAJIB (spec v12/v13): 21 script, lokal semua, tanpa request jaringan. -->
-<script src="src/math3.js"></script>
-<script src="src/rng.js"></script>
-<script src="src/gl.js"></script>
-<script src="src/meshes.js"></script>
-<script src="src/city.js"></script>
-<script src="src/water.js"></script>
-<script src="src/vehicles.js"></script>
-<script src="src/player.js"></script>
-<script src="src/npc.js"></script>
-<script src="src/police.js"></script>
-<script src="src/crew.js"></script>
-<script src="src/economy.js"></script>
-<script src="src/races.js"></script>
-<script src="src/weather.js"></script>
-<script src="src/fx.js"></script>
-<script src="src/audio.js"></script>
-<script src="src/hud.js"></script>
-<script src="src/jobs.js"></script>
-<script src="src/shots.js"></script>
-<script src="src/game.js"></script>
-<script src="src/main.js"></script>
+<script type="module" src="src/config.js"></script>
+<script type="module" src="src/gl.js"></script>
+<script type="module" src="src/render.js"></script>
+<script type="module" src="src/city.js"></script>
+<script type="module" src="src/world.js"></script>
+<script type="module" src="src/audio.js"></script>
+<script type="module" src="src/fx.js"></script>
+<script type="module" src="src/weather.js"></script>
+<script type="module" src="src/water.js"></script>
+<script type="module" src="src/npc.js"></script>
+<script type="module" src="src/police.js"></script>
+<script type="module" src="src/vehicles.js"></script>
+<script type="module" src="src/player.js"></script>
+<script type="module" src="src/weapons.js"></script>
+<script type="module" src="src/crew.js"></script>
+<script type="module" src="src/economy.js"></script>
+<script type="module" src="src/respect.js"></script>
+<script type="module" src="src/races.js"></script>
+<script type="module" src="src/heist.js"></script>
+<script type="module" src="src/missions.js"></script>
+<script type="module" src="src/game.js"></script>
+<script type="module" src="src/main.js"></script>
+<script type="module">
+  // Semua modul sudah terdaftar di window.SB pada titik ini — baru mulai game.
+  if (window.SB && window.SB.Main && typeof window.SB.Main.start === 'function') {
+    window.SB.Main.start();
+  } else {
+    document.getElementById('fatal').textContent =
+      'Sunset Bay failed to load: SB.Main is missing.';
+    document.getElementById('fatal').classList.remove('hidden');
+  }
+</script>
 </body>
 </html>

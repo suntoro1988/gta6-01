@@ -1,290 +1,609 @@
-window.SB = window.SB || {};
+// npc.js — Sunset Bay v14
+// Builder G (AI & city life).
+// Kota hidup: pejalan kaki di trotoar + zebra cross, dan lalu lintas AI.
+// Komunikasi antar modul HANYA lewat namespace SB (lihat design spec §4).
+// Modul ini tidak meng-import modul lain dan tidak membaca file sumber lain.
+
 (function () {
-  'use strict';
+  "use strict";
 
-  // SB.NPC — warga Sunset Bay yang hidup.
-  // 24+ pejalan kaki: jalan, selfie, lari saat takut, bersorak, turis pantai,
-  // pedagang kaki lima, jogger, anak-anak, hewan peliharaan. Perilaku digerakkan
-  // oleh SB.state (wanted, heat, timeOfDay, posisi pemain).
+  window.SB = window.SB || {};
+  var SB = window.SB;
 
-  var WALK_SPEED = 1.1, JOG_SPEED = 3.4, FLEE_SPEED = 5.2;
-  var TARGET_COUNT = 28, CITY_HALF = 220;
-  var KINDS = ['local', 'tourist', 'jogger', 'vendor', 'kid', 'elder', 'worker'];
-  var SHIRT_COLORS = [
-    [0.95, 0.35, 0.30], [0.30, 0.55, 0.95], [0.95, 0.80, 0.25],
-    [0.35, 0.80, 0.45], [0.95, 0.55, 0.75], [0.60, 0.40, 0.85],
-    [0.95, 0.95, 0.90], [0.20, 0.20, 0.25], [0.95, 0.60, 0.20],
-    [0.25, 0.75, 0.70], [0.85, 0.30, 0.55], [0.55, 0.65, 0.30]
-  ];
-  var SKIN_TONES = [
-    [0.92, 0.76, 0.62], [0.78, 0.58, 0.42], [0.62, 0.44, 0.32],
-    [0.85, 0.66, 0.50], [0.55, 0.38, 0.28]
-  ];
-  var PET_COLORS = [
-    [0.55, 0.38, 0.22], [0.90, 0.85, 0.75], [0.15, 0.15, 0.15],
-    [0.75, 0.60, 0.40], [0.95, 0.95, 0.95]
-  ];
-
-  var _state = null, _time = 0, _rngState = 1337;
-
-  function rnd() {
-    _rngState = (_rngState * 1664525 + 1013904223) >>> 0;
-    return _rngState / 4294967296;
-  }
-  function rand(a, b) { return a + rnd() * (b - a); }
-  function pick(arr) { return arr[Math.floor(rnd() * arr.length)]; }
-  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
-  function dist2(ax, az, bx, bz) {
+  // ---------------------------------------------------------------------------
+  // Util kecil (mandiri, tanpa dependensi modul lain)
+  // ---------------------------------------------------------------------------
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function randInt(a, b) { return Math.floor(rand(a, b + 1)); }
+  function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+  function dist2D(ax, az, bx, bz) {
     var dx = ax - bx, dz = az - bz;
-    return dx * dx + dz * dz;
+    return Math.sqrt(dx * dx + dz * dz);
+  }
+  function angleTo(ax, az, bx, bz) { return Math.atan2(bx - ax, bz - az); }
+
+  // ---------------------------------------------------------------------------
+  // Grid jalan (fallback mandiri).
+  // Kota 1200x1200: jalan lurus tiap 100 m, lebar ~14 m, trotoar di ±9 m dari
+  // garis tengah. Bila SB.City.isRoad tersedia saat runtime, fungsi itu yang
+  // dipakai untuk validasi; grid di bawah hanya penopang internal.
+  // ---------------------------------------------------------------------------
+  var ROAD_STEP = 100;
+  var ROAD_HALF = 7;      // setengah lebar jalan
+  var WALK_OFFSET = 10;   // jarak trotoar dari garis tengah jalan
+  var CITY_HALF = 560;    // batas area pejalan kaki / lalu lintas
+
+  function nearestRoadCoord(v) {
+    return Math.round(v / ROAD_STEP) * ROAD_STEP;
+  }
+  function isOnRoadGrid(x, z) {
+    var dx = Math.abs(x - nearestRoadCoord(x));
+    var dz = Math.abs(z - nearestRoadCoord(z));
+    return dx <= ROAD_HALF || dz <= ROAD_HALF;
+  }
+  function isRoadAt(x, z) {
+    if (SB.City && typeof SB.City.isRoad === "function") {
+      try { return !!SB.City.isRoad(x, z); } catch (e) { /* jatuh ke grid */ }
+    }
+    return isOnRoadGrid(x, z);
+  }
+  function districtAt(x, z) {
+    if (SB.City && typeof SB.City.getDistrictAt === "function") {
+      try { return SB.City.getDistrictAt(x, z); } catch (e) { /* lanjut */ }
+    }
+    return null;
   }
 
-  function makePet(owner) {
+  // Titik trotoar: di samping sebuah jalan lurus, pada koordinat grid.
+  function sidewalkPoint() {
+    var along = randInt(-5, 5) * ROAD_STEP;
+    var cross = randInt(-5, 5) * ROAD_STEP;
+    var side = Math.random() < 0.5 ? -1 : 1;
+    if (Math.random() < 0.5) {
+      // Berjalan sejajar sumbu X: jalan di z = cross, trotoar z = cross ± 10.
+      return { x: clamp(along, -CITY_HALF, CITY_HALF), z: clamp(cross + side * WALK_OFFSET, -CITY_HALF, CITY_HALF) };
+    }
+    // Berjalan sejajar sumbu Z: jalan di x = cross, trotoar x = cross ± 10.
+    return { x: clamp(cross + side * WALK_OFFSET, -CITY_HALF, CITY_HALF), z: clamp(along, -CITY_HALF, CITY_HALF) };
+  }
+
+  // Titik zebra cross: persimpangan dua jalan (kelipatan 100,100).
+  function crosswalkPoint() {
     return {
-      x: owner.x + rand(-0.6, 0.6), z: owner.z + rand(-0.6, 0.6),
-      angle: rand(0, Math.PI * 2), color: pick(PET_COLORS),
-      size: rand(0.35, 0.6), kind: rnd() < 0.7 ? 'dog' : 'cat',
-      wag: rand(0, Math.PI * 2), speed: rand(0.8, 1.4)
+      x: randInt(-5, 5) * ROAD_STEP,
+      z: randInt(-5, 5) * ROAD_STEP
     };
   }
 
-  function makePedestrian(x, z, kind) {
-    kind = kind || pick(KINDS);
-    var p = {
-      x: x, z: z, angle: rand(0, Math.PI * 2),
-      speed: kind === 'jogger' ? JOG_SPEED : (kind === 'kid' ? rand(1.4, 1.9) : rand(0.8, 1.4)),
-      state: 'walk', kind: kind, shirt: pick(SHIRT_COLORS), skin: pick(SKIN_TONES),
-      scale: kind === 'kid' ? 0.62 : (kind === 'elder' ? 0.92 : rand(0.95, 1.08)),
-      timer: rand(2, 9), targetX: x, targetZ: z, panic: 0,
-      selfieT: 0, cheerT: 0, chatWith: -1, pet: null, beach: false,
-      phoneUp: false, bobPhase: rand(0, Math.PI * 2), steps: 0
+  // ---------------------------------------------------------------------------
+  // PEJALAN KAKI
+  // ---------------------------------------------------------------------------
+  var MOODS = ["calm", "happy", "hurried", "tourist", "chatting", "selfie", "phone"];
+  var SHIRT_COLORS = [
+    [0.85, 0.25, 0.25], [0.25, 0.45, 0.85], [0.95, 0.85, 0.30],
+    [0.30, 0.75, 0.40], [0.90, 0.55, 0.85], [0.95, 0.95, 0.95],
+    [0.15, 0.15, 0.20], [0.95, 0.55, 0.20], [0.45, 0.80, 0.85],
+    [0.70, 0.30, 0.70], [0.55, 0.75, 0.30], [0.85, 0.65, 0.35]
+  ];
+  var SKIN_COLORS = [
+    [0.95, 0.80, 0.65], [0.80, 0.60, 0.45], [0.60, 0.42, 0.30],
+    [0.98, 0.88, 0.78], [0.72, 0.52, 0.38]
+  ];
+  var NAMES = [
+    "Maya", "Rico", "Sinta", "Dimas", "Luna", "Beto", "Nadia", "Fajar",
+    "Cleo", "Andre", "Rosa", "Kiki", "Tomas", "Ira", "Yusuf", "Dewi",
+    "Marco", "Lia", "Hugo", "Tania", "Eko", "Sari", "Pablo", "Nina",
+    "Omar", "Vera", "Dante", "Mira", "Seno", "Alya", "Rudi", "Citra",
+    "Joko", "Elsa", "Bima", "Rani", "Doni", "Lulu"
+  ];
+
+  function makePedestrian(id) {
+    var start = sidewalkPoint();
+    var mood = pick(MOODS);
+    var ped = {
+      id: id,
+      kind: "pedestrian",
+      name: NAMES[id % NAMES.length],
+      pos: { x: start.x, y: 0, z: start.z },
+      dest: sidewalkPoint(),
+      rotY: 0,
+      speed: mood === "hurried" ? rand(1.9, 2.6) : mood === "tourist" ? rand(0.5, 0.9) : rand(1.0, 1.6),
+      walkSpeed: 0,
+      mood: mood,
+      state: "walking",       // walking | idle | crossing | selfie | recording | fleeing | down | chatting
+      color: pick(SHIRT_COLORS),
+      skin: pick(SKIN_COLORS),
+      scale: rand(0.92, 1.08),
+      idleTimer: 0,
+      selfieTimer: mood === "selfie" ? rand(2, 6) : 0,
+      phoneOut: mood === "selfie" || mood === "phone" || mood === "tourist",
+      panic: 0,               // 0..1, naik saat react() memicu lari
+      panicTime: 0,
+      fleeTarget: null,
+      recordTimer: 0,         // durasi merekam dengan HP saat ada kejadian
+      recordTarget: null,
+      waitAtCrossing: 0,
+      crossing: false,
+      downTimer: 0,
+      chatPartner: null,
+      homeDistrict: null,
+      stepPhase: Math.random() * Math.PI * 2
     };
-    if (kind === 'tourist') { p.beach = rnd() < 0.65; p.shirt = [0.98, 0.85, 0.55]; }
-    if (kind === 'vendor') { p.state = 'idle'; p.timer = rand(8, 20); }
-    if (rnd() < 0.22 && kind !== 'kid' && kind !== 'jogger') p.pet = makePet(p);
-    pickTarget(p);
-    return p;
+    ped.walkSpeed = ped.speed;
+    ped.rotY = angleTo(ped.pos.x, ped.pos.z, ped.dest.x, ped.dest.z);
+    var d = districtAt(ped.pos.x, ped.pos.z);
+    ped.homeDistrict = d && d.name ? d.name : null;
+    return ped;
   }
 
-  function pickTarget(p) {
-    if (p.beach && rnd() < 0.6) {
-      p.targetX = rand(-140, 140);   // turis pantai berkumpul di garis pantai
-      p.targetZ = rand(150, 205);
+  var PEDESTRIANS = [];
+  for (var i = 0; i < 36; i++) {
+    PEDESTRIANS.push(makePedestrian(i));
+  }
+
+  // Pilih tujuan baru: sebagian besar titik trotoar, kadang zebra cross
+  // (menyeberang), kadang berhenti sebentar di tempat (idle / selfie).
+  function pickNewDestination(ped) {
+    var roll = Math.random();
+    if (roll < 0.16) {
+      // Menyeberang lewat zebra cross: dest di seberang jalan.
+      var cross = crosswalkPoint();
+      ped.dest = cross;
+      ped.crossing = true;
+      ped.waitAtCrossing = rand(0, 1.5); // tunggu sejenak sebelum menyeberang
+      ped.state = "walking";
+    } else if (roll < 0.26) {
+      // Berhenti: selfie / lihat HP / ngobrol.
+      ped.state = ped.mood === "selfie" ? "selfie" : (Math.random() < 0.5 ? "idle" : "chatting");
+      ped.idleTimer = rand(2, 7);
+      ped.selfieTimer = ped.state === "selfie" ? rand(2, 6) : 0;
+      ped.dest = { x: ped.pos.x, z: ped.pos.z };
+      ped.crossing = false;
     } else {
-      p.targetX = rand(-CITY_HALF, CITY_HALF);
-      p.targetZ = rand(-CITY_HALF, CITY_HALF);
+      ped.dest = sidewalkPoint();
+      ped.crossing = false;
+      ped.state = "walking";
     }
   }
 
-  function nearestStreet(x, z) {
-    // Jalan grid tiap 40 unit; tarik pejalan kaki ke trotoar terdekat.
-    var gx = Math.round(x / 40) * 40, gz = Math.round(z / 40) * 40;
-    if (Math.abs(x - gx) < Math.abs(z - gz)) return { x: gx + 3.5, z: z };
-    return { x: x, z: gz + 3.5 };
-  }
-
-  function moveToward(p, tx, tz, speed, dt) {
-    var dx = tx - p.x, dz = tz - p.z;
-    var len = Math.sqrt(dx * dx + dz * dz);
-    if (len < 0.001) return;
-    p.angle = Math.atan2(dx, dz);
-    var step = Math.min(len, speed * dt);
-    p.x += (dx / len) * step;
-    p.z += (dz / len) * step;
-  }
-
-  function reached(p, r) { return dist2(p.x, p.z, p.targetX, p.targetZ) < r * r; }
-
-  function scaleMat(m, sx, sy, sz) {
-    m[0] *= sx; m[1] *= sx; m[2] *= sx;   // skala kolom matriks 4x4 (column-major)
-    m[4] *= sy; m[5] *= sy; m[6] *= sy;
-    m[8] *= sz; m[9] *= sz; m[10] *= sz;
-    return m;
-  }
-
-  function updatePet(pet, owner, dt) {
-    pet.wag += dt * 6;
-    var dx = owner.x - pet.x, dz = owner.z - pet.z;
-    var len = Math.sqrt(dx * dx + dz * dz);
-    if (len > 0.4) {
-      pet.angle = Math.atan2(dx, dz);
-      var step = Math.min(len, (len > 1.2 ? pet.speed * 2.4 : pet.speed) * dt);
-      pet.x += (dx / len) * step;
-      pet.z += (dz / len) * step;
+  // Pejalan kaki menghindar dari mobil AI & mobil player yang mendekat.
+  function avoidCars(ped, dt) {
+    var danger = null;
+    var dangerDist = 6;
+    for (var i = 0; i < CARS_AI.length; i++) {
+      var car = CARS_AI[i];
+      var d = dist2D(ped.pos.x, ped.pos.z, car.pos.x, car.pos.z);
+      if (d < dangerDist) { danger = car; dangerDist = d; }
     }
-    // Anjing berlari kecil mengitari pemilik saat pemilik idle.
-    if (owner.state === 'idle' && pet.kind === 'dog' && len < 0.8) {
-      pet.angle += dt * 1.5;
-      pet.x = owner.x + Math.sin(pet.angle) * 0.7;
-      pet.z = owner.z + Math.cos(pet.angle) * 0.7;
+    var player = currentPlayer();
+    if (player && !player.onFoot && player.vehicle) {
+      var v = player.vehicle;
+      var dp = dist2D(ped.pos.x, ped.pos.z, v.pos.x, v.pos.z);
+      if (dp < dangerDist) { danger = v; dangerDist = dp; }
+    }
+    if (!danger) return;
+    // Melangkah tegak lurus menjauhi arah datang mobil.
+    var away = angleTo(danger.pos.x, danger.pos.z, ped.pos.x, ped.pos.z);
+    var side = away + Math.PI / 2;
+    ped.pos.x += Math.cos(side) * ped.speed * 1.4 * dt;
+    ped.pos.z += Math.sin(side) * ped.speed * 1.4 * dt;
+    ped.pos.x = clamp(ped.pos.x, -CITY_HALF, CITY_HALF);
+    ped.pos.z = clamp(ped.pos.z, -CITY_HALF, CITY_HALF);
+  }
+
+  // Ambil info player dari SB.Game.state / SB.Player bila tersedia.
+  function currentPlayer() {
+    try {
+      if (SB.Player && SB.Player.pos) {
+        return {
+          pos: SB.Player.pos,
+          onFoot: SB.Player.onFoot !== false,
+          vehicle: SB.Player.currentVehicle || null,
+          speed: SB.Player.speed || 0
+        };
+      }
+      if (SB.Game && SB.Game.state && SB.Game.state.player) {
+        var p = SB.Game.state.player;
+        return { pos: p.pos || { x: 0, y: 0, z: 0 }, onFoot: p.onFoot !== false, vehicle: p.vehicle || null, speed: p.speed || 0 };
+      }
+    } catch (e) { /* modul lain belum siap */ }
+    return null;
+  }
+
+  // Tabrakan dengan mobil player: pejalan kaki jatuh, polisi dipanggil.
+  function checkPlayerHit(ped) {
+    var player = currentPlayer();
+    if (!player || player.onFoot || !player.vehicle) return;
+    var v = player.vehicle;
+    var speed = Math.abs(v.speed || player.speed || 0);
+    if (speed < 2) return;
+    var d = dist2D(ped.pos.x, ped.pos.z, v.pos.x, v.pos.z);
+    if (d < 1.6 && ped.state !== "down") {
+      knockDown(ped, v);
     }
   }
 
-  function drawPet(gl, pet, M) {
-    if (!window.SB.Meshes || !window.SB.Meshes.person) return;
-    var m = M.mat4Identity();
-    m = M.mat4Translate(m, pet.x, 0.12, pet.z);
-    m = M.mat4RotateY(m, pet.angle + Math.sin(pet.wag) * 0.1);
-    m = scaleMat(m, pet.size, pet.size * 0.55, pet.size * 1.3);
-    gl.drawMesh(window.SB.Meshes.person(pet.color), m, pet.color);
+  function knockDown(ped, vehicle) {
+    ped.state = "down";
+    ped.downTimer = rand(4, 8);
+    ped.panic = 1;
+    ped.dest = { x: ped.pos.x, z: ped.pos.z };
+    if (SB.FX && typeof SB.FX.spawnParticles === "function") {
+      try { SB.FX.spawnParticles(ped.pos, [1.0, 0.3, 0.2], 10); } catch (e) { /* abaikan */ }
+    }
+    if (SB.Audio && typeof SB.Audio.sfx === "function") {
+      try { SB.Audio.sfx("crash"); } catch (e) { /* abaikan */ }
+    }
+    if (SB.Police && typeof SB.Police.commitCrime === "function") {
+      try { SB.Police.commitCrime("hit_pedestrian", ped.pos); } catch (e) { /* abaikan */ }
+    }
+    // Pejalan kaki di sekitar ikut panik.
+    react({ type: "crash", pos: { x: ped.pos.x, y: 0, z: ped.pos.z }, radius: 25 });
   }
 
-  var NPC = {
-    pedestrians: [],
-
-    init: function (state) {
-      _state = state || null;
-      _time = 0;
-      NPC.pedestrians.length = 0;
-      // Pantai ramai di awal: 10 turis di garis pantai, sisanya tersebar di kota.
-      for (var i = 0; i < 10; i++) {
-        NPC.pedestrians.push(makePedestrian(rand(-130, 130), rand(150, 200), 'tourist'));
+  // ---------------------------------------------------------------------------
+  // Update pejalan kaki
+  // ---------------------------------------------------------------------------
+  function updatePedestrian(ped, dt) {
+    // Terjatuh: berbaring sebentar lalu bangkit dan kabur.
+    if (ped.state === "down") {
+      ped.downTimer -= dt;
+      if (ped.downTimer <= 0) {
+        ped.state = "fleeing";
+        ped.panic = 0.9;
+        ped.panicTime = 3;
+        ped.fleeTarget = sidewalkPoint();
       }
-      for (var j = 10; j < TARGET_COUNT; j++) {
-        var pos = nearestStreet(rand(-CITY_HALF, CITY_HALF), rand(-CITY_HALF, CITY_HALF));
-        NPC.pedestrians.push(makePedestrian(pos.x, pos.z));
+      return;
+    }
+
+    // Merekam kejadian dengan HP: berdiri diam menghadap sumber kejadian.
+    if (ped.state === "recording") {
+      ped.recordTimer -= dt;
+      if (ped.recordTarget) {
+        ped.rotY = angleTo(ped.pos.x, ped.pos.z, ped.recordTarget.x, ped.recordTarget.z);
       }
-    },
-
-    spawn: function (x, z) {
-      if (NPC.pedestrians.length >= 64) return null;
-      var p = makePedestrian(x, z);
-      NPC.pedestrians.push(p);
-      return p;
-    },
-
-    flee: function (x, z) {
-      // Semua pejalan kaki dalam radius 26 unit lari menjauh dari (x, z).
-      for (var i = 0; i < NPC.pedestrians.length; i++) {
-        var p = NPC.pedestrians[i];
-        if (dist2(p.x, p.z, x, z) >= 26 * 26) continue;
-        p.state = 'flee';
-        p.panic = 1;
-        p.timer = rand(2.5, 5);
-        var dx = p.x - x, dz = p.z - z;
-        var len = Math.sqrt(dx * dx + dz * dz) || 1;
-        p.targetX = clamp(p.x + (dx / len) * rand(30, 55), -CITY_HALF - 20, CITY_HALF + 20);
-        p.targetZ = clamp(p.z + (dz / len) * rand(30, 55), -CITY_HALF - 20, CITY_HALF + 20);
-        p.angle = Math.atan2(dx, dz);
-        if (p.pet) p.pet.speed = 2.2;
+      if (ped.recordTimer <= 0) {
+        ped.state = "fleeing";
+        ped.panic = 0.6;
+        ped.panicTime = 2.5;
+        ped.fleeTarget = sidewalkPoint();
+        ped.recordTarget = null;
       }
-    },
+      return;
+    }
 
-    cheer: function (x, z) {
-      // Pejalan kaki di sekitar (x, z) bersorak (mis. pemain menang balapan).
-      for (var i = 0; i < NPC.pedestrians.length; i++) {
-        var p = NPC.pedestrians[i];
-        if (dist2(p.x, p.z, x, z) < 20 * 20 && p.state !== 'flee') {
-          p.state = 'cheer';
-          p.cheerT = rand(2, 4.5);
-          p.timer = p.cheerT;
-          p.angle = Math.atan2(x - p.x, z - p.z);
+    // Lari panik menjauh dari sumber bahaya.
+    if (ped.state === "fleeing") {
+      ped.panicTime -= dt;
+      ped.panic = Math.max(0, ped.panicTime / 3);
+      var target = ped.fleeTarget || sidewalkPoint();
+      moveToward(ped, target, ped.speed * 3.1, dt);
+      if (ped.panicTime <= 0 || dist2D(ped.pos.x, ped.pos.z, target.x, target.z) < 2) {
+        ped.state = "walking";
+        ped.panic = 0;
+        ped.fleeTarget = null;
+        pickNewDestination(ped);
+      }
+      return;
+    }
+
+    // Diam: selfie / idle / ngobrol.
+    if (ped.state === "idle" || ped.state === "selfie" || ped.state === "chatting") {
+      ped.idleTimer -= dt;
+      if (ped.state === "selfie") {
+        ped.selfieTimer -= dt;
+        // Putar badan pelan seolah mencari angle foto terbaik.
+        ped.rotY += dt * 0.6;
+        if (ped.selfieTimer <= 0) {
+          ped.state = "walking";
+          pickNewDestination(ped);
         }
+      } else if (ped.idleTimer <= 0) {
+        pickNewDestination(ped);
       }
-    },
+      return;
+    }
 
-    update: function (dt, state) {
-      _time += dt;
-      if (state) _state = state;
-      var st = _state || state;
-      var px = st && st.player ? st.player.x : 0;
-      var pz = st && st.player ? st.player.z : 0;
-      var wanted = st ? st.wanted : 0;
-      var hour = st ? st.timeOfDay : 18.33;
-      // Malam hari: sebagian warga pulang, jalanan lebih sepi.
-      var nightFactor = (hour < 6 || hour >= 21) ? 0.55 : 1;
+    // Menunggu sebelum menyeberang di zebra cross.
+    if (ped.crossing && ped.waitAtCrossing > 0) {
+      ped.waitAtCrossing -= dt;
+      return;
+    }
 
-      for (var i = NPC.pedestrians.length - 1; i >= 0; i--) {
-        var p = NPC.pedestrians[i];
-        p.timer -= dt;
-        p.bobPhase += dt * (p.state === 'walk' ? p.speed * 4 : 2);
+    // Berjalan menuju tujuan.
+    moveToward(ped, ped.dest, ped.speed, dt);
+    avoidCars(ped, dt);
+    checkPlayerHit(ped);
 
-        if (p.state === 'flee') {
-          moveToward(p, p.targetX, p.targetZ, FLEE_SPEED, dt);
-          if (p.timer <= 0 || reached(p, 2)) {
-            p.state = 'walk'; p.panic = 0; p.timer = rand(3, 8);
-            pickTarget(p);
-            if (p.pet) p.pet.speed = 1.1;
-          }
-        } else if (p.state === 'cheer') {
-          p.cheerT -= dt;
-          if (p.cheerT <= 0) { p.state = 'walk'; p.timer = rand(2, 6); pickTarget(p); }
-        } else if (p.state === 'selfie') {
-          p.selfieT -= dt;
-          p.phoneUp = true;
-          p.angle += dt * 0.25;   // putar pelan menghadap sunset (barat, -x)
-          if (p.selfieT <= 0) {
-            p.state = 'walk'; p.phoneUp = false; p.timer = rand(4, 10); pickTarget(p);
-          }
-        } else if (p.state === 'idle') {
-          if (p.timer <= 0) {
-            if (p.kind === 'vendor') p.timer = rand(8, 20);
-            else if (p.beach && rnd() < 0.5) { p.state = 'selfie'; p.selfieT = rand(2, 5); }
-            else { p.state = 'walk'; pickTarget(p); }
-          }
-        } else {
-          var sp = p.kind === 'jogger' ? JOG_SPEED : p.speed;
-          moveToward(p, p.targetX, p.targetZ, sp, dt);
-          p.steps += dt * sp;
-          if (reached(p, 1.5) || p.timer <= 0) {
-            var roll = rnd();
-            if (roll < 0.14 && p.beach) { p.state = 'selfie'; p.selfieT = rand(2, 5); }
-            else if (roll < 0.30) { p.state = 'idle'; p.timer = rand(1.5, 6); }
-            else { pickTarget(p); p.timer = rand(6, 14); }
-          }
-          // Warga menghindar dari pemain yang berlari ke arah mereka.
-          if (st && st.player && dist2(p.x, p.z, px, pz) < 4 && wanted === 0) p.angle += dt * 2;
-        }
-
-        // Reaksi terhadap wanted: warga menjauh saat polisi mengejar pemain.
-        if (wanted >= 3 && dist2(p.x, p.z, px, pz) < 18 * 18 && p.state !== 'flee') {
-          NPC.flee(px, pz);
-        }
-        if (p.pet) updatePet(p.pet, p, dt);
-        p.x = clamp(p.x, -CITY_HALF - 25, CITY_HALF + 25);
-        p.z = clamp(p.z, -CITY_HALF - 25, CITY_HALF + 25);
-      }
-
-      // Jaga populasi: tambah pejalan kaki sampai target (dikurangi malam hari).
-      var want = Math.floor(TARGET_COUNT * nightFactor);
-      while (NPC.pedestrians.length < want) {
-        var sx = rand(-CITY_HALF, CITY_HALF), sz = rand(-CITY_HALF, CITY_HALF);
-        if (dist2(sx, sz, px, pz) > 30 * 30) NPC.pedestrians.push(makePedestrian(sx, sz));
-        else break;   // jangan spawn tepat di depan pemain
-      }
-      // Golden hour: warga pantai bertambah.
-      if (hour >= 17 && hour <= 19 && rnd() < dt * 0.5 && NPC.pedestrians.length < 40) {
-        NPC.pedestrians.push(makePedestrian(rand(-130, 130), rand(150, 200), 'tourist'));
-      }
-    },
-
-    draw: function (gl, state) {
-      if (!gl || !gl.drawMesh || !window.SB.Meshes || !window.SB.Meshes.person) return;
-      var M = window.SB.Math3;
-      var person = window.SB.Meshes.person;
-      for (var i = 0; i < NPC.pedestrians.length; i++) {
-        var p = NPC.pedestrians[i];
-        var bob = 0, lean = 0;
-        if (p.state === 'walk' || p.state === 'flee') {
-          bob = Math.abs(Math.sin(p.bobPhase)) * 0.06;
-          lean = Math.sin(p.bobPhase) * 0.06;
-        } else if (p.state === 'cheer') {
-          bob = Math.abs(Math.sin(_time * 9 + i)) * 0.22;
-        }
-        var m = M.mat4Identity();
-        m = M.mat4Translate(m, p.x, bob, p.z);
-        m = M.mat4RotateY(m, p.angle + lean);
-        m = scaleMat(m, p.scale, p.scale, p.scale);
-        gl.drawMesh(person(p.shirt), m, p.shirt);
-        if (p.phoneUp) {
-          var pm = M.mat4Identity();
-          pm = M.mat4Translate(pm, p.x + Math.sin(p.angle) * 0.5, 1.5 * p.scale, p.z + Math.cos(p.angle) * 0.5);
-          gl.drawMesh(person([0.1, 0.1, 0.12]), pm, [0.1, 0.1, 0.12]);
-        }
-        if (p.pet) drawPet(gl, p.pet, M);
+    var arrived = dist2D(ped.pos.x, ped.pos.z, ped.dest.x, ped.dest.z) < 1.5;
+    if (arrived) {
+      if (ped.crossing) {
+        // Sampai di seberang: lanjut ke trotoar berikutnya.
+        ped.crossing = false;
+        ped.dest = sidewalkPoint();
+      } else {
+        pickNewDestination(ped);
       }
     }
+  }
+
+  function moveToward(ped, target, speed, dt) {
+    var dx = target.x - ped.pos.x;
+    var dz = target.z - ped.pos.z;
+    var d = Math.sqrt(dx * dx + dz * dz);
+    if (d < 0.01) return;
+    var step = Math.min(d, speed * dt);
+    ped.pos.x += (dx / d) * step;
+    ped.pos.z += (dz / d) * step;
+    ped.rotY = angleTo(ped.pos.x - (dx / d) * step, ped.pos.z - (dz / d) * step, ped.pos.x, ped.pos.z);
+    ped.stepPhase += dt * speed * 4;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Reaksi terhadap kejadian (tembakan / ledakan / kejar-kejaran / tabrakan)
+  // event: { type: 'gunshot'|'explosion'|'chase'|'crash', pos: {x,y,z}, radius? }
+  // ---------------------------------------------------------------------------
+  function react(event) {
+    if (!event || !event.pos) return;
+    var type = event.type || "gunshot";
+    var radius = event.radius || (type === "explosion" ? 90 : type === "chase" ? 60 : 45);
+    var ex = event.pos.x, ez = event.pos.z;
+
+    for (var i = 0; i < PEDESTRIANS.length; i++) {
+      var ped = PEDESTRIANS[i];
+      if (ped.state === "down") continue;
+      var d = dist2D(ped.pos.x, ped.pos.z, ex, ez);
+      if (d > radius) continue;
+
+      // Sebagian pejalan kaki (terutama turis & yang pegang HP) merekam dulu
+      // sebelum lari — ciri khas kota Sunset Bay.
+      var willRecord = ped.phoneOut && Math.random() < 0.45 && type !== "explosion";
+      if (willRecord && d > 12) {
+        ped.state = "recording";
+        ped.recordTimer = rand(2, 5);
+        ped.recordTarget = { x: ex, z: ez };
+        ped.dest = { x: ped.pos.x, z: ped.pos.z };
+        continue;
+      }
+
+      // Sisanya lari menjauh dari sumber kejadian.
+      ped.state = "fleeing";
+      ped.panic = 1;
+      ped.panicTime = rand(2.5, 5);
+      var away = angleTo(ex, ez, ped.pos.x, ped.pos.z);
+      var fleeDist = rand(40, 90);
+      ped.fleeTarget = {
+        x: clamp(ped.pos.x + Math.cos(away) * fleeDist, -CITY_HALF, CITY_HALF),
+        z: clamp(ped.pos.z + Math.sin(away) * fleeDist, -CITY_HALF, CITY_HALF)
+      };
+      ped.mood = "panicked";
+    }
+
+    if (type === "gunshot" && SB.Audio && typeof SB.Audio.sfx === "function") {
+      try { SB.Audio.sfx("gunshot"); } catch (e) { /* abaikan */ }
+    }
+    if (type === "explosion" && SB.FX && typeof SB.FX.explosion === "function") {
+      try { SB.FX.explosion({ x: ex, y: 0, z: ez }); } catch (e) { /* abaikan */ }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // MOBIL LALU LINTAS AI (38 mobil)
+  // ---------------------------------------------------------------------------
+  var CAR_COLORS = [
+    [0.80, 0.10, 0.10], [0.10, 0.20, 0.70], [0.90, 0.90, 0.90],
+    [0.15, 0.15, 0.15], [0.95, 0.75, 0.10], [0.10, 0.60, 0.30],
+    [0.85, 0.40, 0.05], [0.40, 0.75, 0.90], [0.60, 0.60, 0.65],
+    [0.55, 0.15, 0.55], [0.25, 0.55, 0.85], [0.95, 0.55, 0.65]
+  ];
+  var CAR_MODELS = ["sedan", "taxi", "van", "pickup", "coupe", "bus"];
+
+  // Rute: urutan persimpangan grid (x,z kelipatan 100) yang dilalui mobil.
+  function makeRoute() {
+    var route = [];
+    var x = randInt(-5, 5) * ROAD_STEP;
+    var z = randInt(-5, 5) * ROAD_STEP;
+    route.push({ x: x, z: z });
+    var n = randInt(4, 8);
+    for (var i = 0; i < n; i++) {
+      if (Math.random() < 0.5) {
+        x = clamp(x + pick([-1, 1]) * ROAD_STEP * randInt(1, 3), -500, 500);
+      } else {
+        z = clamp(z + pick([-1, 1]) * ROAD_STEP * randInt(1, 3), -500, 500);
+      }
+      route.push({ x: x, z: z });
+    }
+    return route;
+  }
+
+  function makeAICar(id) {
+    var route = makeRoute();
+    var start = route[0];
+    var next = route[1] || route[0];
+    var model = pick(CAR_MODELS);
+    var car = {
+      id: id,
+      kind: "traffic",
+      model: model,
+      pos: { x: start.x, y: 0, z: start.z },
+      rotY: angleTo(start.x, start.z, next.x, next.z),
+      speed: 0,
+      targetSpeed: model === "bus" ? rand(6, 8) : model === "van" ? rand(7, 9) : rand(8, 13),
+      route: route,
+      routeIndex: 1,
+      color: model === "taxi" ? [0.95, 0.80, 0.10] : pick(CAR_COLORS),
+      stopped: false,
+      waitTimer: 0,
+      brakeLight: false,
+      honkCooldown: rand(5, 20)
+    };
+    car.speed = car.targetSpeed;
+    return car;
+  }
+
+  var CARS_AI = [];
+  for (var j = 0; j < 38; j++) {
+    CARS_AI.push(makeAICar(j));
+  }
+
+  // Mobil di depan pada jalur yang sama (untuk menghindar / menjaga jarak).
+  function carAhead(car) {
+    var best = null;
+    var bestD = 14;
+    for (var i = 0; i < CARS_AI.length; i++) {
+      var other = CARS_AI[i];
+      if (other === car) continue;
+      var dx = other.pos.x - car.pos.x;
+      var dz = other.pos.z - car.pos.z;
+      var d = Math.sqrt(dx * dx + dz * dz);
+      if (d > bestD || d < 0.01) continue;
+      // Hanya yang berada di depan (searah hadap mobil ini).
+      var fx = Math.sin(car.rotY), fz = Math.cos(car.rotY);
+      var dot = (dx / d) * fx + (dz / d) * fz;
+      if (dot > 0.7) { best = other; bestD = d; }
+    }
+    return best;
+  }
+
+  function updateAICar(car, dt) {
+    car.honkCooldown -= dt;
+
+    // Berhenti di persimpangan: jeda singkat tiap sampai di titik rute yang
+    // merupakan persimpangan (kedua koordinat kelipatan 100).
+    if (car.waitTimer > 0) {
+      car.waitTimer -= dt;
+      car.speed = Math.max(0, car.speed - 20 * dt);
+      car.brakeLight = true;
+      if (car.waitTimer <= 0) car.stopped = false;
+      return;
+    }
+
+    var target = car.route[car.routeIndex];
+    if (!target) {
+      car.route = makeRoute();
+      car.routeIndex = 1;
+      return;
+    }
+
+    var dx = target.x - car.pos.x;
+    var dz = target.z - car.pos.z;
+    var d = Math.sqrt(dx * dx + dz * dz);
+    var desiredRot = Math.atan2(dx, dz);
+    // Belok halus ke arah tujuan.
+    var diff = desiredRot - car.rotY;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    car.rotY += clamp(diff, -1.8 * dt, 1.8 * dt);
+
+    // Menghindar: pelan bila ada mobil di depan, berhenti bila terlalu dekat.
+    var ahead = carAhead(car);
+    var desiredSpeed = car.targetSpeed;
+    if (ahead) {
+      var gap = dist2D(car.pos.x, car.pos.z, ahead.pos.x, ahead.pos.z);
+      if (gap < 7) desiredSpeed = 0;
+      else if (gap < 12) desiredSpeed = car.targetSpeed * 0.35;
+      car.brakeLight = desiredSpeed < car.speed;
+    } else {
+      car.brakeLight = false;
+    }
+
+    // Pejalan kaki menyeberang di depan: berhenti.
+    for (var p = 0; p < PEDESTRIANS.length; p++) {
+      var ped = PEDESTRIANS[p];
+      if (ped.crossing && ped.state === "walking") {
+        var pd = dist2D(car.pos.x, car.pos.z, ped.pos.x, ped.pos.z);
+        if (pd < 9) { desiredSpeed = 0; car.brakeLight = true; break; }
+      }
+    }
+
+    // Percepat / perlambat menuju kecepatan yang diinginkan.
+    if (car.speed < desiredSpeed) car.speed = Math.min(desiredSpeed, car.speed + 6 * dt);
+    else if (car.speed > desiredSpeed) car.speed = Math.max(desiredSpeed, car.speed - 14 * dt);
+
+    car.pos.x += Math.sin(car.rotY) * car.speed * dt;
+    car.pos.z += Math.cos(car.rotY) * car.speed * dt;
+
+    // Klakson sesekali bila macet.
+    if (car.speed < 0.5 && ahead && car.honkCooldown <= 0) {
+      car.honkCooldown = rand(8, 25);
+      if (SB.Audio && typeof SB.Audio.sfx === "function") {
+        try { SB.Audio.sfx("horn"); } catch (e) { /* abaikan */ }
+      }
+    }
+
+    // Sampai di titik rute: lanjut ke titik berikut, kadang berhenti sebentar
+    // di persimpangan (simulasi lampu lalu lintas / persimpangan).
+    if (d < 3) {
+      var atJunction = (Math.abs(target.x) % ROAD_STEP === 0) && (Math.abs(target.z) % ROAD_STEP === 0);
+      if (atJunction && Math.random() < 0.4) {
+        car.stopped = true;
+        car.waitTimer = rand(1, 3.5);
+      }
+      car.routeIndex++;
+      if (car.routeIndex >= car.route.length) {
+        car.route = makeRoute();
+        // Sambung rute baru dari posisi saat ini agar tidak teleport jauh.
+        car.route[0] = { x: Math.round(car.pos.x / ROAD_STEP) * ROAD_STEP, z: Math.round(car.pos.z / ROAD_STEP) * ROAD_STEP };
+        car.routeIndex = 1;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Update utama — dipanggil tiap frame oleh game loop
+  // ---------------------------------------------------------------------------
+  function update(dt) {
+    if (!dt || dt <= 0) return;
+    dt = Math.min(dt, 0.05); // clamp agar tidak lompat saat frame tersendat
+    for (var i = 0; i < PEDESTRIANS.length; i++) {
+      updatePedestrian(PEDESTRIANS[i], dt);
+    }
+    for (var j = 0; j < CARS_AI.length; j++) {
+      updateAICar(CARS_AI[j], dt);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helper publik (untuk render / QA / modul lain)
+  // ---------------------------------------------------------------------------
+  function nearestPedestrian(x, z) {
+    var best = null, bestD = Infinity;
+    for (var i = 0; i < PEDESTRIANS.length; i++) {
+      var d = dist2D(x, z, PEDESTRIANS[i].pos.x, PEDESTRIANS[i].pos.z);
+      if (d < bestD) { bestD = d; best = PEDESTRIANS[i]; }
+    }
+    return best;
+  }
+
+  function countByState(state) {
+    var n = 0;
+    for (var i = 0; i < PEDESTRIANS.length; i++) {
+      if (PEDESTRIANS[i].state === state) n++;
+    }
+    return n;
+  }
+
+  function reset() {
+    PEDESTRIANS.length = 0;
+    for (var i = 0; i < 36; i++) PEDESTRIANS.push(makePedestrian(i));
+    CARS_AI.length = 0;
+    for (var j = 0; j < 38; j++) CARS_AI.push(makeAICar(j));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Registrasi namespace
+  // ---------------------------------------------------------------------------
+  SB.NPC = {
+    PEDESTRIANS: PEDESTRIANS,
+    CARS_AI: CARS_AI,
+    update: update,
+    react: react,
+    nearestPedestrian: nearestPedestrian,
+    countByState: countByState,
+    isRoadAt: isRoadAt,
+    reset: reset
   };
 
-  window.SB.NPC = NPC;
 })();

@@ -1,382 +1,367 @@
+// weather.js — Sunset Bay v14, Builder F.
+// Local weather: each of the 14 districts can have its own weather.
+// Golden hour is the default: clear skies, low orange sun, thin haze.
+// Rain makes roads wet and reduces grip; SB.Vehicles reads the grip
+// factor from here every frame through SB.Weather.gripFactor.
+// Weather drifts slowly on its own; setWeather() forces a change.
+
 window.SB = window.SB || {};
-(function(){ 'use strict';
 
-  // ---------------------------------------------------------------------------
-  // SB.Weather — cuaca lokal + siklus siang-malam Sunset Bay (v13, fresh).
-  // Hujan LOKAL: satu area bisa hujan deras sementara distrik lain cerah.
-  // Siklus waktu: golden hour default 18:20, neon menyala saat malam.
-  // Modul ini TIDAK membaca modul lain; ia hanya menulis hasil hitungannya
-  // ke state.weather supaya game.js / gl.js bisa memakainya saat menggambar.
-  // ---------------------------------------------------------------------------
+(function () {
+  "use strict";
 
-  var GOLDEN_HOUR = 18.33;      // 18:20 — jam default saat game dimulai
-  var SUNSET_START = 17.75;     // matahari mulai merendah
-  var NIGHT_START = 19.5;       // 19:30 — gelap penuh, neon menyala
-  var DAWN_END = 5.75;          // 05:45 — fajar selesai
-  var DAY_LENGTH = 24;          // jam dalam satu hari game
-  var TIME_SCALE = 1;           // 1 detik nyata = 1 detik game (game atur)
+  // 14 districts — name, centre (x, z) and radius, IDENTICAL to spec §3.
+  // city.js and economy.js use the same list; keep all three in sync.
+  var DISTRICT_CENTERS = [
+    { name: "Marina Bay", x: 0, z: 0, radius: 120, center: { x: 0, z: 0 } },
+    { name: "Old Town", x: -120, z: 40, radius: 90, center: { x: -120, z: 40 } },
+    { name: "Fisherman's Wharf", x: -185, z: 40, radius: 55, center: { x: -185, z: 40 } },
+    { name: "Sunset Strip", x: 120, z: -60, radius: 100, center: { x: 120, z: -60 } },
+    { name: "North Hills", x: 60, z: 180, radius: 110, center: { x: 60, z: 180 } },
+    { name: "East Market", x: 200, z: 80, radius: 90, center: { x: 200, z: 80 } },
+    { name: "Harbor Point", x: -220, z: -80, radius: 80, center: { x: -220, z: -80 } },
+    { name: "Palm Court", x: 40, z: -180, radius: 90, center: { x: 40, z: -180 } },
+    { name: "Coral District", x: -60, z: -140, radius: 80, center: { x: -60, z: -140 } },
+    { name: "Beacon Hill", x: 180, z: 180, radius: 100, center: { x: 180, z: 180 } },
+    { name: "Little Havana", x: -160, z: 160, radius: 90, center: { x: -160, z: 160 } },
+    { name: "Airport South", x: 260, z: -160, radius: 110, center: { x: 260, z: -160 } },
+    { name: "University Row", x: -40, z: 220, radius: 90, center: { x: -40, z: 220 } },
+    { name: "Industrial Docks", x: 240, z: 20, radius: 100, center: { x: 240, z: 20 } }
+  ];
 
-  // Pusat distrik (x, z, radius) untuk hujan lokal berbasis nama distrik.
-  // Koordinat mengikuti city.js DISTRICT_INFO (14 distrik Sunset Bay).
-  var DISTRICT_CENTERS = {
-    'Marina Bay':        { x: -150, z:  120, r: 70 },
-    'Sunset Beach':      { x:   40, z:  185, r: 80 },
-    'Downtown':          { x:    0, z:    0, r: 75 },
-    'Old Town':          { x: -100, z:  -60, r: 60 },
-    'Neon Strip':        { x:   80, z:  -40, r: 60 },
-    'Harbour Heights':   { x: -140, z: -140, r: 65 },
-    'Palm Court':        { x:  120, z:  100, r: 60 },
-    "Fisherman's Wharf": { x: -185, z:   40, r: 55 },
-    'University Hill':   { x:  140, z: -120, r: 60 },
-    'Industrial Park':   { x:  160, z:   20, r: 65 },
-    'Coral Gardens':     { x:  -40, z:  140, r: 55 },
-    'Sunset Hills':      { x:   60, z: -160, r: 60 },
-    'Boardwalk':         { x: -120, z:  175, r: 55 },
-    'The Docks':         { x: -190, z: -100, r: 50 }
+  // Canonical weather ids. Indonesian names from the design brief map
+  // to the same ids so either spelling works at the call site.
+  var ALIASES = {
+    clear: "clear", cerah: "clear", sunny: "clear", sun: "clear",
+    rain: "rain", hujan: "rain", rainy: "rain", storm: "rain",
+    fog: "fog", berkabut: "fog", foggy: "fog", mist: "fog",
+    cloudy: "cloudy", berawan: "cloudy", overcast: "cloudy"
   };
 
-  // Preset cuaca bernama: dipakai update() untuk transisi alami.
-  var PRESETS = {
-    clear:   { rain: 0.00, clouds: 0.15, wind: 0.20 },
-    sunny:   { rain: 0.00, clouds: 0.10, wind: 0.15 },
-    cloudy:  { rain: 0.00, clouds: 0.65, wind: 0.35 },
-    overcast:{ rain: 0.05, clouds: 0.90, wind: 0.45 },
-    drizzle: { rain: 0.30, clouds: 0.80, wind: 0.40 },
-    storm:   { rain: 0.90, clouds: 1.00, wind: 0.85 },
-    golden:  { rain: 0.00, clouds: 0.25, wind: 0.20 }
+  var WEATHER_DEFS = {
+    clear: {
+      label: "Clear",
+      sun: [1.0, 0.60, 0.24],
+      skyTop: [0.16, 0.32, 0.62],
+      skyHorizon: [1.0, 0.62, 0.30],
+      fogNear: 180,
+      fogFar: 900,
+      fogDensity: 0.0012,
+      fogColor: [0.98, 0.72, 0.48],
+      rainIntensity: 0,
+      gripFactor: 1.0,
+      sunHeight: 0.18,
+      brightness: 1.0
+    },
+    rain: {
+      label: "Rain",
+      sun: [0.55, 0.55, 0.58],
+      skyTop: [0.22, 0.26, 0.34],
+      skyHorizon: [0.55, 0.55, 0.58],
+      fogNear: 60,
+      fogFar: 420,
+      fogDensity: 0.004,
+      fogColor: [0.55, 0.58, 0.62],
+      rainIntensity: 1.0,
+      gripFactor: 0.72,
+      sunHeight: 0.10,
+      brightness: 0.62
+    },
+    fog: {
+      label: "Foggy",
+      sun: [0.95, 0.75, 0.5],
+      skyTop: [0.55, 0.58, 0.62],
+      skyHorizon: [0.85, 0.78, 0.68],
+      fogNear: 25,
+      fogFar: 190,
+      fogDensity: 0.011,
+      fogColor: [0.82, 0.80, 0.74],
+      rainIntensity: 0,
+      gripFactor: 0.88,
+      sunHeight: 0.14,
+      brightness: 0.78
+    },
+    cloudy: {
+      label: "Cloudy",
+      sun: [0.9, 0.72, 0.5],
+      skyTop: [0.30, 0.38, 0.52],
+      skyHorizon: [0.85, 0.66, 0.48],
+      fogNear: 120,
+      fogFar: 650,
+      fogDensity: 0.0022,
+      fogColor: [0.78, 0.68, 0.58],
+      rainIntensity: 0,
+      gripFactor: 0.95,
+      sunHeight: 0.16,
+      brightness: 0.85
+    }
   };
 
-  var _state = null;            // referensi SB.state (diset di init)
-  var _t = 0;                   // waktu internal (detik)
-  var _rainArea = null;         // {x, z, r, amount} | null
-  var _rainTarget = 0;          // target intensitas hujan lokal
-  var _rainCurrent = 0;         // intensitas hujan lokal saat ini (0..1)
-  var _cloudDrift = 0;          // posisi awan (0..1, melayang ikut angin)
-  var _windDir = 0.6;           // arah angin (radian)
-  var _windGust = 0;            // hembusan sesaat (0..1)
-  var _gustTimer = 0;           // penghitung hembusan berikutnya
-  var _puddles = 0;             // genangan (0..1), bertahan setelah hujan
-  var _rainbow = 0;             // intensitas pelangi (0..1)
-  var _rainbowAngle = 0;        // sudut busur pelangi
-  var _wasRaining = false;      // hujan baru saja berhenti?
-  var _dryTimer = 0;            // jeda sebelum pelangi muncul
-  var _stormTimer = 0;          // penghitung badai acak
-  var _preset = 'golden';       // preset aktif
-  var _presetTimer = 0;         // durasi preset berjalan
-  var _lightning = 0;           // kilat sesaat (0..1)
-  var _lightningTimer = 0;
-
-  // -- util lokal ------------------------------------------------------------
-  function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
-  function lerp(a, b, t){ return a + (b - a) * t; }
-  function smooth(t){ t = clamp(t, 0, 1); return t * t * (3 - 2 * t); }
-
-  // Campur dua warna [r,g,b] dengan faktor t.
-  function mixColor(c1, c2, t){
-    return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
+  function clamp(v, a, b) {
+    return Math.max(a, Math.min(b, v));
   }
 
-  // Palet langit per fase hari: [atas, bawah, matahari, kabut].
-  var SKY = {
-    night:  { top: [0.03, 0.04, 0.12], low: [0.10, 0.08, 0.20], sun: [0.35, 0.45, 0.80], fog: [0.05, 0.06, 0.14] },
-    dawn:   { top: [0.35, 0.30, 0.55], low: [0.98, 0.55, 0.35], sun: [1.00, 0.55, 0.30], fog: [0.45, 0.35, 0.45] },
-    day:    { top: [0.30, 0.55, 0.90], low: [0.75, 0.85, 0.95], sun: [1.00, 0.95, 0.80], fog: [0.70, 0.78, 0.88] },
-    golden: { top: [0.45, 0.25, 0.55], low: [1.00, 0.60, 0.25], sun: [1.00, 0.60, 0.24], fog: [0.85, 0.55, 0.40] },
-    dusk:   { top: [0.15, 0.12, 0.35], low: [0.90, 0.35, 0.25], sun: [1.00, 0.45, 0.20], fog: [0.45, 0.30, 0.40] }
-  };
-
-  // Fase hari dari jam: 'night' | 'dawn' | 'day' | 'golden' | 'dusk'.
-  function phaseOf(hour){
-    if (hour < 5.0 || hour >= NIGHT_START) return 'night';
-    if (hour < DAWN_END) return 'dawn';
-    if (hour >= SUNSET_START && hour < 18.6) return 'golden';
-    if (hour >= 18.6 && hour < NIGHT_START) return 'dusk';
-    return 'day';
+  function lerp(a, b, t) {
+    return a + (b - a) * t;
   }
 
-  // Ketinggian matahari (-1 malam .. 1 siang) dari jam.
-  function sunHeight(hour){
-    // Siang pukul 12 = puncak; 06 terbit, 19 terbenam (kira-kira).
-    var a = (hour - 6) / 13 * Math.PI;
-    return Math.sin(a);
+  function normalizeWeather(w) {
+    if (!w) return "clear";
+    var key = String(w).toLowerCase().trim();
+    if (ALIASES[key]) return ALIASES[key];
+    if (WEATHER_DEFS[key]) return key;
+    return "clear";
   }
 
-  // -- API -------------------------------------------------------------------
-
-  function init(state){
-    _state = state || null;
-    _t = 0;
-    _rainArea = null;
-    _rainTarget = 0;
-    _rainCurrent = 0;
-    _cloudDrift = 0.2;
-    _windDir = 0.6;
-    _windGust = 0;
-    _gustTimer = 4;
-    _puddles = 0;
-    _rainbow = 0;
-    _rainbowAngle = 0.6;
-    _wasRaining = false;
-    _dryTimer = 0;
-    _stormTimer = 90 + Math.random() * 120;
-    _preset = 'golden';
-    _presetTimer = 0;
-    _lightning = 0;
-    _lightningTimer = 0;
-    if (_state){
-      if (typeof _state.timeOfDay !== 'number') _state.timeOfDay = GOLDEN_HOUR;
-      if (!_state.weather) _state.weather = {};
-      _state.weather.rain = 0;
-      _state.weather.rainArea = null;
-      _state.weather.clouds = 0.25;
-      _state.weather.wind = 0.2;
-      _state.weather.puddles = 0;
-      _state.weather.rainbow = 0;
-      _state.weather.neon = 0;
-      _state.weather.sunDir = { x: -0.55, y: 0.35, z: -0.75 };
-      _state.weather.sunColor = [1.0, 0.60, 0.24];
-      _state.weather.skyTop = SKY.golden.top.slice();
-      _state.weather.skyBottom = SKY.golden.low.slice();
-      _state.weather.fogColor = SKY.golden.fog.slice();
-      _state.weather.fogNear = 120;
-      _state.weather.fogFar = 520;
-      _state.weather.lightning = 0;
+  function findDistrict(name) {
+    for (var i = 0; i < DISTRICT_CENTERS.length; i++) {
+      if (DISTRICT_CENTERS[i].name === name) return DISTRICT_CENTERS[i];
     }
-    return true;
+    return null;
   }
 
-  // Hujan LOKAL: area = {x,z,r} | nama distrik (string) | null (matikan).
-  // amount 0..1. Hanya area itu yang hujan; distrik lain tetap cerah.
-  function setRain(area, amount){
-    var amt = clamp(typeof amount === 'number' ? amount : 0.6, 0, 1);
-    if (area === null || area === undefined || amt <= 0){
-      _rainTarget = 0;
-      _rainArea = null;
-      if (_state && _state.weather) _state.weather.rainArea = null;
-      return true; // hujan berhasil dimatikan
-    }
-    var a = null;
-    if (typeof area === 'string'){
-      var c = DISTRICT_CENTERS[area];
-      if (!c){ return false; }
-      a = { x: c.x, z: c.z, r: c.r };
-    } else if (typeof area === 'object'){
-      a = {
-        x: typeof area.x === 'number' ? area.x : 0,
-        z: typeof area.z === 'number' ? area.z : 0,
-        r: typeof area.r === 'number' ? area.r : (typeof area.radius === 'number' ? area.radius : 80)
-      };
-    } else {
-      return false;
-    }
-    _rainArea = a;
-    _rainTarget = amt;
-    if (_state && _state.weather){
-      _state.weather.rainArea = { x: a.x, z: a.z, r: a.r, amount: amt };
-    }
-    return true;
-  }
+  // Per-district weather state, seeded clear everywhere (golden hour).
+  var districtWeather = {};
+  var districtBlend = {};
+  DISTRICT_CENTERS.forEach(function (d) {
+    districtWeather[d.name] = "clear";
+    districtBlend[d.name] = 1.0;
+  });
 
-  // Maju jam hari. dt detik nyata. 1 detik nyata = TIME_SCALE detik game.
-  // Lewat tengah malam: day + 1, jam kembali 0.
-  function advanceTime(dt){
-    if (!_state) return GOLDEN_HOUR;
-    var step = (dt || 0) * TIME_SCALE / 3600; // detik -> jam
-    var h = (typeof _state.timeOfDay === 'number' ? _state.timeOfDay : GOLDEN_HOUR) + step;
-    while (h >= DAY_LENGTH){
-      h -= DAY_LENGTH;
-      _state.day = (_state.day || 1) + 1;
-    }
-    _state.timeOfDay = h;
-    return h;
-  }
+  var Weather = {
+    DISTRICT_CENTERS: DISTRICT_CENTERS,
+    // Alias used by some callers that expect the spec §3 name.
+    DISTRICTS: DISTRICT_CENTERS,
 
-  // Malam: sebelum fajar selesai atau setelah 19:30.
-  function isNight(){
-    var h = _state && typeof _state.timeOfDay === 'number' ? _state.timeOfDay : GOLDEN_HOUR;
-    return h < DAWN_END || h >= NIGHT_START;
-  }
+    // Global weather: the weather at the player's current district.
+    // Starts clear — golden hour default, low orange sun.
+    current: "clear",
+    // Indonesian label kept in step for HUD code that reads it.
+    currentLabel: "Clear",
 
-  // Pelangi: muncul setelah hujan berhenti + genangan masih ada.
-  // Mengembalikan {visible, intensity, angle, colors} atau null bila tidak ada.
-  function rainbow(){
-    if (_rainbow <= 0.02) return null;
-    return {
-      visible: true,
-      intensity: _rainbow,
-      angle: _rainbowAngle,
-      colors: [
-        [1.0, 0.25, 0.25], [1.0, 0.55, 0.15], [1.0, 0.90, 0.20],
-        [0.30, 0.85, 0.30], [0.25, 0.55, 1.00], [0.55, 0.30, 0.85]
-      ]
-    };
-  }
+    // Live blended values. Vehicles read gripFactor; Render reads the
+    // fog and sky values; the sun position comes from sunHeight.
+    gripFactor: 1.0,
+    wetRoads: false,
+    rainIntensity: 0,
+    fogDensity: 0.0012,
+    fogNear: 180,
+    fogFar: 900,
+    fogColor: [0.98, 0.72, 0.48],
+    sunHeight: 0.18,
+    sunColor: [1.0, 0.60, 0.24],
+    skyTop: [0.16, 0.32, 0.62],
+    skyHorizon: [1.0, 0.62, 0.30],
+    brightness: 1.0,
 
-  // Apakah titik (x,z) sedang kehujanan? (untuk FX / audio / gameplay)
-  function isRainingAt(x, z){
-    if (!_rainArea || _rainCurrent <= 0.05) return false;
-    var dx = x - _rainArea.x, dz = z - _rainArea.z;
-    return (dx * dx + dz * dz) <= _rainArea.r * _rainArea.r;
-  }
+    // Golden hour sun: low in the west, warm orange. Render positions
+    // the sun disc from this direction vector.
+    sunDirection: { x: -0.85, y: 0.18, z: -0.35 },
+    // Time of day in hours, 17.5 = 5:30 PM golden hour.
+    timeOfDay: 17.5,
+    dayNight: 0.35,
 
-  function update(dt, state){
-    if (state) _state = state;
-    if (!_state) return;
-    dt = Math.min(typeof dt === 'number' ? dt : 0.016, 0.1);
-    _t += dt;
+    // Internal clock for slow drift and rain splash spawning.
+    elapsed: 0,
+    changeTimer: 0,
+    // Rain splash particles are spawned near the player, throttled here.
+    splashTimer: 0,
 
-    // 1) Waktu berjalan.
-    advanceTime(dt);
-    var hour = _state.timeOfDay;
-    var phase = phaseOf(hour);
-    var sh = sunHeight(hour);
-
-    // 2) Preset cuaca berganti pelan (badai acak sesekali, siang hari saja).
-    _presetTimer += dt;
-    _stormTimer -= dt;
-    if (_stormTimer <= 0){
-      _stormTimer = 150 + Math.random() * 180;
-      if (!isNight() && Math.random() < 0.4){
-        _preset = 'storm';
-        _presetTimer = 0;
-        // Badai selalu lokal: pilih satu distrik acak.
-        var names = Object.keys(DISTRICT_CENTERS);
-        var pick = names[Math.floor(Math.random() * names.length)];
-        setRain(pick, 0.7 + Math.random() * 0.3);
-      }
-    }
-    if (_presetTimer > 60){
-      _presetTimer = 0;
-      // Kembali cerah / golden sesuai jam.
-      _preset = (phase === 'golden' || phase === 'dusk') ? 'golden' : (Math.random() < 0.7 ? 'clear' : 'cloudy');
-      if (_preset === 'clear' || _preset === 'golden'){ setRain(null, 0); }
-    }
-
-    // 3) Hujan lokal: intensitas mengejar target secara halus.
-    var rate = dt * 0.5;
-    if (_rainCurrent < _rainTarget) _rainCurrent = Math.min(_rainTarget, _rainCurrent + rate);
-    else if (_rainCurrent > _rainTarget) _rainCurrent = Math.max(_rainTarget, _rainCurrent - rate * 0.8);
-
-    // 4) Angin: arah berputar pelan + hembusan acak.
-    _gustTimer -= dt;
-    if (_gustTimer <= 0){
-      _gustTimer = 3 + Math.random() * 6;
-      _windGust = 0.3 + Math.random() * 0.7;
-    }
-    _windGust = Math.max(0, _windGust - dt * 0.15);
-    _windDir += Math.sin(_t * 0.05) * dt * 0.02;
-    var baseWind = PRESETS[_preset] ? PRESETS[_preset].wind : 0.2;
-    var wind = clamp(baseWind + _windGust * 0.35, 0, 1);
-
-    // 5) Awan melayang mengikuti angin.
-    _cloudDrift = (_cloudDrift + dt * wind * 0.01) % 1;
-
-    // 6) Genangan: naik saat hujan, mengering pelan setelah hujan berhenti.
-    if (_rainCurrent > 0.2){
-      _puddles = clamp(_puddles + dt * 0.08 * _rainCurrent, 0, 1);
-      _wasRaining = true;
-      _dryTimer = 0;
-    } else {
-      if (_wasRaining){
-        _dryTimer += dt;
-        // Pelangi muncul 2-6 detik setelah hujan reda.
-        if (_dryTimer > 2 && _puddles > 0.25){
-          _rainbow = clamp(_rainbow + dt * 0.2, 0, 1);
-          _rainbowAngle = 0.5 + Math.sin(_t * 0.1) * 0.15;
+    getDistrictAt: function (x, z) {
+      var best = null;
+      var bestDist = Infinity;
+      for (var i = 0; i < DISTRICT_CENTERS.length; i++) {
+        var d = DISTRICT_CENTERS[i];
+        var dx = x - d.x;
+        var dz = z - d.z;
+        var dist = Math.sqrt(dx * dx + dz * dz);
+        if (dist < d.radius && dist < bestDist) {
+          best = d;
+          bestDist = dist;
         }
       }
-      _puddles = clamp(_puddles - dt * 0.004, 0, 1);
-      if (_puddles <= 0.05){ _wasRaining = false; }
-    }
-    // Pelangi bertahan selama genangan masih ada, lalu memudar pelan.
-    if (_puddles > 0.2 && _dryTimer > 2){
-      _rainbow = clamp(_rainbow + dt * 0.1, 0, 1);
-    } else if (_puddles <= 0.2){
-      _rainbow = Math.max(0, _rainbow - dt * 0.08);
-    }
-    if (_puddles <= 0.05){ _rainbow = 0; _wasRaining = false; }
-
-    // 7) Kilat saat badai (hanya kilat, tanpa suara di modul ini).
-    if (_preset === 'storm' && _rainCurrent > 0.5){
-      _lightningTimer -= dt;
-      if (_lightningTimer <= 0){
-        _lightningTimer = 4 + Math.random() * 9;
-        _lightning = 1;
+      if (best) return best.name;
+      // Outside every radius: nearest district still governs the sky.
+      var nearest = null;
+      var nearestDist = Infinity;
+      for (var j = 0; j < DISTRICT_CENTERS.length; j++) {
+        var e = DISTRICT_CENTERS[j];
+        var ex = x - e.x;
+        var ez = z - e.z;
+        var ed = Math.sqrt(ex * ex + ez * ez) - e.radius;
+        if (ed < nearestDist) {
+          nearestDist = ed;
+          nearest = e;
+        }
       }
+      return nearest ? nearest.name : "Marina Bay";
+    },
+
+    getWeatherAt: function (x, z) {
+      return Weather.getDistrictWeather(Weather.getDistrictAt(x, z));
+    },
+
+    getDistrictWeather: function (name) {
+      if (districtWeather[name]) return districtWeather[name];
+      return Weather.current;
+    },
+
+    setDistrictWeather: function (name, w) {
+      var id = normalizeWeather(w);
+      if (!findDistrict(name)) return Weather.current;
+      districtWeather[name] = id;
+      districtBlend[name] = 0;
+      Weather.refreshFromPlayerDistrict();
+      return id;
+    },
+
+    // Force the global weather (and every district) to w.
+    // Accepts "clear" / "rain" / "fog" / "cloudy" and the Indonesian
+    // equivalents "cerah" / "hujan" / "berkabut".
+    setWeather: function (w) {
+      var id = normalizeWeather(w);
+      Weather.current = id;
+      Weather.currentLabel = WEATHER_DEFS[id].label;
+      for (var i = 0; i < DISTRICT_CENTERS.length; i++) {
+        districtWeather[DISTRICT_CENTERS[i].name] = id;
+        districtBlend[DISTRICT_CENTERS[i].name] = 0;
+      }
+      Weather.applyDef(id, 1.0);
+      Weather.changeTimer = 0;
+      return Weather.current;
+    },
+
+    // Blend the live values toward a weather definition by t (0..1).
+    applyDef: function (id, t) {
+      var def = WEATHER_DEFS[id] || WEATHER_DEFS.clear;
+      var k = clamp(t, 0, 1);
+      Weather.gripFactor = lerp(Weather.gripFactor, def.gripFactor, k);
+      Weather.rainIntensity = lerp(Weather.rainIntensity, def.rainIntensity, k);
+      Weather.fogDensity = lerp(Weather.fogDensity, def.fogDensity, k);
+      Weather.fogNear = lerp(Weather.fogNear, def.fogNear, k);
+      Weather.fogFar = lerp(Weather.fogFar, def.fogFar, k);
+      Weather.brightness = lerp(Weather.brightness, def.brightness, k);
+      Weather.sunHeight = lerp(Weather.sunHeight, def.sunHeight, k);
+      for (var i = 0; i < 3; i++) {
+        Weather.fogColor[i] = lerp(Weather.fogColor[i], def.fogColor[i], k);
+        Weather.sunColor[i] = lerp(Weather.sunColor[i], def.sun[i], k);
+        Weather.skyTop[i] = lerp(Weather.skyTop[i], def.skyTop[i], k);
+        Weather.skyHorizon[i] = lerp(Weather.skyHorizon[i], def.skyHorizon[i], k);
+      }
+      Weather.wetRoads = Weather.rainIntensity > 0.25;
+      Weather.sunDirection.y = Weather.sunHeight;
+    },
+
+    // Recompute the global weather from the player's district, so
+    // driving into a rainy district actually changes handling and fog.
+    refreshFromPlayerDistrict: function () {
+      var px = 0;
+      var pz = 0;
+      try {
+        if (window.SB && SB.Game && SB.Game.state && SB.Game.state.player) {
+          px = SB.Game.state.player.pos.x || 0;
+          pz = SB.Game.state.player.pos.z || 0;
+        } else if (window.SB && SB.Player && SB.Player.pos) {
+          px = SB.Player.pos.x || 0;
+          pz = SB.Player.pos.z || 0;
+        }
+      } catch (e) { /* player position is best-effort */ }
+      var district = Weather.getDistrictAt(px, pz);
+      var id = districtWeather[district] || "clear";
+      if (id !== Weather.current) {
+        Weather.current = id;
+        Weather.currentLabel = WEATHER_DEFS[id].label;
+      }
+      // Blend toward the district weather rather than snapping, so a
+      // border crossing fades in over about two seconds.
+      Weather.applyDef(id, 0.04);
+      // Rain splashes near the player while it rains here.
+      if (Weather.rainIntensity > 0.3 && window.SB && SB.FX) {
+        Weather.splashTimer -= 0.016;
+        if (Weather.splashTimer <= 0) {
+          Weather.splashTimer = 0.12;
+          try {
+            SB.FX.rainSplash({
+              x: px + (Math.random() - 0.5) * 24,
+              y: 0,
+              z: pz + (Math.random() - 0.5) * 24
+            });
+          } catch (e) { /* FX is best-effort */ }
+        }
+      }
+      return Weather.current;
+    },
+
+    // Slow drift: every 45–90 seconds one random district changes
+    // weather; clear is the most likely outcome so golden hour returns.
+    // Also advances the clock a little so day/night moves.
+    update: function (dt) {
+      var step = Math.max(0, Math.min(0.1, dt || 0.016));
+      Weather.elapsed += step;
+      Weather.changeTimer += step;
+      // Golden hour drifts slowly toward dusk, then holds: the game is
+      // set at sunset, so the clock creeps from 17.5 toward 18.4.
+      Weather.timeOfDay = Math.min(18.4, Weather.timeOfDay + step * 0.004);
+      var dusk = clamp((Weather.timeOfDay - 17.5) / 0.9, 0, 1);
+      Weather.dayNight = 0.35 + dusk * 0.45;
+      Weather.sunHeight = lerp(Weather.sunHeight, 0.18 - dusk * 0.10, step * 0.05);
+      Weather.sunDirection.y = Weather.sunHeight;
+
+      if (Weather.changeTimer > 60) {
+        Weather.changeTimer = 0;
+        var pick = DISTRICT_CENTERS[Math.floor(Math.random() * DISTRICT_CENTERS.length)];
+        var roll = Math.random();
+        var next = roll < 0.55 ? "clear" : roll < 0.8 ? "cloudy" : roll < 0.92 ? "rain" : "fog";
+        districtWeather[pick.name] = next;
+        districtBlend[pick.name] = 0;
+      }
+      Weather.refreshFromPlayerDistrict();
+      return Weather.current;
+    },
+
+    // Visibility for the renderer and for gameplay (police sight range).
+    // Returns an object; getFogDistance() returns the far plane as a
+    // plain number for callers that only need one value.
+    getFog: function () {
+      return {
+        near: Weather.fogNear,
+        far: Weather.fogFar,
+        distance: Weather.fogFar,
+        density: Weather.fogDensity,
+        color: [Weather.fogColor[0], Weather.fogColor[1], Weather.fogColor[2]]
+      };
+    },
+
+    getFogDistance: function () {
+      return Weather.fogFar;
+    },
+
+    isRaining: function () {
+      return Weather.rainIntensity > 0.3;
+    },
+
+    isFoggy: function () {
+      return Weather.current === "fog";
+    },
+
+    // Handling multiplier the vehicle code multiplies into grip.
+    // 1.0 dry, ~0.72 in rain, ~0.88 in fog, ~0.95 under cloud.
+    getGrip: function () {
+      return Weather.gripFactor;
+    },
+
+    // Sky colors for the renderer, already blended toward the current
+    // district weather and the dusk progression.
+    getSky: function () {
+      return {
+        top: [Weather.skyTop[0], Weather.skyTop[1], Weather.skyTop[2]],
+        horizon: [Weather.skyHorizon[0], Weather.skyHorizon[1], Weather.skyHorizon[2]],
+        sun: [Weather.sunColor[0], Weather.sunColor[1], Weather.sunColor[2]],
+        sunDirection: { x: Weather.sunDirection.x, y: Weather.sunDirection.y, z: Weather.sunDirection.z },
+        brightness: Weather.brightness
+      };
     }
-    _lightning = Math.max(0, _lightning - dt * 3);
-
-    // 8) Langit + matahari + kabut mengikuti fase hari.
-    var sky = SKY[phase] || SKY.day;
-    var next = phase === 'golden' ? SKY.dusk : (phase === 'dusk' ? SKY.night : SKY.day);
-    var blend = 0;
-    if (phase === 'golden') blend = smooth((hour - SUNSET_START) / 0.85);
-    else if (phase === 'dusk') blend = smooth((hour - 18.6) / 0.9);
-    else if (phase === 'dawn') blend = smooth((hour - 5.0) / 0.75);
-    var top = mixColor(sky.top, next.top, blend);
-    var low = mixColor(sky.low, next.low, blend);
-    var sunC = mixColor(sky.sun, next.sun, blend);
-    var fogC = mixColor(sky.fog, next.fog, blend);
-    if (_lightning > 0){
-      var f = _lightning * 0.6;
-      top = mixColor(top, [0.9, 0.9, 1.0], f);
-      fogC = mixColor(fogC, [0.85, 0.85, 0.95], f);
-    }
-    // Awan tebal meredupkan langit.
-    var cloudCover = PRESETS[_preset] ? PRESETS[_preset].clouds : 0.3;
-    var dim = 1 - cloudCover * 0.25;
-    top = [top[0] * dim, top[1] * dim, top[2] * dim];
-
-    // Arah matahari: rendah di barat saat golden hour, tinggi di siang.
-    var sunAz = lerp(0.9, -0.4, clamp((hour - 6) / 13, 0, 1));
-    var sunEl = Math.max(0.08, sh);
-    var sunDir = {
-      x: Math.cos(sunAz) * Math.cos(sunEl),
-      y: Math.sin(sunEl),
-      z: Math.sin(sunAz) * Math.cos(sunEl)
-    };
-    if (isNight()){
-      // Bulan: tinggi, dingin, redup.
-      sunDir = { x: 0.3, y: 0.75, z: -0.45 };
-      sunC = [0.55, 0.65, 0.95];
-    }
-
-    // Neon malam: 0 siang -> 1 gelap penuh.
-    var neon = isNight() ? 1 : (phase === 'dusk' ? smooth((hour - 18.6) / 0.9) : 0);
-
-    // 9) Tulis semuanya ke state.weather (sumber kebenaran bersama).
-    var w = _state.weather;
-    w.rain = _rainCurrent;
-    w.rainArea = _rainArea ? { x: _rainArea.x, z: _rainArea.z, r: _rainArea.r, amount: _rainCurrent } : null;
-    w.clouds = cloudCover;
-    w.cloudDrift = _cloudDrift;
-    w.wind = wind;
-    w.windDir = _windDir;
-    w.windGust = _windGust;
-    w.puddles = _puddles;
-    w.rainbow = _rainbow;
-    w.neon = neon;
-    w.sunDir = sunDir;
-    w.sunColor = sunC;
-    w.sunHeight = sh;
-    w.skyTop = top;
-    w.skyBottom = low;
-    w.fogColor = fogC;
-    w.fogNear = isNight() ? 90 : 120;
-    w.fogFar = isNight() ? 420 : 520;
-    w.lightning = _lightning;
-    w.phase = phase;
-    w.isNight = isNight();
-  }
-
-  window.SB.Weather = {
-    init: init,
-    update: update,
-    setRain: setRain,
-    advanceTime: advanceTime,
-    isNight: isNight,
-    rainbow: rainbow,
-    isRainingAt: isRainingAt
   };
 
+  SB.Weather = Weather;
 })();

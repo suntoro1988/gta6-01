@@ -1,390 +1,605 @@
-window.SB = window.SB || {};
+// police.js — Sunset Bay v14
+// Builder G (AI & city life).
+// Sistem wanted 0–5 bintang + heat, mobil patroli, pengejaran, dan pelarian.
+// Komunikasi antar modul HANYA lewat namespace SB (lihat design spec §4).
+// Modul ini tidak meng-import modul lain dan tidak membaca file sumber lain.
+
 (function () {
-  'use strict';
+  "use strict";
 
-  // SB.Police — kepolisian Sunset Bay.
-  // Wanted 0-5 bintang + Heat 0-100 sebagai state machine. Polisi merespons:
-  // patroli (wanted 0-1), kejar (wanted 2+), roadblock (wanted 3+),
-  // PIT maneuver (wanted 4+), helikopter AIR-1 (wanted >= 3) + heli taktis AIR-2.
+  window.SB = window.SB || {};
+  var SB = window.SB;
 
-  var MAX_COPS = 10, CITY_HALF = 220;
-  var COP_CHASE_SPEED = 13.5, COP_PATROL_SPEED = 6.0, PIT_RANGE = 7;
-  var HEAT_DECAY = 4.0, HEAT_PER_STAR = 20;
-
-  var _state = null, _time = 0, _rngState = 777;
-
-  function rnd() {
-    _rngState = (_rngState * 1664525 + 1013904223) >>> 0;
-    return _rngState / 4294967296;
-  }
-  function rand(a, b) { return a + rnd() * (b - a); }
-  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
-  function dist2(ax, az, bx, bz) {
+  // ---------------------------------------------------------------------------
+  // Util kecil (mandiri)
+  // ---------------------------------------------------------------------------
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function randInt(a, b) { return Math.floor(rand(a, b + 1)); }
+  function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+  function dist2D(ax, az, bx, bz) {
     var dx = ax - bx, dz = az - bz;
-    return dx * dx + dz * dz;
+    return Math.sqrt(dx * dx + dz * dz);
   }
-  function angleLerp(a, b, t) {
-    var d = b - a;
-    while (d > Math.PI) d -= Math.PI * 2;
-    while (d < -Math.PI) d += Math.PI * 2;
-    return a + d * t;
-  }
+  function angleTo(ax, az, bx, bz) { return Math.atan2(bx - ax, bz - az); }
 
-  // State machine wanted -> jumlah unit & mode perilaku.
-  var WANTED_TABLE = [
-    { stars: 0, cops: 2,  mode: 'patrol',    desc: 'Patroli rutin' },
-    { stars: 1, cops: 3,  mode: 'pursue',    desc: 'Pengejaran ringan' },
-    { stars: 2, cops: 4,  mode: 'pursue',    desc: 'Pengejaran aktif' },
-    { stars: 3, cops: 6,  mode: 'intercept', desc: 'Roadblock + heli AIR-1' },
-    { stars: 4, cops: 8,  mode: 'intercept', desc: 'PIT + roadblock + heli' },
-    { stars: 5, cops: 10, mode: 'takedown',  desc: 'Semua unit + heli taktis' }
-  ];
+  // ---------------------------------------------------------------------------
+  // Konstanta wanted (selaras dengan SB.Config.WANTED bila tersedia)
+  // ---------------------------------------------------------------------------
+  var MAX_WANTED = 5;
+  var MAX_HEAT = 100;
+  var CITY_HALF = 560;
+  var ROAD_STEP = 100;
 
-  function makeCop(x, z, kind) {
-    return {
-      x: x, z: z, angle: rand(0, Math.PI * 2), speed: 0, kind: kind || 'patrol',
-      state: 'patrol', // 'patrol' | 'chase' | 'block' | 'pit' | 'ram'
-      targetX: x, targetZ: z, siren: false, sirenPhase: rand(0, Math.PI * 2),
-      pitTimer: 0, pitCooldown: 0, stuckT: 0, lastX: x, lastZ: z,
-      health: 100, color: [0.08, 0.12, 0.35], onFoot: false
-    };
-  }
-
-  function makeHeli(name, orbitR, tactical) {
-    return {
-      name: name, active: false, x: 0, y: 90, z: 0, angle: 0, rotor: 0,
-      spotlight: false, spotX: 0, spotZ: 0, orbitR: orbitR, orbitA: 0,
-      speed: 9, tactical: !!tactical, searchT: 0
-    };
-  }
-
-  var Police = {
-    cops: [],
-    heli: null,            // AIR-1
-    tacticalHeli: null,    // AIR-2
-    roadblocks: [],
-    wanted: 0,
-    heat: 0,
-    _cooldown: 0,
-
-    init: function (state) {
-      _state = state || null;
-      _time = 0;
-      Police.cops.length = 0;
-      Police.roadblocks.length = 0;
-      Police.wanted = 0;
-      Police.heat = 0;
-      Police._cooldown = 0;
-      Police.heli = makeHeli('AIR-1', 26, false);
-      Police.tacticalHeli = makeHeli('AIR-2', 34, true);
-      Police.cops.push(makeCop(20, 10, 'patrol'), makeCop(-30, -20, 'patrol'));
-      if (state) { state.wanted = 0; state.heat = 0; }
-    },
-
-    setWanted: function (n) {
-      n = clamp(Math.round(n), 0, 5);
-      var prev = Police.wanted;
-      Police.wanted = n;
-      // Heat hanya dihitung saat level BERUBAH: syncWanted() memanggil
-      // setWanted tiap frame, dan rumus lama (n*20 + heat*0.3) menaikkan
-      // heat tiap frame sampai 100 lalu wanted naik sendiri (ratchet) —
-      // wanted 4 selalu merangkak jadi 5 tanpa kejahatan baru.
-      if (n !== prev) {
-        Police.heat = clamp(n * HEAT_PER_STAR, 0, 100);
-      }
-      if (_state) { _state.wanted = n; _state.heat = Police.heat; }
-      if (n > prev) {
-        Police.deploy(n);
-        if (n >= 3) Police.heli.active = true;
-        if (n >= 5) Police.tacticalHeli.active = true;
-      }
-      if (n === 0) {
-        Police.heli.active = false;
-        Police.tacticalHeli.active = false;
-        Police.roadblocks.length = 0;
-        for (var i = 0; i < Police.cops.length; i++) {
-          Police.cops[i].state = 'patrol'; Police.cops[i].siren = false;
-        }
-      }
-      return Police.wanted;
-    },
-
-    deploy: function (n) {
-      var want = WANTED_TABLE[n].cops;
-      var st = _state;
-      var px = st && st.player ? st.player.x : 0;
-      var pz = st && st.player ? st.player.z : 0;
-      while (Police.cops.length < want && Police.cops.length < MAX_COPS) {
-        var a = rand(0, Math.PI * 2), r = rand(45, 80);
-        Police.cops.push(makeCop(
-          clamp(px + Math.sin(a) * r, -CITY_HALF, CITY_HALF),
-          clamp(pz + Math.cos(a) * r, -CITY_HALF, CITY_HALF),
-          n >= 4 ? 'tactical' : 'pursuit'
-        ));
-      }
-    },
-
-    roadblock: function (x, z) {
-      // Roadblock: 2 mobil polisi melintang + cone, unit siaga menempati posisi.
-      if (Police.roadblocks.length >= 4) return null;
-      var block = { x: x, z: z, angle: rand(0, Math.PI * 2), cars: 2, active: true, timer: 45, cones: 4 };
-      Police.roadblocks.push(block);
-      for (var i = 0; i < Police.cops.length && block.cars > 0; i++) {
-        var c = Police.cops[i];
-        if (c.state === 'patrol' || c.state === 'chase') {
-          c.state = 'block';
-          c.targetX = x + (block.cars === 2 ? -6 : 6);
-          c.targetZ = z;
-          block.cars--;
-        }
-      }
-      return block;
-    },
-
-    pit: function (target) {
-      // PIT: polisi terdekat membelokkan buronan dari samping belakang.
-      if (!target) return false;
-      var best = null, bestD = Infinity;
-      for (var i = 0; i < Police.cops.length; i++) {
-        var c = Police.cops[i];
-        if (c.state !== 'chase' && c.state !== 'pit') continue;
-        if (c.pitCooldown > 0) continue;
-        var d = dist2(c.x, c.z, target.x, target.z);
-        if (d < bestD) { bestD = d; best = c; }
-      }
-      if (!best || bestD > PIT_RANGE * PIT_RANGE * 3) return false;
-      best.state = 'pit'; best.pitTimer = 1.6; best.pitCooldown = 8;
-      best.targetX = target.x; best.targetZ = target.z;
-      return true;
-    },
-
-    update: function (dt, state) {
-      _time += dt;
-      if (state) _state = state;
-      var st = _state || state;
-      if (!st || !st.player) return;
-      var px = st.player.x, pz = st.player.z;
-      var wanted = Police.wanted;
-      // Kejahatan (curi mobil, dll.) menaikkan state.wanted langsung —
-      // adopsi kenaikan itu; kalau tidak, baris st.wanted = wanted di
-      // bawah menimpa balik ke 0 di frame yang sama dan wanted hilang.
-      if (st.wanted > wanted) { wanted = st.wanted; Police.wanted = wanted; }
-      var mode = WANTED_TABLE[wanted].mode;
-
-      // Heat: naik saat wanted aktif, turun saat pemain menghilang.
-      if (wanted > 0) Police.heat = clamp(Police.heat + dt * 1.5, 0, 100);
-      else Police.heat = clamp(Police.heat - dt * HEAT_DECAY, 0, 100);
-      st.heat = Police.heat;
-      st.wanted = wanted;
-
-      // Heat penuh -> naik satu bintang (pemain makin dicari).
-      if (Police.heat >= 100 && wanted > 0 && wanted < 5) {
-        Police.setWanted(wanted + 1); wanted = Police.wanted; mode = WANTED_TABLE[wanted].mode;
-      }
-
-      // Wanted turun perlahan bila pemain lolos dari pandangan polisi 20 detik.
-      if (wanted > 0) {
-        var seen = false;
-        for (var s = 0; s < Police.cops.length; s++) {
-          if (dist2(Police.cops[s].x, Police.cops[s].z, px, pz) < 40 * 40) { seen = true; break; }
-        }
-        if (!seen && !Police.heli.active) {
-          Police._cooldown += dt;
-          if (Police._cooldown > 20) { Police.setWanted(wanted - 1); Police._cooldown = 0; }
-        } else Police._cooldown = 0;
-      }
-
-      Police.deploy(wanted);
-      for (var i = 0; i < Police.cops.length; i++) updateCop(Police.cops[i], dt, st, mode, px, pz);
-      // Unit berlebih saat wanted turun kembali ke patroli (dihapus dari array).
-      var wantCops = WANTED_TABLE[wanted].cops;
-      if (Police.cops.length > wantCops) Police.cops.splice(wantCops, Police.cops.length - wantCops);
-
-      // Roadblock otomatis saat wanted >= 3, di depan arah laju pemain.
-      if (wanted >= 3 && Police.roadblocks.length < 2 && rnd() < dt * 0.08) {
-        var pa = st.player.angle || 0;
-        Police.roadblock(clamp(px + Math.sin(pa) * 55, -CITY_HALF, CITY_HALF),
-          clamp(pz + Math.cos(pa) * 55, -CITY_HALF, CITY_HALF));
-      }
-      for (var r = Police.roadblocks.length - 1; r >= 0; r--) {
-        var b = Police.roadblocks[r];
-        b.timer -= dt;
-        if (b.timer <= 0 || dist2(b.x, b.z, px, pz) > 160 * 160) Police.roadblocks.splice(r, 1);
-      }
-
-      // Helikopter AIR-1 (wanted >= 3) mengorbit pemain; AIR-2 taktis (wanted 5).
-      updateHeli(Police.heli, dt, px, pz, wanted >= 3);
-      updateHeli(Police.tacticalHeli, dt, px, pz, wanted >= 5);
-
-      // NPC sekitar lari saat sirene mendekat.
-      if (window.SB.NPC && wanted >= 2 && rnd() < dt * 2) window.SB.NPC.flee(px, pz);
-    },
-
-    draw: function (gl, state) {
-      if (!gl || !gl.drawMesh || !window.SB.Meshes || !window.SB.Math3) return;
-      var M = window.SB.Math3;
-      var car = window.SB.Meshes.car, person = window.SB.Meshes.person;
-      for (var i = 0; i < Police.cops.length; i++) {
-        var c = Police.cops[i];
-        var m = M.mat4Identity();
-        m = M.mat4Translate(m, c.x, 0, c.z);
-        m = M.mat4RotateY(m, c.angle);
-        if (car) gl.drawMesh(car(c.color), m, c.color);
-        // Lampu sirene: kilau merah/biru bergantian di atas mobil.
-        if (c.siren && person) {
-          var flash = Math.sin(_time * 10 + i * 2) > 0 ? [1, 0.15, 0.15] : [0.15, 0.35, 1];
-          var lm = M.mat4Identity();
-          lm = M.mat4Translate(lm, c.x, 1.05, c.z);
-          gl.drawMesh(person(flash), lm, flash);
-        }
-        if (c.onFoot && person) {
-          var pm = M.mat4Identity();
-          pm = M.mat4Translate(pm, c.x + Math.sin(c.angle) * 1.2, 0, c.z + Math.cos(c.angle) * 1.2);
-          pm = M.mat4RotateY(pm, c.angle);
-          gl.drawMesh(person([0.1, 0.15, 0.4]), pm, [0.1, 0.15, 0.4]);
-        }
-      }
-      // Roadblock: mobil polisi melintang.
-      for (var r = 0; r < Police.roadblocks.length; r++) {
-        var b = Police.roadblocks[r];
-        for (var k = 0; k < 2; k++) {
-          var bm = M.mat4Identity();
-          bm = M.mat4Translate(bm, b.x + (k === 0 ? -5 : 5), 0, b.z);
-          bm = M.mat4RotateY(bm, b.angle + Math.PI / 2);
-          if (car) gl.drawMesh(car([0.08, 0.12, 0.35]), bm, [0.08, 0.12, 0.35]);
-        }
-      }
-      drawHeli(gl, M, Police.heli);
-      drawHeli(gl, M, Police.tacticalHeli);
-    }
+  // Heat yang ditambahkan tiap jenis kejahatan, dan bintang minimum yang
+  // langsung didapat karenanya.
+  var CRIME_TABLE = {
+    steal_car_seen:   { heat: 25, stars: 1, label: "Grand theft auto" },
+    steal_car_unseen: { heat: 8,  stars: 0, label: "Car stolen quietly" },
+    hit_pedestrian:   { heat: 35, stars: 2, label: "Hit and run" },
+    shoot:            { heat: 30, stars: 2, label: "Shots fired" },
+    shoot_cop:        { heat: 55, stars: 3, label: "Shot at police" },
+    heist:            { heat: 70, stars: 4, label: "Heist in progress" },
+    crash_cop:        { heat: 20, stars: 1, label: "Ram police car" },
+    speeding:         { heat: 5,  stars: 0, label: "Reckless driving" }
   };
 
-  function updateCop(c, dt, st, mode, px, pz) {
-    c.sirenPhase += dt * 9;
-    c.pitCooldown = Math.max(0, c.pitCooldown - dt);
-    var dPlayer = Math.sqrt(dist2(c.x, c.z, px, pz));
-    var wantChase = Police.wanted > 0;
+  // Ambang heat untuk tiap bintang (dipakai bila SB.Config.WANTED tidak ada).
+  var HEAT_THRESHOLDS = [0, 20, 40, 60, 80, 95]; // index = bintang
 
-    if (c.state === 'pit') {
-      c.pitTimer -= dt;
-      var ta = st.player.angle || 0;   // sasar samping belakang target lalu dorong
-      steerToward(c, px - Math.sin(ta) * 2.5 + Math.cos(ta) * 1.8,
-        pz - Math.cos(ta) * 2.5 - Math.sin(ta) * 1.8, COP_CHASE_SPEED * 1.15, dt);
-      if (c.pitTimer <= 0) {
-        c.state = 'chase';
-        if (dPlayer < 4 && st.player.vehicle) {   // PIT berhasil: target spin
-          st.player.angle = (st.player.angle || 0) + 0.9;
-          if (window.SB.FX) window.SB.FX.sparks(px, 1, pz);
-        }
+  // ---------------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------------
+  var WANTED = 0;              // 0–5 bintang (angka; publik via SB.Police.WANTED)
+  var heatValue = 0;           // 0–100
+  var lastCrimeAt = -9999;     // waktu game terakhir ada kejahatan
+  var timeNow = 0;             // jam game internal (detik sejak start modul)
+  var sirenTimer = 0;          // throttle bunyi sirene
+  var bustedTimer = 0;         // polisi menempel player jalan kaki
+  var wantedCooldown = 0;      // jeda antar penurunan bintang
+  var lastReport = "";         // deskripsi kejahatan terakhir (untuk HUD/log)
+  var hiddenTimer = 0;         // akumulasi waktu player tersembunyi
+  var pursuitLog = [];         // riwayat singkat (maks 20 entri)
+
+  function logPursuit(text) {
+    pursuitLog.push({ t: timeNow, text: text });
+    if (pursuitLog.length > 20) pursuitLog.shift();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Heat
+  // ---------------------------------------------------------------------------
+  function heat() {
+    return Math.round(heatValue);
+  }
+
+  function addHeat(n) {
+    heatValue = clamp(heatValue + n, 0, MAX_HEAT);
+    syncWantedFromHeat();
+  }
+
+  function syncWantedFromHeat() {
+    // Bintang naik mengikuti heat, tapi tidak pernah turun lewat jalur ini
+    // (penurunan bintang hanya lewat loseHeat).
+    var stars = 0;
+    for (var s = MAX_WANTED; s >= 1; s--) {
+      if (heatValue >= HEAT_THRESHOLDS[s]) { stars = s; break; }
+    }
+    if (stars > WANTED) {
+      setWanted(stars);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Wanted: naik / turun
+  // ---------------------------------------------------------------------------
+  function setWanted(n) {
+    n = clamp(Math.round(n), 0, MAX_WANTED);
+    if (n === WANTED) {
+      syncCopCars();
+      return;
+    }
+    var old = WANTED;
+    WANTED = n;
+    SB.Police.WANTED = n;
+    if (n > old) {
+      // Naikkan heat polisi ke ambang bintang baru, supaya loseHeat tidak
+      // langsung menurunkan wanted (heatValue 0 = heat habis = turun bintang).
+      heatValue = Math.max(heatValue, HEAT_THRESHOLDS[n] || 0);
+      logPursuit("Wanted level rose to " + n + " star" + (n > 1 ? "s" : ""));
+      if (SB.Audio && typeof SB.Audio.sfx === "function") {
+        try { SB.Audio.sfx("siren"); } catch (e) { /* abaikan */ }
       }
-      return;
-    }
-
-    if (c.state === 'block') {
-      steerToward(c, c.targetX, c.targetZ, COP_PATROL_SPEED, dt);
-      if (dist2(c.x, c.z, c.targetX, c.targetZ) < 4) { c.speed = 0; c.siren = true; }
-      if (Police.wanted === 0) c.state = 'patrol';
-      return;
-    }
-
-    if (wantChase && (mode === 'pursue' || mode === 'intercept' || mode === 'takedown')) {
-      c.state = 'chase';
-      c.siren = true;
-      // Prediksi posisi pemain (intercept), bukan kejar ekor.
-      var lead = clamp(dPlayer * 0.25, 0, 12);
-      var pa = st.player.angle || 0;
-      var spd = COP_CHASE_SPEED + (Police.wanted >= 4 ? 1.5 : 0);
-      steerToward(c, px + Math.sin(pa) * lead, pz + Math.cos(pa) * lead, spd, dt);
-      if (Police.wanted >= 4 && dPlayer < PIT_RANGE && c.pitCooldown <= 0) Police.pit(st.player);
-      if (mode === 'takedown' && dPlayer < 3.5 && st.player.hp > 0) c.state = 'ram';
+      if (SB.Game && typeof SB.Game.setWanted === "function") {
+        try { SB.Game.setWanted(n); } catch (e) { /* abaikan */ }
+      }
     } else {
-      // Patroli: jalan pelan menyusuri grid, belok di persimpangan.
-      c.state = 'patrol';
-      c.siren = Police.wanted > 0;
-      steerToward(c, c.targetX, c.targetZ, COP_PATROL_SPEED, dt);
-      if (dist2(c.x, c.z, c.targetX, c.targetZ) < 6) {
-        c.targetX = clamp(c.x + rand(-90, 90), -CITY_HALF, CITY_HALF);
-        c.targetZ = clamp(c.z + rand(-90, 90), -CITY_HALF, CITY_HALF);
+      logPursuit("Wanted level dropped to " + n + " star" + (n === 1 ? "" : "s"));
+      if (SB.Game && typeof SB.Game.setWanted === "function") {
+        try { SB.Game.setWanted(n); } catch (e) { /* abaikan */ }
+      }
+    }
+    syncCopCars();
+  }
+
+  // Kejahatan yang menaikkan wanted. Dipanggil modul lain (Vehicles saat curi
+  // mobil, Weapons saat menembak, Heist saat heist, NPC saat tabrak pejalan).
+  // type: kunci CRIME_TABLE. pos: lokasi kejadian (untuk saksi & respons).
+  function commitCrime(type, pos) {
+    var crime = CRIME_TABLE[type];
+    if (!crime) return false;
+    lastCrimeAt = timeNow;
+    lastReport = crime.label;
+
+    // Curi mobil hanya menaikkan wanted bila ada saksi (pejalan kaki / polisi
+    // dalam radius 40 m). Tanpa saksi, heat naik sedikit saja.
+    if (type === "steal_car_seen" || type === "steal_car_unseen") {
+      var witnessed = isWitnessed(pos);
+      if (!witnessed) {
+        addHeat(CRIME_TABLE.steal_car_unseen.heat);
+        logPursuit("Car stolen unseen — heat +" + CRIME_TABLE.steal_car_unseen.heat);
+        return true;
       }
     }
 
-    if (c.state === 'ram') {
-      steerToward(c, px, pz, COP_CHASE_SPEED * 1.25, dt);
-      if (dPlayer > 8) c.state = 'chase';
-      if (dPlayer < 2.2) { c.state = 'chase'; c.pitCooldown = 3; }
+    addHeat(crime.heat);
+    if (crime.stars > WANTED) setWanted(crime.stars);
+    logPursuit(crime.label + " — heat +" + crime.heat + ", wanted " + WANTED + " stars");
+
+    // Pejalan kaki di sekitar bereaksi terhadap kejahatan keras.
+    if (SB.NPC && typeof SB.NPC.react === "function" && pos) {
+      try {
+        var evType = type === "shoot" || type === "shoot_cop" ? "gunshot" : "chase";
+        SB.NPC.react({ type: evType, pos: pos, radius: 70 });
+      } catch (e) { /* abaikan */ }
     }
-
-    // Deteksi macet: tidak bergerak 4 detik -> cari target baru.
-    if (dist2(c.x, c.z, c.lastX, c.lastZ) < 0.01) {
-      c.stuckT += dt;
-      if (c.stuckT > 4) {
-        c.targetX = clamp(c.x + rand(-60, 60), -CITY_HALF, CITY_HALF);
-        c.targetZ = clamp(c.z + rand(-60, 60), -CITY_HALF, CITY_HALF);
-        c.stuckT = 0;
-      }
-    } else c.stuckT = 0;
-    c.lastX = c.x;
-    c.lastZ = c.z;
-    c.x = clamp(c.x, -CITY_HALF - 10, CITY_HALF + 10);
-    c.z = clamp(c.z, -CITY_HALF - 10, CITY_HALF + 10);
+    return true;
   }
 
-  function steerToward(c, tx, tz, speed, dt) {
-    var dx = tx - c.x, dz = tz - c.z;
-    var len = Math.sqrt(dx * dx + dz * dz);
-    if (len < 0.01) { c.speed = 0; return; }
-    c.angle = angleLerp(c.angle, Math.atan2(dx, dz), Math.min(1, dt * 3.2));
-    c.speed = speed;
-    c.x += Math.sin(c.angle) * speed * dt;
-    c.z += Math.cos(c.angle) * speed * dt;
-  }
-
-  function updateHeli(h, dt, px, pz, shouldBeActive) {
-    if (!h) return;
-    h.rotor += dt * 22;
-    if (!shouldBeActive) {
-      if (h.active) { h.y += dt * 8; if (h.y > 160) h.active = false; }
-      return;
-    }
-    h.active = true;
-    h.spotlight = true;
-    h.orbitA += dt * 0.35;
-    var tx = px + Math.sin(h.orbitA) * h.orbitR;
-    var tz = pz + Math.cos(h.orbitA) * h.orbitR;
-    var ty = 55 + Math.sin(_time * 0.7 + h.orbitA) * 6;
-    h.x += (tx - h.x) * Math.min(1, dt * 1.2);
-    h.z += (tz - h.z) * Math.min(1, dt * 1.2);
-    h.y += (ty - h.y) * Math.min(1, dt * 1.5);
-    h.angle = Math.atan2(px - h.x, pz - h.z);
-    h.spotX = px;
-    h.spotZ = pz;
-    h.searchT += dt;
-  }
-
-  function drawHeli(gl, M, h) {
-    if (!h || !h.active) return;
-    var car = window.SB.Meshes && window.SB.Meshes.car;
-    var plane = window.SB.Meshes && window.SB.Meshes.plane;
-    if (!car) return;
-    var body = h.tactical ? [0.15, 0.15, 0.18] : [0.9, 0.9, 0.92];
-    var m = M.mat4Identity();
-    m = M.mat4Translate(m, h.x, h.y, h.z);
-    m = M.mat4RotateY(m, h.angle);
-    gl.drawMesh(car(body), m, body);
-    // Rotor: bilah tipis berputar di atas badan.
-    if (plane) {
-      var rm = M.mat4Identity();
-      rm = M.mat4Translate(rm, h.x, h.y + 1.2, h.z);
-      rm = M.mat4RotateY(rm, h.rotor);
-      gl.drawMesh(plane(6, 0.4), rm, [0.2, 0.2, 0.22]);
-      // Spotlight: bidang terang di tanah menyapu jalan.
-      if (h.spotlight) {
-        var sm = M.mat4Identity();
-        sm = M.mat4Translate(sm, h.spotX, 0.15, h.spotZ);
-        gl.drawMesh(plane(9, 9), sm, [1, 0.95, 0.7]);
+  // Ada saksi? Pejalan kaki atau mobil polisi dalam radius 40 m dari kejadian.
+  function isWitnessed(pos) {
+    if (!pos) return true; // tanpa info lokasi, anggap terlihat
+    if (SB.NPC && SB.NPC.PEDESTRIANS) {
+      for (var i = 0; i < SB.NPC.PEDESTRIANS.length; i++) {
+        var ped = SB.NPC.PEDESTRIANS[i];
+        if (ped.state !== "down" && dist2D(pos.x, pos.z, ped.pos.x, ped.pos.z) < 40) return true;
       }
     }
+    for (var j = 0; j < COP_CARS.length; j++) {
+      if (dist2D(pos.x, pos.z, COP_CARS[j].pos.x, COP_CARS[j].pos.z) < 60) return true;
+    }
+    return false;
   }
 
-  window.SB.Police = Police;
+  // ---------------------------------------------------------------------------
+  // Mobil patroli
+  // ---------------------------------------------------------------------------
+  var COP_COLORS = [[0.05, 0.05, 0.08]]; // hitam-putih khas patroli (bodi gelap)
+  var COP_ACCENT = [0.95, 0.95, 0.95];
+
+  function makeCopCar(id, spawnPos) {
+    return {
+      id: id,
+      kind: "cop",
+      pos: { x: spawnPos.x, y: 0, z: spawnPos.z },
+      rotY: 0,
+      speed: 0,
+      targetSpeed: 0,
+      color: COP_COLORS[0],
+      accent: COP_ACCENT,
+      state: "patrol",      // patrol | pursue | search | ram
+      searchTimer: 0,
+      stuckTimer: 0,
+      lastPos: { x: spawnPos.x, z: spawnPos.z },
+      sirenOn: false,
+      ramCooldown: 0
+    };
+  }
+
+  // Titik spawn: di jalan terdekat dari player, tapi di luar pandangan dekat
+  // (60–160 m), agar polisi "datang" dari kejauhan, bukan muncul di depan mata.
+  function copSpawnPoint(playerPos) {
+    for (var attempt = 0; attempt < 12; attempt++) {
+      var ang = rand(0, Math.PI * 2);
+      var d = rand(70, 170);
+      var x = clamp(playerPos.x + Math.cos(ang) * d, -CITY_HALF, CITY_HALF);
+      var z = clamp(playerPos.z + Math.sin(ang) * d, -CITY_HALF, CITY_HALF);
+      // Geser ke jalan terdekat (kelipatan 100).
+      var gx = Math.round(x / ROAD_STEP) * ROAD_STEP;
+      var gz = Math.round(z / ROAD_STEP) * ROAD_STEP;
+      if (Math.abs(x - gx) < Math.abs(z - gz)) x = gx; else z = gz;
+      if (dist2D(x, z, playerPos.x, playerPos.z) > 55) {
+        return { x: x, z: z };
+      }
+    }
+    return { x: clamp(playerPos.x + 90, -CITY_HALF, CITY_HALF), z: playerPos.z };
+  }
+
+  var COP_CARS = [];
+
+  // Jumlah patroli = wanted + 1 saat wanted ≥ 1 (1 bintang → 2 mobil, dst),
+  // dibatasi 6 mobil agar kota tidak penuh polisi.
+  function desiredCopCount() {
+    if (WANTED <= 0) return 0;
+    return Math.min(WANTED + 1, 6);
+  }
+
+  function syncCopCars() {
+    var want = desiredCopCount();
+    var player = currentPlayer();
+    var base = player ? player.pos : { x: 0, z: 0 };
+    while (COP_CARS.length < want) {
+      var spawn = copSpawnPoint(base);
+      var cop = makeCopCar(COP_CARS.length, spawn);
+      cop.state = WANTED >= 1 ? "pursue" : "patrol";
+      cop.sirenOn = true;
+      COP_CARS.push(cop);
+    }
+    while (COP_CARS.length > want) {
+      COP_CARS.pop();
+    }
+    // Sinkronkan state dengan wanted saat ini.
+    for (var i = 0; i < COP_CARS.length; i++) {
+      COP_CARS[i].sirenOn = WANTED >= 1;
+      if (WANTED === 0) COP_CARS[i].state = "patrol";
+      else if (COP_CARS[i].state === "patrol") COP_CARS[i].state = "pursue";
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Player (dibaca saat runtime dari SB.Player / SB.Game.state)
+  // ---------------------------------------------------------------------------
+  function currentPlayer() {
+    try {
+      if (SB.Player && SB.Player.pos) {
+        return {
+          pos: SB.Player.pos,
+          onFoot: SB.Player.onFoot !== false,
+          vehicle: SB.Player.currentVehicle || null,
+          speed: Math.abs(SB.Player.speed || 0),
+          health: SB.Player.health
+        };
+      }
+      if (SB.Game && SB.Game.state && SB.Game.state.player) {
+        var p = SB.Game.state.player;
+        return {
+          pos: p.pos || { x: 0, y: 0, z: 0 },
+          onFoot: p.onFoot !== false,
+          vehicle: p.vehicle || null,
+          speed: Math.abs(p.speed || 0),
+          health: p.health
+        };
+      }
+    } catch (e) { /* modul lain belum siap */ }
+    return null;
+  }
+
+  function playerVehicleSpeed(player) {
+    if (!player) return 0;
+    if (player.vehicle && typeof player.vehicle.speed === "number") {
+      return Math.abs(player.vehicle.speed);
+    }
+    return player.speed || 0;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pengejaran
+  // ---------------------------------------------------------------------------
+  // Satu mobil polisi mengejar player. Dipanggil dari update(); tersedia juga
+  // sebagai API publik pursue(player).
+  function pursue(player) {
+    if (!player || !player.pos) return;
+    for (var i = 0; i < COP_CARS.length; i++) {
+      chaseTarget(COP_CARS[i], player, 0.016);
+    }
+  }
+
+  function chaseTarget(cop, player, dt) {
+    var target = player.pos;
+    var d = dist2D(cop.pos.x, cop.pos.z, target.x, target.z);
+
+    // Kecepatan kejar: sedikit di atas kecepatan player agar bisa mendekat,
+    // tapi tidak mustahil dilepas. Di atas 4 bintang polisi lebih agresif.
+    var playerSpeed = playerVehicleSpeed(player);
+    var chaseSpeed = player.onFoot
+      ? 5.2 + WANTED * 0.35                      // kejar jalan kaki: lari cepat
+      : Math.min(24 + WANTED * 1.5, playerSpeed + 4 + WANTED); // kejar mobil
+
+    if (cop.state === "search") {
+      // Kehilangan jejak: berkeliling di titik terakhir terlihat.
+      cop.searchTimer -= dt;
+      cop.targetSpeed = 7;
+      if (cop.searchTimer <= 0) {
+        cop.state = "pursue";
+      }
+    } else {
+      cop.targetSpeed = chaseSpeed;
+    }
+
+    // Belok menuju player (dengan batas laju belok agar tidak berputar instan).
+    var desiredRot = angleTo(cop.pos.x, cop.pos.z, target.x, target.z);
+    var diff = desiredRot - cop.rotY;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    cop.rotY += clamp(diff, -2.4 * dt, 2.4 * dt);
+
+    // Percepat / perlambat.
+    if (cop.speed < cop.targetSpeed) cop.speed = Math.min(cop.targetSpeed, cop.speed + 10 * dt);
+    else if (cop.speed > cop.targetSpeed) cop.speed = Math.max(cop.targetSpeed, cop.speed - 16 * dt);
+
+    cop.pos.x += Math.sin(cop.rotY) * cop.speed * dt;
+    cop.pos.z += Math.cos(cop.rotY) * cop.speed * dt;
+    cop.pos.x = clamp(cop.pos.x, -CITY_HALF - 40, CITY_HALF + 40);
+    cop.pos.z = clamp(cop.pos.z, -CITY_HALF - 40, CITY_HALF + 40);
+
+    // Deteksi macet (tidak bergerak padahal harus mengejar): mundur & belok.
+    var moved = dist2D(cop.pos.x, cop.pos.z, cop.lastPos.x, cop.lastPos.z);
+    if (cop.speed > 3 && moved < 0.05) {
+      cop.stuckTimer += dt;
+      if (cop.stuckTimer > 1.2) {
+        cop.rotY += Math.PI / 2; // putar untuk keluar dari jebakan
+        cop.stuckTimer = 0;
+      }
+    } else {
+      cop.stuckTimer = 0;
+    }
+    cop.lastPos = { x: cop.pos.x, z: cop.pos.z };
+
+    // Menabrak mobil player dari samping/belakang saat sudah sangat dekat
+    // (ram): dorong lewat event + bunyi, dengan cooldown.
+    cop.ramCooldown -= dt;
+    if (!player.onFoot && d < 4 && cop.ramCooldown <= 0) {
+      cop.ramCooldown = 2;
+      cop.state = "ram";
+      if (SB.Audio && typeof SB.Audio.sfx === "function") {
+        try { SB.Audio.sfx("crash"); } catch (e) { /* abaikan */ }
+      }
+      if (SB.FX && typeof SB.FX.spawnParticles === "function") {
+        try { SB.FX.spawnParticles(cop.pos, [1.0, 0.8, 0.2], 8); } catch (e) { /* abaikan */ }
+      }
+      setTimeout(function () { if (cop.state === "ram") cop.state = "pursue"; }, 600);
+    }
+
+    // Jarak pengejaran terlalu jauh: polisi kehilangan jejak, masuk mode cari.
+    if (d > 260 && cop.state === "pursue") {
+      cop.state = "search";
+      cop.searchTimer = rand(6, 12);
+    } else if (d < 120 && cop.state === "search") {
+      cop.state = "pursue";
+    }
+  }
+
+  function busted(reason) {
+    if (WANTED <= 0) return;
+    logPursuit("BUSTED — " + reason);
+    bustedTimer = 0;
+    if (SB.Game && typeof SB.Game.gameOver === "function") {
+      try { SB.Game.gameOver("busted"); } catch (e) { /* abaikan */ }
+    }
+  }
+
+  // Patroli santai saat wanted 0: mobil polisi berkeliling kota pelan.
+  function patrolUpdate(cop, dt) {
+    cop.targetSpeed = 8;
+    cop.rotY += Math.sin(timeNow * 0.15 + cop.id) * 0.15 * dt;
+    if (cop.speed < cop.targetSpeed) cop.speed = Math.min(cop.targetSpeed, cop.speed + 5 * dt);
+    cop.pos.x += Math.sin(cop.rotY) * cop.speed * dt;
+    cop.pos.z += Math.cos(cop.rotY) * cop.speed * dt;
+    // Pantul di batas kota.
+    if (Math.abs(cop.pos.x) > CITY_HALF || Math.abs(cop.pos.z) > CITY_HALF) {
+      cop.rotY += Math.PI;
+      cop.pos.x = clamp(cop.pos.x, -CITY_HALF, CITY_HALF);
+      cop.pos.z = clamp(cop.pos.z, -CITY_HALF, CITY_HALF);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Kehilangan heat (sembunyi / menjauh)
+  // ---------------------------------------------------------------------------
+  // Jarak ke polisi terdekat; Infinity bila tidak ada patroli.
+  function nearestCopDistance(playerPos) {
+    if (!playerPos || COP_CARS.length === 0) return Infinity;
+    var best = Infinity;
+    for (var i = 0; i < COP_CARS.length; i++) {
+      var d = dist2D(playerPos.x, playerPos.z, COP_CARS[i].pos.x, COP_CARS[i].pos.z);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  // Player dianggap bersembunyi bila: jauh dari semua polisi (>140 m), atau
+  // sudah lama tidak melakukan kejahatan dan tidak terlihat (polisi dalam
+  // mode search, bukan pursue).
+  function isHiding(player) {
+    if (!player || !player.pos) return false;
+    if (timeNow - lastCrimeAt < 8) return false; // baru berbuat kejahatan
+    var d = nearestCopDistance(player.pos);
+    if (d > 140) return true;
+    var anyPursuing = false;
+    for (var i = 0; i < COP_CARS.length; i++) {
+      if (COP_CARS[i].state === "pursue" || COP_CARS[i].state === "ram") { anyPursuing = true; break; }
+    }
+    return !anyPursuing && d > 80;
+  }
+
+  function loseHeat(dt) {
+    if (WANTED <= 0 && heatValue <= 0) return;
+    var player = currentPlayer();
+    var hiding = isHiding(player);
+    var decay = 0;
+
+    if (hiding) {
+      hiddenTimer += dt;
+      // Makin lama sembunyi, makin cepat heat turun.
+      decay = 2.2 + Math.min(hiddenTimer / 10, 2.5);
+    } else if (WANTED > 0) {
+      hiddenTimer = 0;
+      // Saat dikejar aktif heat praktis tidak turun; hanya merayap saat
+      // player menjauh (>200 m dari polisi terdekat).
+      var d = player ? nearestCopDistance(player.pos) : Infinity;
+      if (d > 200) decay = 0.4;
+    } else {
+      hiddenTimer = 0;
+      decay = 1.0;
+    }
+
+    if (decay > 0) {
+      heatValue = clamp(heatValue - decay * dt, 0, MAX_HEAT);
+    }
+
+    // Bila heat habis, wanted turun satu bintang (dengan jeda antar penurunan).
+    wantedCooldown -= dt;
+    if (heatValue <= 0 && WANTED > 0 && wantedCooldown <= 0) {
+      wantedCooldown = 4;
+      setWanted(WANTED - 1);
+      // Heat tidak langsung penuh lagi: mulai dari ambang bintang baru.
+      heatValue = WANTED > 0 ? HEAT_THRESHOLDS[WANTED] : 0;
+      hiddenTimer = 0;
+      logPursuit("Heat cleared — wanted now " + WANTED + " star" + (WANTED === 1 ? "" : "s"));
+    }
+  }
+
+  // Ganti mobil + respray menurunkan wanted: polisi kehilangan jejak kendaraan.
+  function clearWantedAfterRespray() {
+    if (WANTED <= 0) return false;
+    heatValue = 0;
+    setWanted(Math.max(0, WANTED - 1));
+    hiddenTimer = 0;
+    logPursuit("Respray + vehicle swap — wanted reduced to " + WANTED);
+    return true;
+  }
+
+  // Ganti kendaraan saja (tanpa respray) mengurangi heat separuh.
+  function vehicleSwapHeatCut() {
+    heatValue = Math.floor(heatValue / 2);
+    syncWantedFromHeat();
+    logPursuit("Vehicle swapped — heat halved to " + heatValue);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Update utama — dipanggil tiap frame oleh game loop
+  // ---------------------------------------------------------------------------
+  function update(dt) {
+    if (!dt || dt <= 0) return;
+    dt = Math.min(dt, 0.05);
+    syncCopCars();
+    timeNow += dt;
+
+    var player = currentPlayer();
+
+    // Sirene berkala selama pengejaran aktif.
+    sirenTimer -= dt;
+    if (WANTED >= 1 && sirenTimer <= 0) {
+      sirenTimer = 2.8;
+      if (SB.Audio && typeof SB.Audio.sfx === "function") {
+        try { SB.Audio.sfx("siren"); } catch (e) { /* abaikan */ }
+      }
+    }
+
+    // Saat wanted naik, heat ikut merayap naik selama pengejaran terlihat.
+    if (WANTED >= 1 && player) {
+      var nearest = nearestCopDistance(player.pos);
+      if (nearest < 90) {
+        heatValue = clamp(heatValue + dt * 0.8, 0, MAX_HEAT);
+      }
+    }
+
+    for (var i = 0; i < COP_CARS.length; i++) {
+      var cop = COP_CARS[i];
+      if (WANTED >= 1 && player) {
+        chaseTarget(cop, player, dt);
+      } else {
+        patrolUpdate(cop, dt);
+      }
+    }
+
+    loseHeat(dt);
+
+    // Tertangkap (sekali per frame, pakai cop terdekat — jangan per-cop,
+    // supaya cop jauh tidak membatalkan cop dekat).
+    if (WANTED >= 1 && player && player.onFoot) {
+      var nd = nearestCopDistance(player.pos);
+      var anyClose = false;
+      for (var j = 0; j < COP_CARS.length; j++) {
+        var cc = COP_CARS[j];
+        if (cc.speed > 1 && dist2D(cc.pos.x, cc.pos.z, player.pos.x, player.pos.z) < 2.5) { anyClose = true; break; }
+      }
+      if (anyClose) {
+        bustedTimer += dt;
+        if (bustedTimer > 2) busted("caught by police on foot");
+      } else if (nd < 6) {
+        bustedTimer += dt * 0.5;
+      } else {
+        bustedTimer = Math.max(0, bustedTimer - dt);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helper publik
+  // ---------------------------------------------------------------------------
+  function isPursuing() {
+    for (var i = 0; i < COP_CARS.length; i++) {
+      if (COP_CARS[i].state === "pursue" || COP_CARS[i].state === "ram") return true;
+    }
+    return false;
+  }
+
+  function nearestCop(x, z) {
+    var best = null, bestD = Infinity;
+    for (var i = 0; i < COP_CARS.length; i++) {
+      var d = dist2D(x, z, COP_CARS[i].pos.x, COP_CARS[i].pos.z);
+      if (d < bestD) { bestD = d; best = COP_CARS[i]; }
+    }
+    return best;
+  }
+
+  function status() {
+    return {
+      wanted: WANTED,
+      heat: Math.round(heatValue),
+      cops: COP_CARS.length,
+      pursuing: isPursuing(),
+      hiddenFor: Math.round(hiddenTimer),
+      lastCrime: lastReport
+    };
+  }
+
+  function reset() {
+    WANTED = 0;
+    SB.Police.WANTED = 0;
+    heatValue = 0;
+    lastCrimeAt = -9999;
+    bustedTimer = 0;
+    wantedCooldown = 0;
+    hiddenTimer = 0;
+    lastReport = "";
+    pursuitLog.length = 0;
+    COP_CARS.length = 0;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Registrasi namespace
+  // ---------------------------------------------------------------------------
+  SB.Police = {
+    WANTED: WANTED,
+    COP_CARS: COP_CARS,
+    heat: heat,
+    update: update,
+    pursue: pursue,
+    loseHeat: loseHeat,
+    setWanted: setWanted,
+    commitCrime: commitCrime,
+    isWitnessed: isWitnessed,
+    clearWantedAfterRespray: clearWantedAfterRespray,
+    vehicleSwapHeatCut: vehicleSwapHeatCut,
+    isPursuing: isPursuing,
+    nearestCop: nearestCop,
+    nearestCopDistance: nearestCopDistance,
+    isHiding: isHiding,
+    status: status,
+    log: pursuitLog,
+    reset: reset
+  };
+
 })();

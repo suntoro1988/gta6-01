@@ -1,427 +1,423 @@
+// Sunset Bay — SB.Vehicles
+// 42 mobil kota: spawn per distrik, curi dengan E, nyetir WASD + Space rem,
+// respray (biaya SB.Config.RESPRAY_COST = 150).
+// Komunikasi antar modul HANYA lewat namespace SB (design spec §4).
+
 window.SB = window.SB || {};
-(function(){ 'use strict';
 
-// SB.Vehicles — lalu lintas Sunset Bay: 40 mobil (traffic AI + mobil pemain),
-// curi mobil, masuk/keluar mobil, tabrakan ringan, klakson.
-// Mobil pemain + traffic berbagi struktur car:
-//   { id, x, z, angle, speed, targetSpeed, color, kind, stolen, ai,
-//     waypoint, lane, brake, meshKey }
-// state.player.vehicle menunjuk objek car saat mengemudi (atau null).
-// PENTING (pelajaran v12): stealCar() HARUS mengembalikan OBJEK mobil,
-// BUKAN boolean — pemanggil (Player/Jobs) memakai objeknya langsung.
+(function () {
+  "use strict";
 
-function mulberry32(seed) {
-  var a = seed >>> 0;
-  return function() {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    var t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+  // Pusat distrik — SAMA PERSIS dengan design spec §3.
+  var DISTRICTS = [
+    { name: "Marina Bay", x: 0, z: 0, r: 120 },
+    { name: "Old Town", x: -120, z: 40, r: 90 },
+    { name: "Fisherman's Wharf", x: -185, z: 40, r: 55 },
+    { name: "Sunset Strip", x: 120, z: -60, r: 100 },
+    { name: "North Hills", x: 60, z: 180, r: 110 },
+    { name: "East Market", x: 200, z: 80, r: 90 },
+    { name: "Harbor Point", x: -220, z: -80, r: 80 },
+    { name: "Palm Court", x: 40, z: -180, r: 90 },
+    { name: "Coral District", x: -60, z: -140, r: 80 },
+    { name: "Beacon Hill", x: 180, z: 180, r: 100 },
+    { name: "Little Havana", x: -160, z: 160, r: 90 },
+    { name: "Airport South", x: 260, z: -160, r: 110 },
+    { name: "University Row", x: -40, z: 220, r: 90 },
+    { name: "Industrial Docks", x: 240, z: 20, r: 100 }
+  ];
 
-function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  var MODELS = [
+    { name: "Comet", maxSpeed: 34, accel: 16, grip: 1.0 },
+    { name: "Sunrise", maxSpeed: 28, accel: 13, grip: 1.05 },
+    { name: "Paleto", maxSpeed: 26, accel: 12, grip: 1.1 },
+    { name: "Viceroy", maxSpeed: 30, accel: 14, grip: 1.0 },
+    { name: "Banshee", maxSpeed: 38, accel: 18, grip: 0.95 },
+    { name: "Tropic", maxSpeed: 24, accel: 11, grip: 1.15 }
+  ];
 
-var CAR_COLORS = [
-  '#c0392b', '#2980b9', '#f1c40f', '#ecf0f1', '#2c3e50',
-  '#e67e22', '#8e44ad', '#16a085', '#7f8c8d', '#d35400',
-  '#1abc9c', '#34495e', '#e74c3c', '#f39c12', '#bdc3c7'
-];
+  // Palette warna mobil (RGB 0..1).
+  var PAINT = [
+    [0.85, 0.15, 0.2], [0.15, 0.3, 0.85], [0.9, 0.75, 0.15],
+    [0.1, 0.7, 0.3], [0.95, 0.95, 0.95], [0.1, 0.1, 0.12],
+    [0.85, 0.4, 0.05], [0.5, 0.15, 0.6], [0.2, 0.75, 0.8],
+    [0.75, 0.75, 0.8], [0.9, 0.2, 0.5], [0.3, 0.3, 0.35]
+  ];
 
-var KINDS = ['sedan', 'sedan', 'sedan', 'taxi', 'coupe', 'van', 'pickup'];
+  var STEAL_RADIUS = 4.5;
+  var MAX_CARS = 60;
 
-var TRAFFIC_COUNT = 40;   // target spec: 36+ mobil traffic
-var BLOCK = 40;           // grid jalan (selaras SB.City)
-var MAX_SPEED = 14;       // traffic santai (unit/detik)
-var PLAYER_TOP = 26;      // mobil pemain bisa lebih kencang
-var STEAL_RADIUS = 7;     // jarak maksimal mencuri mobil
-var RESPRAY_COST = 150;   // biaya cat ulang mobil pemain (respray)
-
-var veh = {
-  ready: false,
-  cars: [],
-  nextId: 1,
-  rng: null,
-  meshCache: {},
-  hornTimer: 0
-};
-
-// Pembuatan mobil
-
-// Posisi jalan acak (di tengah jalur grid).
-function streetPos(rng) {
-  var vertical = rng() < 0.5;
-  var g = -200 + Math.floor(rng() * 11) * BLOCK;
-  if (vertical) {
-    return { x: g + (rng() < 0.5 ? 2.5 : -2.5), z: -190 + rng() * 350 };
+  function config() {
+    return (window.SB && window.SB.Config) || {};
   }
-  return { x: -190 + rng() * 380, z: g + (rng() < 0.5 ? 2.5 : -2.5) };
-}
 
-// Buat objek car baru di (x, z). kind 'taxi' berwarna kuning.
-function makeCar(x, z, kind) {
-  var rng = veh.rng || mulberry32(99);
-  kind = kind || KINDS[Math.floor(rng() * KINDS.length)];
-  var color = (kind === 'taxi') ? '#f1c40f'
-    : CAR_COLORS[Math.floor(rng() * CAR_COLORS.length)];
-  var vertical = rng() < 0.5;
-  return {
-    id: 'car-' + (veh.nextId++),
-    x: x, z: z,
-    angle: vertical ? (rng() < 0.5 ? 0 : Math.PI) : (rng() < 0.5 ? Math.PI / 2 : -Math.PI / 2),
-    speed: 0,
-    targetSpeed: 6 + rng() * 6,
-    color: color,
-    kind: kind,
-    stolen: false,
-    ai: true,
-    lane: vertical ? 'v' : 'h',
-    grid: vertical ? Math.round(x / BLOCK) * BLOCK : Math.round(z / BLOCK) * BLOCK,
-    brake: 0,
-    hp: 100
-  };
-}
-
-// spawnCar(x, z): buat mobil baru di posisi itu, masukkan ke cars, kembalikan.
-// Bila x/z tidak diberikan, pakai posisi jalan acak.
-function spawnCar(x, z) {
-  var rng = veh.rng || mulberry32(99);
-  if (x === undefined || z === undefined) {
-    var p = streetPos(rng);
-    x = p.x; z = p.z;
+  function resprayCost() {
+    var c = config();
+    if (typeof c.RESPRAY_COST === "number") return c.RESPRAY_COST;
+    return 150;
   }
-  var car = makeCar(x, z);
-  veh.cars.push(car);
-  return car;
-}
 
-// Mobil terdekat dari (x, z) dalam radius r.
-function nearestCar(x, z, r) {
-  var best = null, bestD = r;
-  for (var i = 0; i < veh.cars.length; i++) {
-    var c = veh.cars[i];
-    var dx = c.x - x, dz = c.z - z;
-    var d = Math.sqrt(dx * dx + dz * dz);
-    if (d < bestD) { bestD = d; best = c; }
+  function clamp(v, lo, hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
   }
-  return best;
-}
 
-// API publik
-
-// init(state): isi 40 traffic + 2 mobil parkir dekat spawn pemain.
-function init(state) {
-  if (veh.ready) { return; }
-  veh.ready = true;
-  veh.rng = mulberry32(20261122);
-  // Kosongkan in-place (JANGAN reassign): array yang diekspor di
-  // window.SB.Vehicles.cars menunjuk objek array ini.
-  veh.cars.length = 0;
-  veh.nextId = 1;
-  for (var i = 0; i < TRAFFIC_COUNT; i++) {
-    var p = streetPos(veh.rng);
-    veh.cars.push(makeCar(p.x, p.z));
+  function rand(lo, hi) {
+    return lo + Math.random() * (hi - lo);
   }
-  // Dua mobil parkir di Boardwalk dekat spawn pemain (mudah dicuri di awal).
-  var parked1 = makeCar(-36, 146, 'sedan');
-  parked1.ai = false; parked1.targetSpeed = 0;
-  veh.cars.push(parked1);
-  var parked2 = makeCar(-30, 158, 'coupe');
-  parked2.ai = false; parked2.targetSpeed = 0;
-  veh.cars.push(parked2);
-  if (state) { state.flags.carsReady = true; }
-}
 
-// update(dt, state): traffic AI + mobil pemain.
-function update(dt, state) {
-  if (!veh.ready) { return; }
-  var p = state ? state.player : null;
+  function pick(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+  }
 
-  for (var i = 0; i < veh.cars.length; i++) {
-    var c = veh.cars[i];
+  function dist2(ax, az, bx, bz) {
+    var dx = ax - bx;
+    var dz = az - bz;
+    return Math.sqrt(dx * dx + dz * dz);
+  }
 
-    // --- Mobil yang dikemudikan pemain ---
-    if (p && p.vehicle === c) {
-      var input = state._carInput || { f: 0, turn: 0 };
-      var top = PLAYER_TOP;
-      c.targetSpeed = input.f * top;
-      // Akselerasi / pengereman halus.
-      var accel = (c.targetSpeed > c.speed) ? 10 : 16;
-      if (c.speed < c.targetSpeed) {
-        c.speed = Math.min(c.targetSpeed, c.speed + accel * dt);
-      } else if (c.speed > c.targetSpeed) {
-        c.speed = Math.max(c.targetSpeed, c.speed - accel * dt);
-      }
-      // Belok: hanya efektif saat bergerak; mundur membalik arah belok.
-      var steer = input.turn * (0.55 + Math.min(1, Math.abs(c.speed) / 12) * 0.9);
-      c.angle += steer * dt * (c.speed < -0.5 ? -1 : 1);
-      c.x += Math.sin(c.angle) * c.speed * dt;
-      c.z += Math.cos(c.angle) * c.speed * dt;
-      // Batas dunia: pantai selatan + tepi peta (pantul pelan).
-      if (c.z > 200) { c.z = 200; c.speed *= 0.3; }
-      if (c.z < -235) { c.z = -235; c.speed *= 0.3; }
-      if (c.x < -235) { c.x = -235; c.speed *= 0.3; }
-      if (c.x > 235) { c.x = 235; c.speed *= 0.3; }
-      // Tabrakan dengan traffic: dorong pelan, kurangi kecepatan.
-      for (var j = 0; j < veh.cars.length; j++) {
-        if (i === j) { continue; }
-        var o = veh.cars[j];
-        var dx = c.x - o.x, dz = c.z - o.z;
-        var d2 = dx * dx + dz * dz;
-        if (d2 < 9 && d2 > 0.01) {
-          var d = Math.sqrt(d2);
-          var push = (3 - d) * 0.5;
-          c.x += (dx / d) * push;
-          c.z += (dz / d) * push;
-          c.speed *= 0.85;
+  function districtCenter(name) {
+    // Utamakan data resmi dari SB.Config / SB.City bila tersedia.
+    var src = null;
+    var c = config();
+    if (c.DISTRICTS) src = c.DISTRICTS;
+    else if (window.SB && window.SB.City && window.SB.City.DISTRICTS) src = window.SB.City.DISTRICTS;
+    if (src) {
+      if (Array.isArray(src)) {
+        for (var i = 0; i < src.length; i++) {
+          if (src[i].name === name) return { x: src[i].x, z: src[i].z, r: src[i].r || src[i].radius || 80 };
+          if (src[i].x != null && src[i].center) return null;
         }
+      } else if (src[name]) {
+        var d = src[name];
+        return { x: d.x, z: d.z, r: d.r || d.radius || 80 };
       }
-      // Sinkronkan state pemain ke mobil.
-      p.x = c.x; p.z = c.z; p.y = 0;
-      p.angle = c.angle;
-      // Drift: belok tajam di kecepatan tinggi.
-      if (Math.abs(input.turn) > 0.7 && Math.abs(c.speed) > 14) {
-        if (state.stats) { state.stats.drifts = (state.stats.drifts || 0) + dt; }
-      }
-      continue;
     }
+    for (var j = 0; j < DISTRICTS.length; j++) {
+      if (DISTRICTS[j].name === name) return DISTRICTS[j];
+    }
+    return DISTRICTS[0];
+  }
 
-    // --- Traffic AI: jalan lurus di jalurnya, belok di persimpangan ---
-    if (!c.ai) { continue; }
-    // Rem bila ada mobil di depan (jarak < 10 searah).
-    c.brake = 0;
-    for (var k = 0; k < veh.cars.length; k++) {
-      if (k === i) { continue; }
-      var ahead = veh.cars[k];
-      var ax = ahead.x - c.x, az = ahead.z - c.z;
-      var dist = Math.sqrt(ax * ax + az * az);
-      if (dist < 9) {
-        // Apakah mobil itu ada di depan (searah hadap)?
-        var dot = (ax * Math.sin(c.angle) + az * Math.cos(c.angle)) / (dist || 1);
-        if (dot > 0.7) { c.brake = 1; break; }
-      }
+  function keyDown(input, key) {
+    if (!input) return false;
+    if (input.keys) {
+      if (typeof input.keys.has === "function") return input.keys.has(key);
+      if (Array.isArray(input.keys)) return input.keys.indexOf(key) !== -1;
     }
-    var want = c.brake ? 0 : c.targetSpeed;
-    if (c.speed < want) { c.speed = Math.min(want, c.speed + 5 * dt); }
-    else if (c.speed > want) { c.speed = Math.max(want, c.speed - 12 * dt); }
-    c.x += Math.sin(c.angle) * c.speed * dt;
-    c.z += Math.cos(c.angle) * c.speed * dt;
+    if (input[key]) return true;
+    return false;
+  }
 
-    // Di persimpangan (dekat kelipatan BLOCK di kedua sumbu), kadang belok.
-    var nearIx = Math.abs(c.x - Math.round(c.x / BLOCK) * BLOCK) < 3;
-    var nearIz = Math.abs(c.z - Math.round(c.z / BLOCK) * BLOCK) < 3;
-    if (nearIx && nearIz && c.speed > 1) {
-      var r = veh.rng();
-      if (r < 0.12) { c.angle += Math.PI / 2; }        // belok kanan
-      else if (r < 0.24) { c.angle -= Math.PI / 2; }   // belok kiri
-      else if (r < 0.27) { c.angle += Math.PI; }       // putar balik
-      // Setelah belok, kunci jalur baru.
-      c.lane = (Math.abs(Math.sin(c.angle)) > 0.5) ? 'v' : 'h';
-    }
-    // Keluar peta -> respawn di sisi berlawanan (lalu lintas tak habis).
-    if (c.z > 205 || c.z < -235 || c.x < -235 || c.x > 235) {
-      var np = streetPos(veh.rng);
-      c.x = np.x; c.z = np.z;
-      c.speed = c.targetSpeed * 0.5;
+  function collideAt(x, z) {
+    var City = window.SB && window.SB.City;
+    if (!City || typeof City.collide !== "function") return false;
+    try {
+      var r = City.collide({ x: x, y: 0, z: z }, 1.4);
+      return !!r;
+    } catch (e) {
+      return false;
     }
   }
 
-  // Klakson acak dari traffic yang mengerem (dipakai Audio bila ada).
-  veh.hornTimer -= dt;
-  if (veh.hornTimer <= 0) {
-    veh.hornTimer = 4 + veh.rng() * 8;
-    if (state && window.SB.Audio) {
-      // Hanya bunyikan bila ada mobil mengerem di dekat pemain.
-      for (var h = 0; h < veh.cars.length; h++) {
-        var hc = veh.cars[h];
-        if (hc.brake && p) {
-          var hdx = hc.x - p.x, hdz = hc.z - p.z;
-          if (hdx * hdx + hdz * hdz < 900) {
-            window.SB.Audio.sfx('horn');
+  function isRaining() {
+    if (window.SB && window.SB.Weather && window.SB.Weather.current === "rain") return true;
+    if (window.SB && window.SB.Game && window.SB.Game.state &&
+        window.SB.Game.state.weather === "rain") return true;
+    return false;
+  }
+
+  function sfx(name) {
+    if (window.SB && window.SB.Audio && typeof window.SB.Audio.sfx === "function") {
+      try { window.SB.Audio.sfx(name); } catch (e) { /* abaikan */ }
+    }
+  }
+
+  function fxParticles(pos, color, n) {
+    if (window.SB && window.SB.FX && typeof window.SB.FX.spawnParticles === "function") {
+      try { window.SB.FX.spawnParticles(pos, color, n); } catch (e) { /* abaikan */ }
+    }
+  }
+
+  var nextId = 1;
+
+  var Vehicles = {
+    CARS: [],
+    STEAL_RADIUS: STEAL_RADIUS,
+    _ePrev: false,
+    _fPrev: false,
+
+    spawnCar: function (district) {
+      var center = districtCenter(district || pick(DISTRICTS).name);
+      var model = pick(MODELS);
+      var car = {
+        id: "car-" + (nextId++),
+        kind: "car",
+        model: model.name,
+        pos: {
+          x: center.x + rand(-center.r * 0.6, center.r * 0.6),
+          y: 0,
+          z: center.z + rand(-center.r * 0.6, center.r * 0.6)
+        },
+        rotY: rand(0, Math.PI * 2),
+        vel: { x: 0, y: 0, z: 0 },
+        speed: 0,
+        color: pick(PAINT).slice(),
+        stolen: false,
+        driver: null,
+        district: center.name,
+        maxSpeed: model.maxSpeed,
+        accel: model.accel,
+        grip: model.grip,
+        health: 100
+      };
+      // Jangan spawn di dalam bangunan: geser sampai titik bebas.
+      var tries = 0;
+      while (collideAt(car.pos.x, car.pos.z) && tries < 12) {
+        car.pos.x = center.x + rand(-center.r * 0.7, center.r * 0.7);
+        car.pos.z = center.z + rand(-center.r * 0.7, center.r * 0.7);
+        tries++;
+      }
+      this.CARS.push(car);
+      // Batasi jumlah mobil: buang mobil parkir tertua yang bukan milik pemain.
+      while (this.CARS.length > MAX_CARS) {
+        var removed = false;
+        for (var i = 0; i < this.CARS.length; i++) {
+          if (!this.CARS[i].driver && !this.CARS[i].stolen) {
+            this.CARS.splice(i, 1);
+            removed = true;
             break;
           }
         }
+        if (!removed) break;
       }
+      return car;
+    },
+
+    nearestCar: function (pos) {
+      if (!pos) return null;
+      var best = null;
+      var bestD = Infinity;
+      for (var i = 0; i < this.CARS.length; i++) {
+        var car = this.CARS[i];
+        if (car.driver) continue; // mobil yang sudah ada pengemudinya tidak bisa dicuri
+        var d = dist2(pos.x, pos.z, car.pos.x, car.pos.z);
+        if (d < bestD) { bestD = d; best = car; }
+      }
+      if (!best) return null;
+      return { car: best, dist: bestD };
+    },
+
+    // Curi mobil terdekat (tombol E). Mengembalikan mobil atau null.
+    stealNearest: function () {
+      var P = window.SB && window.SB.Player;
+      if (!P || !P.pos || !P.onFoot) return null;
+      var found = this.nearestCar(P.pos);
+      if (!found || found.dist > STEAL_RADIUS) return null;
+      var car = found.car;
+      car.stolen = true;
+      car.driver = "player";
+      var G = window.SB && window.SB.Game;
+      if (G && G.state) {
+        G.state.stats.carsStolen = (G.state.stats.carsStolen || 0) + 1;
+        // Pencurian mobil selalu terlihat seseorang di jalanan Sunset Bay:
+        // wanted naik 1 bintang. Bila polisi dekat, heat langsung tinggi.
+        if (typeof G.raiseWanted === "function") {
+          try { G.raiseWanted(1); } catch (e) { /* abaikan */ }
+        } else if (typeof G.setWanted === "function") {
+          try { G.setWanted((G.state.wanted || 0) + 1); } catch (e) { /* abaikan */ }
+        }
+        if (this._policeNear(car.pos, 80)) {
+          G.state.heat = Math.max(G.state.heat || 0, 70);
+        }
+      }
+      if (typeof P.enterVehicle === "function") P.enterVehicle(car);
+      sfx("engine");
+      fxParticles(car.pos, [1, 0.8, 0.2], 10);
+      return car;
+    },
+
+    _policeNear: function (pos, radius) {
+      var Police = window.SB && window.SB.Police;
+      if (!Police || !Police.COP_CARS) return false;
+      for (var i = 0; i < Police.COP_CARS.length; i++) {
+        var cop = Police.COP_CARS[i];
+        if (cop && cop.pos && dist2(pos.x, pos.z, cop.pos.x, cop.pos.z) <= radius) return true;
+      }
+      return false;
+    },
+
+    // Mengemudi: W gas, S rem/mundur, A/D belok, Space rem tangan.
+    drive: function (car, input, dt) {
+      if (!car) return;
+      if (!dt || dt <= 0) dt = 0.016;
+      if (dt > 0.25) dt = 0.25;
+
+      var rain = isRaining();
+      var grip = car.grip * (rain ? 0.62 : 1.0);
+      var maxSpeed = car.maxSpeed * (rain ? 0.82 : 1.0);
+      var maxReverse = 10;
+
+      var throttle = 0;
+      if (keyDown(input, "KeyW") || keyDown(input, "ArrowUp")) throttle = 1;
+      if (keyDown(input, "KeyS") || keyDown(input, "ArrowDown")) throttle = -1;
+
+      var steering = 0;
+      if (keyDown(input, "KeyA") || keyDown(input, "ArrowLeft")) steering = 1;
+      if (keyDown(input, "KeyD") || keyDown(input, "ArrowRight")) steering = -1;
+
+      var handbrake = keyDown(input, "Space");
+
+      // Akselerasi / pengereman.
+      if (throttle > 0) {
+        car.speed += car.accel * grip * dt;
+      } else if (throttle < 0) {
+        if (car.speed > 0.5) car.speed -= 26 * dt; // rem
+        else car.speed -= car.accel * 0.55 * dt; // mundur
+      } else {
+        // Meluncur: gesekan jalan + hambatan udara.
+        var drag = 2.2 * dt + Math.abs(car.speed) * 0.02 * dt;
+        if (car.speed > 0) car.speed = Math.max(0, car.speed - drag * 4);
+        else if (car.speed < 0) car.speed = Math.min(0, car.speed + drag * 4);
+      }
+      if (handbrake) {
+        car.speed *= Math.max(0, 1 - 3.2 * dt);
+        if (Math.abs(car.speed) < 0.3) car.speed = 0;
+      }
+      car.speed = clamp(car.speed, -maxReverse, maxSpeed);
+
+      // Belok: makin cepat makin lebar, mundur membalik arah belok.
+      var speedFactor = clamp(Math.abs(car.speed) / 12, 0, 1);
+      var turnRate = 2.1 * grip * speedFactor;
+      if (car.speed < 0) turnRate = -turnRate;
+      car.rotY += steering * turnRate * dt;
+
+      // Gerak maju sesuai arah mobil.
+      var nx = car.pos.x + Math.sin(car.rotY) * car.speed * dt;
+      var nz = car.pos.z + Math.cos(car.rotY) * car.speed * dt;
+
+      // Tabrakan dengan bangunan: pantul pelan + bunyi + rusak sedikit.
+      if (Math.abs(car.speed) > 0.5 && collideAt(nx, nz)) {
+        if (Math.abs(car.speed) > 12) {
+          sfx("crash");
+          fxParticles({ x: nx, y: 1, z: nz }, [1, 0.6, 0.1], 14);
+          car.health = clamp((car.health || 100) - 8, 0, 100);
+          var G = window.SB && window.SB.Game;
+          if (G && typeof G.damagePlayer === "function" && Math.abs(car.speed) > 20) {
+            try { G.damagePlayer(5); } catch (e) { /* abaikan */ }
+          }
+        }
+        car.speed *= -0.25;
+        nx = car.pos.x;
+        nz = car.pos.z;
+      }
+
+      car.pos.x = nx;
+      car.pos.z = nz;
+      // Batas dunia.
+      car.pos.x = clamp(car.pos.x, -590, 590);
+      car.pos.z = clamp(car.pos.z, -590, 590);
+      car.vel.x = Math.sin(car.rotY) * car.speed;
+      car.vel.z = Math.cos(car.rotY) * car.speed;
+
+      // Sinkronkan pemain & HUD game dengan mobil.
+      var P = window.SB && window.SB.Player;
+      if (P && !P.onFoot && P.vehicleId === car.id) {
+        P.pos.x = car.pos.x; P.pos.y = car.pos.y; P.pos.z = car.pos.z;
+        P.rotY = car.rotY;
+      }
+      var GS = window.SB && window.SB.Game;
+      if (GS && GS.state) {
+        GS.state.player.speed = Math.abs(car.speed);
+        GS.state.player.pos.x = car.pos.x;
+        GS.state.player.pos.y = car.pos.y;
+        GS.state.player.pos.z = car.pos.z;
+        GS.state.player.rotY = car.rotY;
+      }
+    },
+
+    // Cat ulang mobil: ganti warna + kurangi cash sebesar RESPRAY_COST.
+    respray: function (car) {
+      if (!car) return false;
+      var cost = resprayCost();
+      var paid = false;
+      var E = window.SB && window.SB.Economy;
+      var G = window.SB && window.SB.Game;
+      if (E && typeof E.spend === "function") {
+        try { paid = E.spend(cost) !== false; } catch (e) { paid = false; }
+        // SB.Economy.spend yang tidak mengembalikan nilai dianggap berhasil
+        // bila kas game masih cukup — verifikasi lewat saldo game.
+        if (paid && G && G.state && G.state.cash < 0) paid = false;
+      }
+      if (!paid && G && typeof G.spendCash === "function") {
+        try { paid = G.spendCash(cost); } catch (e) { paid = false; }
+      }
+      if (!paid && G && G.state) {
+        if (G.state.cash >= cost) {
+          G.state.cash -= cost;
+          paid = true;
+        }
+      }
+      if (!paid) return false;
+      // Warna baru, dijamin berbeda dari warna lama.
+      var oldColor = car.color;
+      var next = pick(PAINT).slice();
+      var guard = 0;
+      while (oldColor && next[0] === oldColor[0] && next[1] === oldColor[1] &&
+             next[2] === oldColor[2] && guard < 10) {
+        next = pick(PAINT).slice();
+        guard++;
+      }
+      car.color = next;
+      car.resprayed = true;
+      if (window.SB && window.SB.Police && typeof window.SB.Police.clearWantedAfterRespray === "function") {
+        try { window.SB.Police.clearWantedAfterRespray(); } catch (e) { /* abaikan */ }
+      }
+      if (G && G.state) {
+        G.state.stats.carsResprayed = (G.state.stats.carsResprayed || 0) + 1;
+      }
+      sfx("pickup");
+      fxParticles(car.pos, next, 16);
+      return true;
+    },
+
+    // Dipanggil tiap frame dari SB.Game.update.
+    update: function (dt, input) {
+      if (!dt || dt <= 0) dt = 0.016;
+      var P = window.SB && window.SB.Player;
+
+      // E/F dimiliki SB.Main.handleActionKeys (E = curi/keluar mobil,
+      // F = interaksi, sesuai spec §3 + How to Play). Bila update() ini
+      // juga menangani E, sekali tekan E mencuri lalu langsung keluar
+      // lagi di frame yang sama — jadi JANGAN tangani tombol di sini.
+      // Mobil yang dikendarai pemain bergerak lewat drive().
+      if (P && !P.onFoot && P.vehicleId) {
+        var car = null;
+        for (var i = 0; i < this.CARS.length; i++) {
+          if (this.CARS[i].id === P.vehicleId) { car = this.CARS[i]; break; }
+        }
+        if (car) this.drive(car, input, dt);
+      }
+    },
+
+    count: function () {
+      return this.CARS.length;
+    },
+
+    byId: function (id) {
+      for (var i = 0; i < this.CARS.length; i++) {
+        if (this.CARS[i].id === id) return this.CARS[i];
+      }
+      return null;
+    }
+  };
+
+  // Isi awal: 42 mobil, 3 per distrik (14 distrik).
+  for (var d = 0; d < DISTRICTS.length; d++) {
+    for (var k = 0; k < 3; k++) {
+      Vehicles.spawnCar(DISTRICTS[d].name);
     }
   }
-}
 
-// draw(gl, state): gambar semua mobil (mesh di-cache per warna).
-function draw(gl, state) {
-  if (!veh.ready || !gl || !gl.drawMesh) { return; }
-  var M = window.SB.Math3;
-  if (!M) { return; }
-  var white = [1, 1, 1];
-  for (var i = 0; i < veh.cars.length; i++) {
-    var c = veh.cars[i];
-    var mesh = carMesh(c.color);
-    if (!mesh) { continue; }
-    var m4 = M.mat4Identity();
-    m4 = M.mat4Translate(m4, c.x, 0, c.z);
-    m4 = M.mat4RotateY(m4, c.angle);
-    gl.drawMesh(mesh, m4, white);
-  }
-}
-
-// Ambil mesh mobil per warna (cache).
-function carMesh(color) {
-  if (!window.SB || !window.SB.Meshes) { return null; }
-  var m = veh.meshCache[color];
-  if (!m) {
-    m = window.SB.Meshes.car(color);
-    veh.meshCache[color] = m;
-  }
-  return m;
-}
-
-// Curi / masuk / keluar mobil.
-
-// stealCar(): curi mobil terdekat dan LANGSUNG masuk ke dalamnya.
-// MENGEMBALIKAN OBJEK MOBIL (bukan boolean):
-//   - mobil terdekat dalam STEAL_RADIUS bila ada;
-//   - bila tidak ada mobil dekat, spawn satu mobil di jalan terdekat dan
-//     kembalikan mobil itu (pemain tidak pernah gagal total).
-//   - bila pemain sudah mengemudi / di perahu, kembalikan mobil yang sedang
-//     dikemudikan (atau null bila tidak ada).
-// Efek samping: stats.carsStolen +1, wanted +1 (maks 5), heat +8.
-function stealCar() {
-  var state = window.SB.state;
-  if (!veh.ready) { return null; }
-  if (!state || !state.player) { return null; }
-  var p = state.player;
-
-  // Sudah mengemudi: kembalikan mobil yang sedang dipakai.
-  if (p.vehicle && p.vehicle.id && p.vehicle.id.indexOf('car-') === 0) {
-    return p.vehicle;
-  }
-  // Sedang di perahu: tidak bisa mencuri mobil.
-  if (p.onBoat) { return null; }
-
-  var car = nearestCar(p.x, p.z, STEAL_RADIUS);
-  if (!car) {
-    // Tidak ada mobil dekat: spawn satu di jalan terdekat dari pemain.
-    var rng = veh.rng || mulberry32(7);
-    var gx = Math.round(p.x / BLOCK) * BLOCK + (rng() < 0.5 ? 2.5 : -2.5);
-    var gz = clamp(p.z + (rng() - 0.5) * 20, -190, 195);
-    car = spawnCar(gx, gz);
-  }
-
-  car.stolen = true;
-  car.ai = false;
-  car.speed = 0;
-  enterCar(car);
-
-  if (state.stats) {
-    state.stats.carsStolen = (state.stats.carsStolen || 0) + 1;
-  }
-  // Mencuri mobil menaikkan wanted + heat (polisi memperhatikan).
-  if (typeof state.wanted === 'number') {
-    state.wanted = Math.min(5, state.wanted + 1);
-  }
-  if (typeof state.heat === 'number') {
-    state.heat = Math.min(100, state.heat + 8);
-  }
-  return car;
-}
-
-// enterCar(car): pemain masuk ke mobil (tanpa efek wanted).
-// Mengembalikan mobil yang dimasuki, atau null bila argumen tidak valid.
-function enterCar(car) {
-  var state = window.SB.state;
-  if (!car || !car.id) { return null; }
-  if (!state || !state.player) { return null; }
-  var p = state.player;
-  // Turun dulu dari perahu bila sedang di perahu (tidak bisa dua kendaraan).
-  if (p.onBoat && window.SB.Water) { window.SB.Water.exitBoat(); }
-  p.vehicle = car;
-  p.onFoot = false;
-  p.onBoat = false;
-  p.x = car.x;
-  p.z = car.z;
-  p.y = 0;
-  p.angle = car.angle;
-  car.ai = false;
-  state._carInput = state._carInput || { f: 0, turn: 0 };
-  return car;
-}
-
-// exitCar(): pemain keluar dari mobil ke sisi jalan. Return true bila
-// berhasil, false bila pemain memang tidak sedang mengemudi.
-function exitCar() {
-  var state = window.SB.state;
-  if (!state || !state.player) { return false; }
-  var p = state.player;
-  var car = p.vehicle;
-  if (!car || !car.id || car.id.indexOf('car-') !== 0) { return false; }
-  // Parkir mobil (berhenti, kembali jadi traffic pasif bila bukan curian).
-  car.speed = 0;
-  car.targetSpeed = 0;
-  if (!car.stolen) { car.ai = true; car.targetSpeed = 6 + (veh.rng ? veh.rng() * 6 : 6); }
-  // Pemain turun di sisi kiri mobil (tegak lurus arah hadap).
-  var sideX = Math.cos(car.angle), sideZ = -Math.sin(car.angle);
-  p.x = car.x + sideX * 2.2;
-  p.z = car.z + sideZ * 2.2;
-  p.y = 0;
-  p.vehicle = null;
-  p.onFoot = true;
-  p.onBoat = false;
-  if (state) { state._carInput = { f: 0, turn: 0 }; }
-  return true;
-}
-
-// respray(): cat ulang mobil pemain seharga RESPRAY_COST ($150).
-// Hanya bisa dipakai saat pemain BERADA DI DALAM mobil.
-//   - Berhasil: potong $150 dari uang pemain, ganti warna mobil pemain ke
-//     warna baru (acak dari CAR_COLORS, berbeda dari warna sekarang),
-//     tampilkan toast, mainkan sfx 'respray', kembalikan {ok:true}.
-//   - Gagal (pemain tidak di dalam mobil, atau uang kurang):
-//     kembalikan {ok:false} TANPA memotong uang.
-// Uang dibaca dari state.money bila ada, kalau tidak state.player.money.
-function respray() {
-  var state = window.SB.state;
-  if (!veh.ready) { return { ok: false }; }
-  if (!state || !state.player) { return { ok: false }; }
-  var p = state.player;
-  var car = p.vehicle;
-  if (!car || !car.id || car.id.indexOf('car-') !== 0) { return { ok: false }; }
-  var hasStateMoney = (typeof state.money === 'number');
-  var money = hasStateMoney ? state.money
-    : (typeof p.money === 'number' ? p.money : null);
-  if (money === null || money < RESPRAY_COST) { return { ok: false }; }
-  if (hasStateMoney) { state.money -= RESPRAY_COST; }
-  else { p.money -= RESPRAY_COST; }
-  // Warna baru: acak, berbeda dari warna sekarang.
-  var rng = veh.rng || mulberry32(31);
-  var color = car.color;
-  var guard = 0;
-  while (color === car.color && guard++ < 12) {
-    color = CAR_COLORS[Math.floor(rng() * CAR_COLORS.length)];
-  }
-  car.color = color;
-  // Mesh warna baru dibuat otomatis saat draw berikutnya (carMesh cache
-  // per warna; cache warna lama tetap valid).
-  if (window.SB.Audio) { window.SB.Audio.sfx('respray'); }
-  if (window.SB.UI && window.SB.UI.toast) {
-    window.SB.UI.toast('Respray selesai! Mobil dicat ' + color + ' (-$150)');
-  }
-  if (state.stats) {
-    state.stats.resprays = (state.stats.resprays || 0) + 1;
-  }
-  return { ok: true };
-}
-
-// Export namespace.
-
-window.SB.Vehicles = {
-  init: init,
-  update: update,
-  draw: draw,
-  spawnCar: spawnCar,
-  stealCar: stealCar,
-  cars: veh.cars,
-  enterCar: enterCar,
-  exitCar: exitCar,
-  respray: respray
-};
-
+  window.SB.Vehicles = Vehicles;
 })();
